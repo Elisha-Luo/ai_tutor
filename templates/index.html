@@ -1,0 +1,453 @@
+<!DOCTYPE html>                              <!-- 声明这是一个 HTML5 网页 -->
+<html lang="zh-CN">                          <!-- 网页开始，lang 写 zh-CN 表示内容是简体中文 -->
+<head>                                       <!-- head 里放的不是给人看的内容，而是网页的设置 -->
+  <meta charset="UTF-8">                     <!-- 告诉浏览器用 UTF-8 编码，中文才不会乱码 -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">   <!-- 让网页在手机上也按正常比例显示，不会缩得很小 -->
+  <title>AI 学习助手</title>                 <!-- 浏览器标签页上显示的标题 -->
+
+  <style>                                    /* 下面开始写 CSS，也就是「网页长什么样」 */
+    * {                                      /* * 表示页面上的所有元素 */
+      box-sizing: border-box;                /* 让宽度把内边距也算进去，布局时不容易被撑破 */
+    }
+
+    body {                                   /* body 是整个页面的主体 */
+      margin: 0;                             /* 去掉浏览器默认的空白边距 */
+      min-height: 100vh;                     /* 高度至少占满一整个屏幕（vh = 视口高度） */
+      display: flex;                         /* 用弹性布局，方便把内容居中 */
+      align-items: center;                   /* 让内容在垂直方向居中 */
+      justify-content: center;               /* 让内容在水平方向居中 */
+      padding: 24px;                         /* 四周留点空隙，手机上不会贴边 */
+      background: linear-gradient(135deg, #eef2ff 0%, #f8fafc 55%, #ecfeff 100%);   /* 淡蓝到淡青的渐变背景 */
+      font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;         /* 优先用中文字体，保证中文好看 */
+      color: #1e293b;                        /* 默认文字颜色：深灰蓝 */
+    }
+
+    .chat {                                  /* 整个聊天面板 */
+      width: 100%;                           /* 占满可用宽度 */
+      max-width: 720px;                      /* 但最宽不超过 720 像素（比单词查询那张卡片宽，聊天需要更多横向空间） */
+      height: 85vh;                          /* 高度占屏幕的 85%，看起来像一个聊天窗口 */
+      display: flex;                         /* 用弹性布局来排列内部三块 */
+      flex-direction: column;                /* 纵向排：标题在上、对话区在中间、输入栏在最下 */
+      overflow: hidden;                      /* 内容不会溢出到圆角外面 */
+      background: #ffffff;                   /* 白色背景 */
+      border-radius: 18px;                   /* 四个角变圆 */
+      box-shadow: 0 12px 40px rgba(15, 23, 42, 0.10);   /* 淡淡的阴影，让面板有浮起来的感觉 */
+    }
+
+    .chat-header {                           /* 顶部标题栏 */
+      padding: 22px 28px 18px;               /* 内边距：上 22，左右 28，下 18 */
+      text-align: center;                    /* 文字居中 */
+      border-bottom: 1px solid #eef2f7;      /* 底部一条细横线，和对话区分开 */
+    }
+
+    h1 {                                     /* 大标题 */
+      margin: 0 0 6px;                       /* 外边距：上 0，左右 0，下 6 像素 */
+      font-size: 20px;                       /* 字号 */
+    }
+
+    .subtitle {                              /* 标题下面那行灰色小字 */
+      margin: 0;                             /* 去掉默认外边距 */
+      font-size: 13px;                       /* 小一号的字 */
+      color: #64748b;                        /* 灰色 */
+    }
+
+    .messages {                              /* 中间那块对话区 */
+      flex: 1;                               /* 占满剩下的全部高度（标题和输入栏高度固定，剩下的都给它） */
+      overflow-y: auto;                      /* 内容超出高度时自动出现滚动条 */
+      display: flex;                         /* 用弹性布局排列一条条消息 */
+      flex-direction: column;                /* 消息从上往下排 */
+      gap: 14px;                             /* 每条消息之间留 14 像素空隙 */
+      padding: 22px 28px;                    /* 内边距 */
+    }
+
+    .empty {                                 /* 还没开始对话时的提示文字 */
+      margin: auto;                          /* 上下左右都自动，等于把它推到对话区正中间 */
+      font-size: 14px;                       /* 字号 */
+      color: #94a3b8;                        /* 浅灰 */
+    }
+
+    .msg {                                   /* 一条消息占一行 */
+      display: flex;                         /* 用弹性布局，方便控制靠左还是靠右 */
+    }
+
+    .msg.user {                              /* 学生说的话 */
+      justify-content: flex-end;             /* 靠右显示（聊天软件里「自己」的话一般在右边） */
+    }
+
+    .msg.ai {                                /* AI 说的话 */
+      justify-content: flex-start;           /* 靠左显示 */
+    }
+
+    .bubble {                                /* 消息气泡 */
+      max-width: 78%;                        /* 最宽占对话区的 78%，太长了换行不好看 */
+      padding: 12px 16px;                    /* 内边距，让文字不贴着气泡边缘 */
+      font-size: 15px;                       /* 字号 */
+      line-height: 1.8;                      /* 行高，多行文字不挤在一起 */
+      border-radius: 14px;                   /* 圆角 */
+      white-space: pre-wrap;                 /* 关键：保留 AI 回答里的换行符，否则会挤成一大段 */
+      word-break: break-word;                /* 超长内容自动换行，不会撑破气泡 */
+    }
+
+    .msg.user .bubble {                      /* 学生气泡 */
+      background: #6366f1;                   /* 紫色底 */
+      color: #ffffff;                        /* 白字 */
+      border-bottom-right-radius: 4px;       /* 右下角收窄一点，做出「这句话是我说的」的感觉 */
+    }
+
+    .msg.ai .bubble {                        /* AI 气泡 */
+      background: #f1f5f9;                   /* 浅灰底 */
+      color: #1e293b;                        /* 深灰字 */
+      border-bottom-left-radius: 4px;        /* 左下角同样收窄，和学生对称为 */
+    }
+
+    /* ---------- 下面这些是「AI 回答被渲染成 HTML 之后」的样式 ---------- */
+    /* AI 返回的是 Markdown，页面上会先把它转成真正的 HTML 标签再显示    */
+    /* 所以这里要给这些标签单独定样式，否则浏览器会用难看的默认样式        */
+
+    .msg.ai .bubble.rendered {               /* 渲染成功后会加上 rendered 这个标记 */
+      white-space: normal;                   /* 关掉 pre-wrap，换成由 HTML 标签自己控制换行和间距 */
+    }
+
+    .msg.ai .bubble p {                      /* 段落 */
+      margin: 0 0 10px;                      /* 段落之间留 10 像素间距 */
+    }
+
+    .msg.ai .bubble p:last-child {           /* 最后一个段落 */
+      margin-bottom: 0;                      /* 不留底部间距，免得气泡底部多出一块空白 */
+    }
+
+    .msg.ai .bubble strong {                 /* 加粗的文字（原来显示成 **这样的**） */
+      font-weight: 700;                      /* 真正加粗 */
+      color: #0f172a;                        /* 颜色再深一点，更醒目 */
+    }
+
+    .msg.ai .bubble ul,                      /* 无序列表 */
+    .msg.ai .bubble ol {                     /* 有序列表 */
+      margin: 0 0 10px;                      /* 底部间距 */
+      padding-left: 22px;                    /* 左边留出圆点/编号的位置 */
+    }
+
+    .msg.ai .bubble li {                     /* 列表里的每一项 */
+      margin-bottom: 4px;                    /* 项与项之间留点空隙 */
+    }
+
+    .msg.ai .bubble h1,                      /* 各级小标题 */
+    .msg.ai .bubble h2,
+    .msg.ai .bubble h3 {
+      margin: 14px 0 8px;                    /* 上方多留点，和上一段分开 */
+      font-size: 16px;                       /* 字号统一，气泡里不需要很大的标题 */
+    }
+
+    .msg.ai .bubble code {                   /* 行内代码，比如 print() */
+      padding: 2px 6px;                      /* 内边距，让底色包住文字 */
+      font-family: Consolas, Menlo, monospace;   /* 等宽字体，代码看起来才像代码 */
+      font-size: 13px;                       /* 比正文小一号 */
+      background: #e2e8f0;                   /* 浅灰底 */
+      border-radius: 5px;                    /* 圆角 */
+    }
+
+    .msg.ai .bubble pre {                    /* 代码块（``` 包起来的多行代码） */
+      margin: 0 0 12px;                      /* 底部间距 */
+      padding: 14px 16px;                    /* 内边距 */
+      overflow-x: auto;                      /* 代码太长时横向滚动，不会撑破气泡 */
+      background: #0f172a;                   /* 深色底，和正文明显区分 */
+      border-radius: 10px;                   /* 圆角 */
+    }
+
+    .msg.ai .bubble pre code {               /* 代码块里面的 code */
+      padding: 0;                            /* 去掉行内代码的内边距 */
+      font-size: 13px;                       /* 字号 */
+      color: #e2e8f0;                        /* 浅色字，配深色底 */
+      background: none;                      /* 去掉行内代码的浅灰底 */
+    }
+
+    .msg.ai .bubble blockquote {             /* 引用块（> 开头的内容） */
+      margin: 0 0 12px;                      /* 底部间距 */
+      padding: 6px 14px;                     /* 内边距 */
+      color: #475569;                        /* 灰一点的文字 */
+      border-left: 3px solid #c7d2fe;        /* 左边一条淡紫色竖线，这是引用块的标志 */
+    }
+
+    .msg.ai .bubble hr {                     /* 分割线（--- 会变成这个） */
+      margin: 14px 0;                        /* 上下留白 */
+      border: none;                          /* 去掉浏览器默认的边框 */
+      border-top: 1px solid #e2e8f0;         /* 换成一条细横线 */
+    }
+
+    .error {                                 /* 出错时的红色提示条 */
+      margin: 0 28px;                        /* 左右留出和对话区一致的空隙 */
+      padding: 10px 14px;                    /* 内边距 */
+      font-size: 13px;                       /* 字号 */
+      color: #b91c1c;                        /* 深红色字 */
+      background: #fef2f2;                   /* 淡红色底 */
+      border-radius: 10px;                   /* 圆角 */
+    }
+
+    /* ---------- 下面是「正在思考中」那一套反馈样式 ---------- */
+    /* 目的：让用户一按回车就立刻看到「我已经开始干活了」，
+       这样他才不会因为不确定而反复按回车 —— 那正是重复提问的根源 */
+
+    #pending {                               /* 「正在思考」那个气泡，平时是不显示的 */
+      display: none;                         /* 默认藏起来，提交后才由 JS 打开 */
+    }
+
+    .dots {                                  /* 气泡里那三个跳动的小点 */
+      display: flex;                         /* 弹性布局，让三个点横着排 */
+      gap: 5px;                              /* 点与点之间留 5 像素 */
+      align-items: center;                   /* 垂直居中对齐 */
+      padding: 16px 18px;                    /* 内边距比普通气泡大一点，让点看起来不局促 */
+    }
+
+    .dots i {                                /* 每一个小点（用 i 标签只是为了短，不表示斜体） */
+      width: 7px;                            /* 宽 7 像素 */
+      height: 7px;                           /* 高 7 像素 */
+      background: #94a3b8;                   /* 灰色 */
+      border-radius: 50%;                    /* 圆角设成一半 = 正圆 */
+      animation: bounce 1.2s infinite ease-in-out;   /* 播放 bounce 动画：1.2 秒一轮，无限循环，缓入缓出 */
+    }
+
+    .dots i:nth-child(2) {                   /* 第二个点 */
+      animation-delay: 0.15s;                /* 晚 0.15 秒开始，三个点就错开了，像波浪一样 */
+    }
+
+    .dots i:nth-child(3) {                   /* 第三个点 */
+      animation-delay: 0.3s;                 /* 再晚 0.15 秒 */
+    }
+
+    @keyframes bounce {                      /* 定义上面用到的 bounce 动画 */
+      0%, 60%, 100% {                        /* 一轮的头、中间、结尾 */
+        transform: translateY(0);            /* 停在原位 */
+        opacity: 0.45;                       /* 半透明，显得暗一些 */
+      }
+      30% {                                  /* 一轮的 30% 处，也就是跳起来的时候 */
+        transform: translateY(-5px);         /* 往上移 5 像素 */
+        opacity: 1;                          /* 完全不透明，显得亮 */
+      }
+    }
+
+    .status {                                /* 输入框上方那条蓝色提示 */
+      display: none;                         /* 默认藏起来 */
+      margin: 0 28px 10px;                   /* 左右和对话区对齐，下面留 10 像素 */
+      padding: 10px 14px;                    /* 内边距 */
+      font-size: 13px;                       /* 字号 */
+      color: #4f46e5;                        /* 紫色字 */
+      background: #eef2ff;                   /* 淡紫色底 */
+      border-radius: 10px;                   /* 圆角 */
+      text-align: center;                    /* 文字居中 */
+    }
+
+    .composer {                              /* 底部输入栏 */
+      display: flex;                         /* 弹性布局，让输入框和按钮横向排列 */
+      gap: 10px;                             /* 两者之间留 10 像素空隙 */
+      padding: 18px 28px 22px;               /* 内边距 */
+      border-top: 1px solid #eef2f7;         /* 顶部一条细横线，和对话区分开 */
+    }
+
+    input[type=text] {                       /* 文字输入框 */
+      flex: 1;                               /* 占满剩余空间（按钮宽度固定，剩下的都给输入框） */
+      padding: 14px 16px;                    /* 内边距，让框显得宽大舒服 */
+      font-size: 16px;                       /* 字号 16 像素，手机上点进来不会自动放大 */
+      border: 2px solid #e2e8f0;             /* 2 像素的浅灰边框 */
+      border-radius: 12px;                   /* 圆角 */
+      outline: none;                         /* 去掉浏览器默认的蓝色聚焦框，后面自己画 */
+      font-family: inherit;                  /* 继承 body 的中文字体 */
+      color: inherit;                        /* 继承 body 的文字颜色 */
+    }
+
+    input[type=text]:focus {                 /* 当光标点进输入框时（focus = 聚焦） */
+      border-color: #6366f1;                 /* 边框变成紫色，提示用户「你正在这里输入」 */
+      box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.13);   /* 外面加一圈淡淡的光晕 */
+    }
+
+    button {                                 /* 发送按钮 */
+      padding: 14px 28px;                    /* 内边距：上下 14，左右 28 */
+      font-size: 16px;                       /* 字号 */
+      font-weight: 600;                      /* 字加粗 */
+      font-family: inherit;                  /* 继承中文字体 */
+      color: #ffffff;                        /* 白字 */
+      background: #6366f1;                   /* 紫色背景 */
+      border: none;                          /* 去掉默认边框 */
+      border-radius: 12px;                   /* 圆角，和输入框保持一致 */
+      cursor: pointer;                       /* 鼠标移上去变成小手，表示可以点 */
+    }
+
+    button:hover {                           /* 鼠标悬停在按钮上时 */
+      background: #4f46e5;                   /* 颜色变深一点，给出反馈 */
+    }
+
+    button:active {                          /* 按下按钮的一瞬间 */
+      transform: scale(0.97);                /* 整体缩小 3%，像是被按下去 */
+    }
+
+    /* ---------- 提交之后的「锁住」样式：让人一眼看出已经发出去了、现在在等 ---------- */
+
+    input[type=text].waiting {               /* 等待回复期间，输入框会被 JS 加上 waiting 这个标记 */
+      background: #f8fafc;                   /* 底色变灰 */
+      color: #94a3b8;                        /* 文字变浅 */
+      cursor: not-allowed;                   /* 鼠标移上去变成「禁止」图标 */
+    }
+
+    button[type=submit]:disabled {           /* 被禁用的发送按钮 */
+      background: #a5b4fc;                   /* 改成淡紫色 */
+      cursor: not-allowed;                   /* 鼠标变成「禁止」图标 */
+      transform: none;                       /* 关掉按下缩小的效果（禁用状态不该有反馈） */
+    }
+
+    @media (max-width: 480px) {              /* 当屏幕宽度小于 480 像素时（手机） */
+      body {                                 /* 页面主体 */
+        padding: 0;                          /* 去掉四周留白，让聊天面板占满整个屏幕 */
+      }
+      .chat {                                /* 聊天面板 */
+        height: 100vh;                       /* 高度改成占满一屏 */
+        max-width: none;                     /* 取消最大宽度限制 */
+        border-radius: 0;                    /* 手机上没有圆角更好看 */
+      }
+      .messages {                            /* 对话区 */
+        padding: 16px;                       /* 内边距缩小，小屏幕上留更多空间给内容 */
+      }
+      .composer {                            /* 输入栏 */
+        padding: 12px 16px 16px;             /* 内边距缩小 */
+      }
+      .error {                               /* 错误提示条 */
+        margin: 0 16px;                      /* 左右间距跟着缩小，保持对齐 */
+      }
+      .status {                              /* 正在思考的提示条 */
+        margin-left: 16px;                   /* 左右间距跟着缩小，和其它元素保持对齐 */
+        margin-right: 16px;                  /* 右边同理 */
+      }
+    }
+  </style>
+</head>
+
+<body>                                       <!-- 下面开始是页面上能看到的内容 -->
+  <div class="chat">                         <!-- 整个聊天面板 -->
+
+    <header class="chat-header">             <!-- 顶部标题栏 -->
+      <h1>🎓 AI 学习助手</h1>                 <!-- 大标题 -->
+      <p class="subtitle">有问题直接问，AI 会用大白话解答</p>   <!-- 副标题 -->
+    </header>
+
+    <main class="messages">                  <!-- 中间对话区：所有消息都显示在这里 -->
+      <!-- Jinja 模板语法：历史为空时不显示任何气泡，只给一句引导文字 -->
+      {% if not history %}
+      <div class="empty">还没有对话，在下面输入你的第一个问题吧</div>
+      {% endif %}
+
+      <!-- 把对话历史一条一条渲染出来 -->
+      {% for msg in history %}
+      {% if msg.role == "user" %}            <!-- msg 是字典，msg.role 取的是它的 role 字段 -->
+      <div class="msg user">                 <!-- 学生说的话 -->
+        <div class="bubble">{{ msg.content }}</div>   <!-- 双大括号表示「把内容填到这里」 -->
+      </div>
+      {% else %}                             <!-- 否则就是 AI 说的话 -->
+      <div class="msg ai">
+        <!-- 多了一个 md 类，是给页面末尾那段脚本认的：它只处理带 md 的气泡 -->
+        <div class="bubble md">{{ msg.content }}</div>
+      </div>
+      {% endif %}
+      {% endfor %}                           <!-- for 循环到这里结束 -->
+
+      <!-- 「正在思考中」的占位气泡。默认是藏起来的（样式里写了 display:none），
+           用户一按发送，页面末尾那段脚本就把它显示出来。
+           它的作用就是给用户一个明确的信号：「你的话已经发出去了，AI 正在想」——
+           人一旦确定了这一点，就不会再反复按回车，重复提问的根源也就没了 -->
+      <div class="msg ai" id="pending">
+        <div class="bubble dots"><i></i><i></i><i></i></div>
+      </div>
+    </main>
+
+    <!-- 只有出错时才显示这条红色提示 -->
+    {% if error %}
+    <div class="error">{{ error }}</div>
+    {% endif %}
+
+    <!-- 「正在思考」的提示条：默认藏起来，提交后由脚本显示。
+         加上这个是为了让反馈足够明显 —— 光有气泡可能被滚动条挡住看不见 -->
+    <div class="status" id="status">⏳ AI 正在思考中，请稍候……不用重复按回车</div>
+
+    <!-- 底部输入栏：method="POST" 表示点发送时把数据「提交」给后端 -->
+    <!-- id="ask-form" 是给页面末尾那段脚本用的：它靠这个 id 找到表单，挂上「防止重复提交」的把关函数 -->
+    <form class="composer" method="POST" id="ask-form">
+
+      <!-- 下面这个输入框，几个关键属性分别是： -->
+      <!--   id="question-input"  —— 给页面末尾的脚本用的，方便它找到这个框并锁住 -->
+      <!--   name="question"      —— 它的名字，后端用 request.form.get("question") 就是靠这个名字取到内容 -->
+      <!--   value="..."          —— 出错时把刚才问的话填回去（由 question 变量填进来），不用重新打字 -->
+      <!--   autofocus            —— 打开网页时光标自动落在这里，可以直接打字 -->
+      <input type="text" name="question" id="question-input" placeholder="输入你的问题…" value="{{ question }}" autocomplete="off" autofocus>
+
+      <!-- 提交按钮，文字是「发送」。id 同样是给脚本用的：它要把按钮禁用、并把文字改成「思考中…」 -->
+      <button type="submit" id="send-button">发送</button>
+
+    </form>
+
+  </div>
+
+  <!-- marked：把 Markdown 文字转成真正的 HTML 标签 -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@18.0.12/lib/marked.umd.js"></script>
+
+  <!-- DOMPurify：清洗掉 HTML 里危险的标签和属性（安全保险） -->
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.4.15/dist/purify.min.js"></script>
+
+  <script>
+    // ===== 第一步：把 AI 的回答从 Markdown 渲染成漂亮的 HTML =====
+    document.querySelectorAll('.bubble.md').forEach(function (el) {   // 找出所有带 md 的气泡，逐个处理
+      const raw = el.textContent;                                    // 取出原始文字（AI 返回的 Markdown 源码）
+
+      if (window.marked && window.DOMPurify) {                       // 两个库都加载成功了才动手
+        const html = marked.parse(raw);                              // 把 Markdown 转成 HTML
+        el.innerHTML = DOMPurify.sanitize(html);                     // 先清洗再放进去——AI 的内容属于「外来内容」，不能无条件信任
+        el.classList.add('rendered');                                // 打上标记，通知 CSS 关掉原本的 pre-wrap
+      }
+      // 万一 CDN 没加载出来（断网、被墙），就什么都不做
+      // 结果是页面回到「纯文本加一堆星号」的老样子，但至少不会白屏
+    });
+
+    // ===== 第二步：把对话区滚到最底部 =====
+    // 注意必须放在渲染之后：渲染会把内容撑高，先滚动就会滚不到真正的底部
+    const box = document.querySelector('.messages');   // 找到对话区那个元素
+    box.scrollTop = box.scrollHeight;                  // 把滚动位置设到最底（scrollHeight 是内容总高度）
+
+    // ===== 第三步：防止重复提问（本次新加的重点）=====
+    //
+    // 问题出在哪：按回车之后，浏览器要把请求发给服务器、等 AI 想好答案，
+    // 这一等可能要十几二十秒。而这段时间页面看起来毫无变化，
+    // 用户就会怀疑「到底发出去了没有」，于是再按一次回车 —— 就又问了一遍。
+    //
+    // 所以这两个毛病其实是一个病根：反馈不足导致人重复操作。
+    // 解决办法就是按下去的那一瞬间，立刻锁住界面 + 给出明显的「正在思考」反馈。
+    let sending = false;                                // 标记：现在有没有正在发送的请求
+
+    const form = document.getElementById('ask-form');             // 表单
+    const input = document.getElementById('question-input');      // 输入框
+    const button = document.getElementById('send-button');        // 发送按钮
+    const pending = document.getElementById('pending');           // 「正在思考」的气泡
+    const status = document.getElementById('status');             // 「正在思考」的提示条
+
+    form.addEventListener('submit', function (event) {            // 监听「表单即将提交」这个时刻
+      if (sending) {                                              // 已经在发了 —— 说明这次回车是多余的
+        event.preventDefault();                                   // 拦下它，什么都不做
+        return;                                                   // 直接结束
+      }
+
+      sending = true;                                             // 记下来：从现在起处于「发送中」
+
+      // 下面这些就是「明显的反馈」，一秒都不耽搁地全做掉
+      input.readOnly = true;                                      // 输入框变只读，打不进字了
+      // 【为什么用 readOnly 而不是 disabled】被 disabled 的表单控件，浏览器不会随表单一起提交上去，
+      // 那样后端就收不到问题了。readOnly 既能拦住输入，又不影响提交，所以这里必须用它。
+      input.classList.add('waiting');                             // 加个标记，让 CSS 把它画成灰底灰字
+      button.disabled = true;                                     // 按钮禁用，防止鼠标连点
+      button.textContent = '思考中…';                              // 按钮文字也换掉，再多一层反馈
+
+      pending.style.display = 'flex';                             // 显示那三个跳动的小点
+      status.style.display = 'block';                             // 显示提示条
+      box.scrollTop = box.scrollHeight;                           // 滚到底，保证这两个提示都在视野里
+
+      // 说明：这里故意不设「超时自动解锁」。
+      // 如果服务器真的卡住没回，请求其实还在挂着，锁着才是诚实的表现；
+      // 用户按 F5 刷新即可恢复。等页面带着答案重新加载回来，所有状态自然重置。
+    });
+  </script>
+</body>
+</html>
