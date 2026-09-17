@@ -8,34 +8,24 @@ import threading                                    # 用它的「锁」防止�
 from datetime import datetime, timedelta            # datetime 记录消息时间；timedelta 设置 cookie 有效期
 from flask import Flask, render_template, request, redirect, url_for, session   # session 用来给每个浏览器发一个签名过的身份标记
 from openai import OpenAI                           # 从 openai 库里导入 OpenAI 类（DeepSeek 兼容它的接口）
+from env_utils import load_dotenv                   # 共用同一份 .env 读取逻辑（实现和「为什么」都在 env_utils.py）
 
 
 # ===================== 读取 .env（如果存在）=====================
-# 为什么要有这个：密钥不能写进代码，只能放环境变量。但每次开新终端都要重新设一遍太麻烦，
+# 密钥不能写进代码，只能放环境变量。但每次开新终端都要重新设一遍太麻烦，
 # 所以约定把密钥写在一个叫 .env 的文件里，程序启动时自动读进来。
 # 这个文件被 .gitignore 忽略，永远不会被推到 GitHub。
-# 这里只用 Python 标准库自己解析，不额外装 python-dotenv。
+#
+# 【为什么读取逻辑放在 env_utils.py 而不是写在这里】
+# 这个项目有两个入口都要用 .env：网页（本文件）和评测器（evals/run_rag_eval.py）。
+# 以前两边各写各的，结果评测器压根没读 .env —— 密钥只写在 .env 里的人，
+# 网页能用、评测器却报「密钥未设置」。同一份配置两种结论，非常难查。
+# 现在全项目只有 env_utils.load_dotenv 一份实现，从根上避免再次漂移。
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))   # 本文件（app.py）所在的文件夹，后面拼路径都以它为基准
 
-
-def load_dotenv(path):
-    """把 .env 文件里的 KEY=VALUE 逐行读进环境变量。文件不存在就安静地跳过。"""
-    if not os.path.exists(path):                    # 没有 .env 文件属于正常情况（比如在服务器上直接设了环境变量）
-        return
-    with open(path, encoding="utf-8") as f:         # 打开文件，用 utf-8 读，中文注释才不会乱码
-        for raw in f:                               # 一行一行读
-            line = raw.strip()                      # 去掉首尾空白
-            if not line or line.startswith("#") or "=" not in line:   # 空行、注释行、没有等号的行，都跳过
-                continue
-            key, _, value = line.partition("=")     # 用第一个等号切成「键」和「值」。partition 只会切一刀，值里再有等号也不受影响
-            key = key.strip()                       # 去掉键两边的空白
-            value = value.strip().strip('"').strip("'")   # 去掉值两边的空白，以及可能存在的引号
-            os.environ.setdefault(key, value)       # setdefault：只有环境变量里还没有这个键时才写入。
-                                                    # 意思是「真实环境变量优先，.env 只作兜底」——方便临时覆盖
-
-
-load_dotenv(os.path.join(BASE_DIR, ".env"))         # 启动时先读 .env，下面再读环境变量
+load_dotenv(os.path.join(BASE_DIR, ".env"))         # 启动时先读 .env，下面再从环境变量取值
+                                                    # 注意：.env 只作兜底，真实环境变量优先
 
 
 # ===================== 配置区 =====================
