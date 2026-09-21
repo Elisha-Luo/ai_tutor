@@ -270,5 +270,146 @@ class TestSafety(unittest.TestCase):
         self.assertIn("同义词", source, "代码里没写明不理解同义词这个局限")
 
 
+# ===================== 5. 精确到 heading 的排序回归 =====================
+#
+# 【为什么必须测到 heading 这一层】
+# 「来源文件对了」不等于「内容对了」。
+# 同一个文件里有七八个小节。检索把「和一般过去时的区别」当成答案送过去时，
+# source 字段照样是 grammar_present_perfect.md —— 光看来源，一切正常，
+# 实际上是答非所问。
+#
+# 这就是为什么验收题库里那 17 道单来源题没能抓到这个问题：
+# 它们只断言 top-1 的【来源】对不对，而错误答案恰好也在同一个文件里。
+# 所以断言必须下沉到 heading。
+
+class TestHeadingLevelRanking(unittest.TestCase):
+
+    STRUCTURE_Q = "现在完成时的句子结构是怎样的？"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = R.Retriever()
+
+    def test_structure_query_recalls_the_structure_section(self):
+        """【核心回归】问「句子结构」，top-3 里必须出现「基本结构」那一节。"""
+        hits = self.r.retrieve(self.STRUCTURE_Q, top_k=3)
+        headings = [h["heading"] for h in hits]
+        self.assertIn("基本结构", headings,
+                      "top-3 里没有「基本结构」，实际返回的是：" + str(headings))
+
+    def test_structure_section_is_ranked_first(self):
+        """【理想目标】「基本结构」应该是 top-1，而不是勉强挤进前三。"""
+        hits = self.r.retrieve(self.STRUCTURE_Q, top_k=1)
+        self.assertTrue(hits, "这个查询居然什么都没检索到")
+        self.assertEqual(hits[0]["heading"], "基本结构",
+                         "top-1 是「" + hits[0]["heading"] + "」，不是「基本结构」")
+
+    def test_structure_hit_has_both_right_source_and_heading(self):
+        """命中的那一段，来源和标题都要对。"""
+        hits = self.r.retrieve(self.STRUCTURE_Q, top_k=3)
+        matched = [h for h in hits if h["heading"] == "基本结构"]
+        self.assertTrue(matched)
+        self.assertEqual(matched[0]["source"], "grammar_present_perfect.md")
+
+    def test_recalled_chunk_actually_holds_the_answer(self):
+        """召回的正文里确实写着答案，不是标题碰巧对上。"""
+        hits = self.r.retrieve(self.STRUCTURE_Q, top_k=1)
+        text = hits[0]["text"]
+        self.assertIn("have", text)
+        self.assertIn("过去分词", text)
+
+    def test_it_does_not_recall_the_contrast_section(self):
+        """旧版本会把「和一般过去时的区别」排第一，那是错的：问结构，不是问区别。"""
+        hits = self.r.retrieve(self.STRUCTURE_Q, top_k=1)
+        self.assertNotEqual(hits[0]["heading"], "和一般过去时的区别")
+
+
+# ===================== 6. 通用机制：跨结构助词的 bigram =====================
+#
+# 上面那条回归能过，靠的是这条通用规则，所以规则本身也要单独钉住。
+# 它针对的是【一类字】，不是某道题 —— 换任何一句中文都成立。
+
+class TestBigramStopChars(unittest.TestCase):
+
+    def test_bigrams_containing_de_are_dropped(self):
+        """含「的」的两字组合要丢掉，因为它们横跨词边界、本身不是词。"""
+        tokens = R.tokenize("现在完成时的句子结构")
+        self.assertNotIn("时的", tokens)
+        self.assertNotIn("的句", tokens)
+        # 真正有意义的词不能被误伤
+        self.assertIn("现在", tokens)
+        self.assertIn("完成", tokens)
+        self.assertIn("句子", tokens)
+        self.assertIn("结构", tokens)
+
+    def test_the_rule_is_general_not_word_specific(self):
+        """任何含「的」的组合都丢，不挑词——证明这是通用规则而非硬编码。"""
+        for text in ["我的书", "便宜的票", "最重要的区别", "的一句话", "吃的喝的"]:
+            for token in R.tokenize(text):
+                self.assertNotIn("的", token,
+                                 "「" + text + "」里漏掉了含「的」的组合：" + token)
+
+    def test_a_lone_de_is_dropped(self):
+        """孤零零一个「的」也丢掉——它自己不带任何信息。"""
+        self.assertEqual(R.tokenize("的"), [])
+
+    def test_other_chinese_words_are_unaffected(self):
+        """不涉及「的」的中文照常切分。"""
+        self.assertEqual(R.tokenize("现在完成时"), ["现在", "在完", "完成", "成时"])
+
+    def test_english_and_mixed_content_still_work(self):
+        """中英混排不受影响。"""
+        tokens = R.tokenize("since 和 for 的区别")
+        self.assertIn("since", tokens)
+        self.assertIn("for", tokens)
+        self.assertIn("区别", tokens)
+        self.assertNotIn("的区", tokens)
+
+    def test_empty_and_punctuation_still_return_nothing(self):
+        """空输入和纯标点的行为保持不变。"""
+        for text in ["", "   ", "？？！——"]:
+            self.assertEqual(R.tokenize(text), [])
+
+
+# ===================== 7. 文档一级标题必须真的被读到 =====================
+#
+# 【这里曾经有个藏了很久的 bug】
+# H1_RE 少写了 re.MULTILINE。不带它时，^ 只认整个字符串的开头、$ 只认结尾，
+# 而标题虽然在文件第一行、文件却远不止一行，于是 search 永远匹配不上，
+# doc_title 悄悄退回了文件名 —— 那行「文档标题加权」因此一直是死代码。
+# 这组测试盯着它别再退回去。
+
+class TestDocumentTitleIsReallyUsed(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = R.Retriever()
+
+    def test_doc_title_is_not_a_filename(self):
+        """【核心回归】doc_title 必须是真标题，不能退化成文件名。"""
+        for c in self.r.chunks:
+            self.assertFalse(
+                c["doc_title"].lower().endswith(".md"),
+                c["source"] + " 的 doc_title 退化成了文件名：" + repr(c["doc_title"]))
+
+    def test_doc_title_matches_the_first_heading_line(self):
+        """doc_title 要和文件第一行的 # 标题逐字一致。"""
+        for source in self.r.sources:
+            with open(os.path.join(R.KB_DIR, source), encoding="utf-8-sig") as f:
+                first_line = f.readline().strip()
+
+            self.assertTrue(first_line.startswith("# "), source + " 第一行不是一级标题")
+            expected = first_line[2:].strip()
+
+            titles = {c["doc_title"] for c in self.r.chunks if c["source"] == source}
+            self.assertEqual(titles, {expected}, source + " 的 doc_title 不对")
+
+    def test_doc_title_is_present_on_every_chunk(self):
+        """每个片段都要带 doc_title 字段。"""
+        for c in self.r.chunks:
+            self.assertIn("doc_title", c)
+            self.assertTrue(c["doc_title"].strip())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

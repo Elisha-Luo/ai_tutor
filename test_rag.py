@@ -463,5 +463,234 @@ class TestReturnShape(RagTestCase):
             self.assertNotIn(token, source, "rag.py 里出现了密钥相关代码：" + token)
 
 
+# ===================== 9. 诊断标签（只给后厨看的「退菜原因单」）=====================
+#
+# 【为什么单独测这一组】
+# 一次降级如果只说「insufficient_evidence」，看不出是哪一步拦下的——
+# 是没检索到资料？API 挂了？返回的不是 JSON？还是模型编了个来源？
+# 修 API 和改提示词完全是两件事，所以必须能区分。
+#
+# 但诊断标签【只给后厨看】：它绝不能混进用户看到的回答里，
+# 也绝不能带上异常原文、密钥、提示词或模型的完整原始回答。
+
+class TestDiagnostics(RagTestCase):
+
+    def run_diag(self, chunks=None, reply=None, question="这是问题"):
+        """跑一次带诊断的入口，返回 (结果, 诊断标签)。"""
+        if chunks is None:
+            chunks = [dict(c) for c in CHUNKS]
+        if reply is not None:
+            if isinstance(reply, str):
+                self.fake.reply = reply
+            else:
+                self.fake.reply = json.dumps(reply, ensure_ascii=False)
+        return rag.generate_answer_with_diagnostics(question, chunks, self.fake, MODEL)
+
+    # ---------- 每一种降级原因都要能被区分出来 ----------
+
+    def test_ok_when_answer_passes_all_checks(self):
+        r, code = self.run_diag(reply=self.answer_json())
+        self.assertEqual(code, rag.DIAG_OK)
+        self.assertEqual(r["decision"], "answer")
+
+    def test_ok_when_clean_refuse(self):
+        r, code = self.run_diag(reply={"decision": "refuse", "answer": "没有", "citations": []})
+        self.assertEqual(code, rag.DIAG_OK)
+        self.assertEqual(r["decision"], "refuse")
+
+    def test_no_chunks(self):
+        """没有检索结果 → 直接拒答，标签是 no_chunks，而且【不调用模型】。"""
+        r, code = self.run_diag(chunks=[])
+        self.assertEqual(code, rag.DIAG_NO_CHUNKS)
+        self.assertEqual(r["decision"], "refuse")
+        self.assertEqual(len(self.fake.calls), 0)
+
+    def test_api_or_response_error(self):
+        """模型直接抛异常 → api_or_response_error（不是别的标签）。"""
+        def boom(model, messages, **kwargs):
+            raise RuntimeError("模拟网络故障")
+        self.fake.chat.completions.create = boom
+
+        r, code = self.run_diag()
+        self.assertEqual(code, rag.DIAG_API_OR_RESPONSE_ERROR)
+        self.assertEqual(r["decision"], "insufficient_evidence")
+
+    def test_response_shape_error_is_also_api_or_response_error(self):
+        """响应对象结构不对（取不到 choices）→ 同样算 api_or_response_error。"""
+        def bad(model, messages, **kwargs):
+            return object()          # 没有 .choices 属性
+        self.fake.chat.completions.create = bad
+
+        r, code = self.run_diag()
+        self.assertEqual(code, rag.DIAG_API_OR_RESPONSE_ERROR)
+
+    def test_invalid_json(self):
+        """返回一段根本不是 JSON 的文字。"""
+        r, code = self.run_diag(reply="我觉得应该这样回答：since 接时间点。")
+        self.assertEqual(code, rag.DIAG_INVALID_JSON)
+
+    def test_response_not_object(self):
+        """JSON 合法，但是个数组而不是对象。"""
+        r, code = self.run_diag(reply="[1, 2, 3]")
+        self.assertEqual(code, rag.DIAG_RESPONSE_NOT_OBJECT)
+
+    def test_invalid_decision(self):
+        """decision 不在三个合法值里。"""
+        r, code = self.run_diag(reply={"decision": "maybe", "answer": "x", "citations": []})
+        self.assertEqual(code, rag.DIAG_INVALID_DECISION)
+
+    def test_invalid_citations_fabricated_source(self):
+        """【核心】模型编了一个不存在的文件名 —— 要能和别的降级区分开。"""
+        r, code = self.run_diag(reply=self.answer_json(citations=[
+            {"source": "根本没有这个文件.md", "heading": CHUNK_SINCE_FOR["heading"]},
+        ]))
+        self.assertEqual(code, rag.DIAG_INVALID_CITATIONS)
+
+    def test_invalid_citations_fabricated_heading(self):
+        """文件名是真的，但标题是编的 —— 同样算 invalid_citations。"""
+        r, code = self.run_diag(reply=self.answer_json(citations=[
+            {"source": CHUNK_SINCE_FOR["source"], "heading": "编造的标题"},
+        ]))
+        self.assertEqual(code, rag.DIAG_INVALID_CITATIONS)
+
+    def test_empty_answer(self):
+        """说好要回答，正文却是空的。"""
+        r, code = self.run_diag(reply=self.answer_json(text="   "))
+        self.assertEqual(code, rag.DIAG_EMPTY_ANSWER)
+
+    def test_missing_citations(self):
+        """说好要回答，却一条引用都不给。"""
+        r, code = self.run_diag(reply={"decision": "answer", "answer": "有内容但没出处",
+                                       "citations": []})
+        self.assertEqual(code, rag.DIAG_MISSING_CITATIONS)
+
+    def test_citations_on_non_answer(self):
+        """拒答却带着引用 —— 自相矛盾，单独一个标签。"""
+        r, code = self.run_diag(reply={
+            "decision": "refuse", "answer": "没有",
+            "citations": [{"source": CHUNK_SINCE_FOR["source"],
+                           "heading": CHUNK_SINCE_FOR["heading"]}]})
+        self.assertEqual(code, rag.DIAG_CITATIONS_ON_NON_ANSWER)
+
+    # ---------- 标签本身的安全性与完整性 ----------
+
+    def test_every_scenario_produces_a_known_code(self):
+        """所有能想到的输入，产出的标签都必须在固定枚举里。"""
+        scenarios = [
+            ([], None),
+            (CHUNKS, self.answer_json()),
+            (CHUNKS, {"decision": "refuse", "answer": "x", "citations": []}),
+            (CHUNKS, {"decision": "insufficient_evidence", "answer": "x", "citations": []}),
+            (CHUNKS, "不是 JSON"),
+            (CHUNKS, "[1,2,3]"),
+            (CHUNKS, {"decision": "??", "answer": "x", "citations": []}),
+            (CHUNKS, {"decision": "answer", "answer": "x", "citations": []}),
+            (CHUNKS, {"decision": "answer", "answer": "  ", "citations": [
+                {"source": CHUNK_SINCE_FOR["source"], "heading": CHUNK_SINCE_FOR["heading"]}]}),
+            (CHUNKS, {"decision": "answer", "answer": "x", "citations": [
+                {"source": "假的.md", "heading": "假的"}]}),
+        ]
+        for chunks, reply in scenarios:
+            _r, code = self.run_diag(chunks=chunks, reply=reply)
+            self.assertIn(code, rag.DIAGNOSTIC_CODES,
+                          "产出了枚举之外的标签：" + repr(code))
+
+    def test_diagnostic_is_never_inside_the_result(self):
+        """【核心】诊断标签绝不能混进结果字典里。"""
+        for chunks, reply in [([], None), (CHUNKS, "不是 JSON"), (CHUNKS, self.answer_json())]:
+            r, code = self.run_diag(chunks=chunks, reply=reply)
+            self.assertNotIn("diagnostic_code", r)
+            self.assertNotIn("diagnostic", r)
+            self.assertNotIn(code, json.dumps(r, ensure_ascii=False))
+
+    def test_diagnostic_carries_no_content_from_the_reply(self):
+        """【核心】标签里不能带上模型原始输出的任何片段。"""
+        marker = "ZZTOP-SECRET-MARKER-42"
+        _r, code = self.run_diag(reply=marker + " 这不是 JSON，只是随便一段话")
+        self.assertNotIn(marker, code)
+        self.assertEqual(code, rag.DIAG_INVALID_JSON)
+
+    def test_diagnostic_carries_no_exception_text(self):
+        """【核心】标签里不能带上异常原文。"""
+        marker = "内部细节-不该外露-8c1f"
+
+        def boom(model, messages, **kwargs):
+            raise RuntimeError(marker)
+        self.fake.chat.completions.create = boom
+
+        _r, code = self.run_diag()
+        self.assertNotIn(marker, code)
+        self.assertEqual(code, rag.DIAG_API_OR_RESPONSE_ERROR)
+
+    def test_codes_are_short_fixed_tokens(self):
+        """标签必须都是短的、写死的小写标识，不是句子。"""
+        for code in rag.DIAGNOSTIC_CODES:
+            self.assertIsInstance(code, str)
+            self.assertLessEqual(len(code), 32, code)
+            self.assertTrue(code.replace("_", "").isalnum(), code)
+            self.assertEqual(code, code.lower(), code)
+
+
+# ===================== 10. generate_answer 的返回格式恒定不变 =====================
+
+class TestPublicShapeIsUnchanged(RagTestCase):
+
+    def _results(self):
+        """把各种情况都跑一遍，收集 generate_answer 的返回值。"""
+        scenarios = [
+            ([], None),
+            (CHUNKS, self.answer_json()),
+            (CHUNKS, {"decision": "refuse", "answer": "x", "citations": []}),
+            (CHUNKS, {"decision": "insufficient_evidence", "answer": "x", "citations": []}),
+            (CHUNKS, "不是 JSON"),
+            (CHUNKS, "[1,2,3]"),
+            (CHUNKS, {"decision": "??", "answer": "x", "citations": []}),
+            (CHUNKS, {"decision": "answer", "answer": "x", "citations": []}),
+        ]
+        out = []
+        for chunks, reply in scenarios:
+            out.append(self.ask(chunks=chunks, reply=reply))
+        return out
+
+    def test_generate_answer_returns_exactly_three_keys(self):
+        """【核心】对外返回恒定只有 decision / answer / citations 三个键。"""
+        for r in self._results():
+            self.assertEqual(set(r.keys()), {"decision", "answer", "citations"},
+                             "返回的键不对：" + str(sorted(r.keys())))
+
+    def test_generate_answer_is_json_serializable(self):
+        """返回值必须能直接序列化——网页和结果文件都要用它。"""
+        for r in self._results():
+            json.dumps(r, ensure_ascii=False)
+
+    def test_generate_answer_has_no_diagnostic_leak(self):
+        """对外返回值里不能有任何诊断相关的痕迹。"""
+        for r in self._results():
+            blob = json.dumps(r, ensure_ascii=False)
+            for code in rag.DIAGNOSTIC_CODES:
+                self.assertNotIn(code, blob, "诊断标签泄漏进了对外结果：" + code)
+
+    def test_diagnostics_entry_point_returns_a_pair(self):
+        """带诊断的入口返回的是二元组 (结果, 标签)。"""
+        out = rag.generate_answer_with_diagnostics(
+            "问题", [dict(c) for c in CHUNKS], self.fake, MODEL)
+        self.assertIsInstance(out, tuple)
+        self.assertEqual(len(out), 2)
+        result, code = out
+        self.assertEqual(set(result.keys()), {"decision", "answer", "citations"})
+        self.assertIn(code, rag.DIAGNOSTIC_CODES)
+
+    def test_both_entry_points_agree(self):
+        """同一份输入，两个入口给出的结果字典必须完全一致。"""
+        self.fake.reply = self.answer_json()
+        plain = rag.generate_answer("问题", [dict(c) for c in CHUNKS], self.fake, MODEL)
+
+        self.fake.reply = self.answer_json()
+        with_diag, _code = rag.generate_answer_with_diagnostics(
+            "问题", [dict(c) for c in CHUNKS], self.fake, MODEL)
+
+        self.assertEqual(plain, with_diag)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)      # 直接 python test_rag.py 也能跑

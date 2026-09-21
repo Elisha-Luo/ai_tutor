@@ -72,6 +72,27 @@ DEFAULT_TOP_K = 3                         # 每题检索几段资料
 # 题库里每一道题必须具备的字段。缺了就没法判分，属于题库本身的错误。
 REQUIRED_CASE_KEYS = ("id", "question", "expected_behavior", "expected_sources", "category")
 
+# ===================== 三种期望行为 =====================
+#
+# 【术语直接引用 rag.py 的常量，不在两边各写一份字符串】
+# 评测器的「期望行为」和 rag.py 的「decision」用的是同一套词。
+# 它们必须一字不差地对应，否则判分会静默失真——分数看着正常，
+# 实际比的根本不是一回事。
+#
+# 【操作性边界】三种情况互斥，判断时按「资料能支持多少」来分：
+#   answer                —— 资料足以【完整】回答这个问题
+#   refuse                —— 资料对问题所需的事实【完全没有】支持
+#   insufficient_evidence —— 资料支持了问题的一部分，或者提到了相关对象，
+#                            但缺少完整回答所需的关键信息
+#
+# 【后两种都属于安全的「不回答」】
+# 区别只体现在严格判分上：该说「完全没支持」却说了「支持一部分」，
+# 不算错，但不算严格通过。反过来也一样。
+VALID_BEHAVIORS = (G.DECISION_ANSWER, G.DECISION_REFUSE, G.DECISION_INSUFFICIENT)
+
+# 不给出回答的那两种。
+NON_ANSWER_BEHAVIORS = (G.DECISION_REFUSE, G.DECISION_INSUFFICIENT)
+
 # 结果文件里每一条记录必须具备的字段。测试会拿这个清单去核对。
 REQUIRED_RECORD_KEYS = (
     "id", "question", "category",
@@ -81,7 +102,79 @@ REQUIRED_RECORD_KEYS = (
     "elapsed_ms",
     "strict_pass", "safe_pass",
     "needs_human_review", "failure_reason",
+    # 【只给后厨看的】这一次是在哪一步被拦下的。固定短枚举，不含任何内容。
+    # dry-run 不调用模型，所以这一项是 None。
+    "diagnostic_code",
 )
+
+# 【诊断标签里唯一由本文件产出的一个】
+# 其他标签都由 rag.generate_answer_with_diagnostics() 给出。
+# 这一个专门表示「检索这一步就炸了」——检索发生在 rag 之前，所以 rag 报告不了它。
+DIAG_RETRIEVAL_ERROR = "retrieval_error"
+
+# 【第二个由本文件产出的标签】表示「生成这一步抛出了它内部没接住的异常」。
+#
+# 注意它和 rag 自己报的那些标签不是一回事：
+#   · rag 报的 invalid_json / invalid_citations 等等，是「模型给的东西不合规」——
+#     属于预期内的降级，rag 内部已经妥善处理过了。
+#   · generation_error 是「生成这一步的程序本身炸了」——rag 的兜底都没接住，
+#     说明是代码缺陷，不是模型的问题。
+# 两者混在一起会把排查方向带偏，所以必须分开。
+DIAG_GENERATION_ERROR = "generation_error"
+
+# 不在名单里的标签一律换成这个。正常情况下永远不会出现。
+DIAG_UNKNOWN = "unknown"
+
+# 已知的全部诊断标签。键直接引用 rag 的常量，这样两边不会各自漂移。
+KNOWN_DIAGNOSTIC_CODES = frozenset(
+    G.DIAGNOSTIC_CODES | {DIAG_RETRIEVAL_ERROR, DIAG_GENERATION_ERROR}
+)
+
+# 标签的中文含义，只用于打印给人看，不参与数据和判分。
+DIAGNOSTIC_MEANINGS = {
+    G.DIAG_OK: "正常，通过了全部校验",
+    G.DIAG_NO_CHUNKS: "没有检索结果，直接拒答（未调用模型）",
+    G.DIAG_API_OR_RESPONSE_ERROR: "调用模型失败，或响应结构不对",
+    G.DIAG_INVALID_JSON: "模型返回的不是合法 JSON",
+    G.DIAG_RESPONSE_NOT_OBJECT: "返回的 JSON 合法，但不是对象",
+    G.DIAG_INVALID_DECISION: "decision 不是那三个合法值之一",
+    G.DIAG_INVALID_CITATIONS: "引用格式不对，或引用了白名单外的来源（编造来源）",
+    G.DIAG_EMPTY_ANSWER: "说好要回答，正文却是空的",
+    G.DIAG_MISSING_CITATIONS: "说好要回答，却一条引用都没给",
+    G.DIAG_CITATIONS_ON_NON_ANSWER: "拒答 / 证据不足，却带着引用",
+    DIAG_RETRIEVAL_ERROR: "检索这一步就出错了",
+    DIAG_GENERATION_ERROR: "生成这一步出现了未被内部处理的程序异常",
+    DIAG_UNKNOWN: "无法识别的标签（已按安全策略替换）",
+}
+
+
+def _safe_diagnostic(code):
+    """只放行固定枚举里的标签，其余一律换成 "unknown"。
+
+    【为什么要有这道闸】
+    diagnostic_code 的整个意义就是「短、固定、不含任何内容」。
+    万一以后有人手滑，把一个异常对象、一段模型原文或别的什么传进这个字段，
+    结果文件里就会混进不该有的东西——而结果文件是要长期留存的。
+
+    所以这里做一次白名单过滤：不在名单里的一律替换掉。
+    宁可丢掉诊断信息，也绝不让内容漏进记录。
+    """
+    if code is None:
+        return None                                    # None 是「没有诊断」，不是「未知标签」
+
+    # 【必须先判类型，再谈比对】
+    # `code in KNOWN_DIAGNOSTIC_CODES` 要先算出 code 的哈希值才能查集合，
+    # 而 dict / list / set 这类可变对象根本不支持哈希，会直接抛 TypeError。
+    #
+    # 这道闸本身就是「安全兜底」，兜底逻辑自己会崩是不可接受的——
+    # 一个本该保护记录的守卫，反而成了新的崩溃点。
+    #
+    # 【绝不用 str(code) 兜底】那样会把对象的内容变成字符串存进结果文件，
+    # 正是我们要防的泄露。所以非字符串一律直接判为 unknown，连看都不看。
+    if not isinstance(code, str):
+        return DIAG_UNKNOWN
+
+    return code if code in KNOWN_DIAGNOSTIC_CODES else DIAG_UNKNOWN
 
 
 # ===================== 读题库 =====================
@@ -124,20 +217,105 @@ def validate_cases(cases):
         seen_ids.add(cid)
 
         behavior = c.get("expected_behavior")
-        if behavior not in ("answer", "refuse"):
-            problems.append(str(cid) + "：expected_behavior 只能是 answer 或 refuse，实际是 " + str(behavior))
+        if behavior not in VALID_BEHAVIORS:
+            problems.append(str(cid) + "：expected_behavior 只能是 "
+                            + " / ".join(VALID_BEHAVIORS) + "，实际是 " + str(behavior))
 
         sources = c.get("expected_sources")
         if not isinstance(sources, list):
             problems.append(str(cid) + "：expected_sources 必须是数组")
-        elif behavior == "refuse" and sources:
-            # 拒答题却写了来源，自相矛盾——判分时会永远判不过
-            problems.append(str(cid) + "：拒答题的 expected_sources 必须是空数组")
-        elif behavior == "answer" and not sources:
+        elif behavior in NON_ANSWER_BEHAVIORS and sources:
+            # 期望「不回答」却写了来源，自相矛盾——判分时会永远判不过
+            problems.append(str(cid) + "：期望 " + str(behavior)
+                            + " 的题目，expected_sources 必须是空数组")
+        elif behavior == G.DECISION_ANSWER and not sources:
             # 该答题却没写来源，就没法判「引用对不对」了
             problems.append(str(cid) + "：该答题必须至少写一个 expected_sources")
 
     return problems
+
+
+# ===================== 按 ID 精确选题 =====================
+
+def select_cases(cases, case_ids):
+    """按题目 ID 挑出要跑的那几道题。
+
+    【为什么要有这个能力】
+    跑完整 33 题 = 33 次真实模型调用。做风险导向的小样本验收时，其实只需要
+    几道有代表性的题（比如：1 道普通回答 + 1 道跨来源 + 1 道普通拒答
+    + 1 道高相似陷阱拒答）——各类风险都覆盖到，又不用全场跑一遍。
+
+    【四条规则，写清楚免得踩坑】
+
+    1. 不传 case_ids（None 或空列表）→ 原样返回全部题目。
+       也就是「不加这个参数时，行为和以前一模一样」。
+
+    2. 顺序 = 【命令行上写的顺序】。
+       你在命令里怎么排，报告里就怎么出，所见即所得。
+       （没有采用「按题库原顺序」是因为那会让人对不上自己写的命令。）
+       排序稳定、可复现，同样输入永远同样输出。
+
+    3. 重复 ID → 【安全去重】，同一个 ID 只跑一次，保留第一次出现的位置。
+       选择去重而不是报错，理由：
+         · 真正要防的是「同一道题被跑两次」（那会多花钱、还污染统计），去重已经防住了；
+         · 报错则会把「复制粘贴时多带了一个」这种小事，升级成整个流程中断。
+       被去重掉的 ID 会原样返回给调用方，让它明确告诉用户。
+
+    4. 有 ID 不存在 → 返回错误，调用方必须【在调用任何模型之前】退出。
+       即使只有一部分 ID 是错的，也整批不跑 —— 宁可让你改好命令重来，
+       也不要在你没预期的情况下跑掉一半、
+       更不能让你以为「跑完了」。
+
+    返回值：
+        {
+          "cases":      选中的题目列表（未指定 ID 时就是全部题目）,
+          "errors":     错误信息列表；非空表示不能继续，必须直接退出,
+          "duplicates": 被去重掉的重复 ID,
+        }
+    """
+    if not case_ids:
+        return {"cases": list(cases), "errors": [], "duplicates": []}
+
+    # 先建一张「ID -> 题目」的表。题库里 id 是唯一的，这里再兜一层底：
+    # 万一重复，只认第一道，不让后面的悄悄盖掉。
+    by_id = {}
+    for c in cases:
+        cid = c.get("id")
+        if cid not in by_id:
+            by_id[cid] = c
+
+    selected = []
+    seen = set()
+    duplicates = []
+    unknown = []
+
+    for cid in case_ids:                      # 按命令行给出的顺序遍历
+        if cid not in by_id:
+            unknown.append(cid)
+            continue
+        if cid in seen:
+            duplicates.append(cid)            # 已经选过了，记一笔但不重复加入
+            continue
+        seen.add(cid)
+        selected.append(by_id[cid])
+
+    if unknown:
+        # 【只要有 ID 不认识，就整批作废，一个都不返回】
+        # 即使一部分 ID 写对了也不返回 —— 这是为了从结构上堵死「部分执行」：
+        # 哪怕调用方哪天忘了检查 errors，也不可能在用户以为「只跑四题」的情况下
+        # 跑掉其中两题。宁可让人改好命令重来。
+        return {
+            "cases": [],
+            "duplicates": duplicates,
+            "errors": [
+                "题库里没有这些题目 ID：" + "、".join(unknown),
+                "题库一共 " + str(len(by_id)) + " 道题，ID 形如："
+                + "、".join(list(by_id)[:6]) + " …",
+                "完整清单见 evals/rag_cases.json",
+            ],
+        }
+
+    return {"cases": selected, "errors": [], "duplicates": duplicates}
 
 
 # ===================== 判分 =====================
@@ -166,8 +344,8 @@ def score_case(case, result):
     cited = {c.get("source") for c in citations if isinstance(c, dict)}
 
     # ---------- 该答题 ----------
-    if behavior == "answer":
-        if decision != "answer":
+    if behavior == G.DECISION_ANSWER:
+        if decision != G.DECISION_ANSWER:
             # 没有硬答，所以是安全的；但该上菜没上，不算过
             return {
                 "strict_pass": False,
@@ -200,18 +378,27 @@ def score_case(case, result):
             ),
         }
 
-    # ---------- 该拒答题（refuse / trap_refuse）----------
-    strict = (decision == "refuse")                       # 明确拒答才算严格通过
-    safe = (decision != "answer") and (len(citations) == 0)   # 没硬答、且没带引用才算安全
+    # ---------- 期望「不回答」的题（refuse / insufficient_evidence）----------
+    no_citations = (len(citations) == 0)
+
+    # 【严格】要的那一个，恰好就是模型给的那一个，而且不带引用。
+    strict = (decision == behavior) and no_citations
+
+    # 【安全】只要不是「硬答」就算安全。
+    # refuse 和 insufficient_evidence 都属于安全的「不回答」——两者之间选错，
+    # 只是说得不够精确，不构成风险。真正危险的只有「资料不足却给了 answer」。
+    safe = (decision in NON_ANSWER_BEHAVIORS) and no_citations
 
     reason = None
-    if decision == "answer":
-        reason = "资料不支持回答，模型却给出了 answer —— 属于强行作答（编造风险）"
-    elif decision != "refuse":
-        reason = "期望明确拒答（refuse），实际是 " + str(decision)
+    if decision == G.DECISION_ANSWER:
+        reason = "资料不足以回答，模型却给出了 answer —— 属于强行作答（编造风险）"
+    elif decision != behavior:
+        reason = "期望 " + str(behavior) + "，实际是 " + str(decision)
+    elif not no_citations:
+        reason = "决定是 " + str(decision) + "，却带了引用 —— 不回答就不该给出处"
 
     review = None
-    if decision == "answer":
+    if decision == G.DECISION_ANSWER:
         review = "回答内容需人工复核"
     if not safe:
         review = (review + "；" if review else "") + "失败需复核：" + str(reason)
@@ -226,11 +413,11 @@ def score_case(case, result):
 
 # ===================== 组装一条记录 =====================
 
-def build_record(case, chunks, result, elapsed_ms):
-    """把「一道题 + 检索结果 + 模型输出 + 耗时」打包成一条记录。
+def build_record(case, chunks, result, elapsed_ms, diagnostic_code=None):
+    """把「一道题 + 检索结果 + 模型输出 + 耗时 + 诊断标签」打包成一条记录。
 
     result 传 None 时（dry-run），decision/answer 那几项留空，
-    判分字段也留 None —— 因为这一轮压根没问模型，判分是没有意义的。
+    判分字段和 diagnostic_code 也留 None —— 这一轮压根没问模型，谈不上诊断。
     """
     chunks = chunks or []
     return {
@@ -252,6 +439,11 @@ def build_record(case, chunks, result, elapsed_ms):
 
         "elapsed_ms": elapsed_ms,
 
+        # 【只给后厨看的退菜原因单】固定短枚举，不含任何内容。
+        # dry-run 时为 None（没调用模型，没什么可诊断的）。
+        # 过一道白名单闸：不是已知枚举就换成 "unknown"，绝不放过任意文本。
+        "diagnostic_code": _safe_diagnostic(diagnostic_code),
+
         # 判分（dry-run 时全部为 None）
         "strict_pass": None,
         "safe_pass": None,
@@ -268,11 +460,18 @@ def summarize(records, mode, model=None, top_k=DEFAULT_TOP_K):
     by_category = {}
     failures = []              # 不安全的输出（必须处理）
     safe_misses = []           # 安全、但没达到期望（要改进，但不危险）
+    diagnostics = {}           # 【退菜原因单】每个诊断标签各出现了几次
 
     for r in records:
         cat = r.get("category") or "未分类"
         bucket = by_category.setdefault(cat, {"total": 0, "strict_pass": 0, "safe_pass": 0})
         bucket["total"] += 1
+
+        # 诊断标签只统计，不参与判分——判分逻辑和以前完全一样。
+        # 它回答的是另一个问题：「降级发生在哪一步」。
+        code = r.get("diagnostic_code")
+        if code:
+            diagnostics[code] = diagnostics.get(code, 0) + 1
 
         if r.get("strict_pass"):
             counts["strict_pass"] += 1
@@ -310,6 +509,7 @@ def summarize(records, mode, model=None, top_k=DEFAULT_TOP_K):
         "by_category": by_category,
         "failures": failures,
         "safe_misses": safe_misses,
+        "diagnostics": diagnostics,
         "cases": records,
     }
 
@@ -439,19 +639,46 @@ def run_live(cases, client, model, top_k=DEFAULT_TOP_K, retrieve_fn=None):
         start = time.perf_counter()
 
         chunks = []          # 先摆好默认值，万一检索就炸了，后面组装记录时也有东西可用
+        diagnostic = None
+        result = None
+
+        # ---------- 第一道边界：只包住「检索」 ----------
+        # 【为什么非要把检索和生成分开包】
+        # 上一版用一个 try 把两件事一起包住，于是生成函数万一抛出未预料的异常，
+        # 也会被笼统标成 retrieval_error —— 排查方向直接被带偏：
+        # 检索明明成功了，却让人去查检索。
+        # 检索挂掉和生成挂掉是完全不同的两件事，修法也不同，边界必须分开。
         try:
             chunks = retrieve_fn(question, top_k)
-            result = G.generate_answer(question, chunks, client, model)
         except Exception:
             # 【不记录原始异常】异常里可能含内部细节、请求内容甚至密钥片段。
-            # 这里只留一句「这一题出错了」，具体原因去看 rag.py 的降级路径。
+            # 这里只留一句笼统的提示，外加一个写死的诊断标签。
             result = {"decision": "insufficient_evidence",
-                      "answer": "（这一题执行出错，已跳过）",
+                      "answer": "（检索这一步出错，已跳过）",
                       "citations": []}
+            diagnostic = DIAG_RETRIEVAL_ERROR
+
+        # ---------- 第二道边界：只包住「生成」 ----------
+        # 只有检索成功时才进入这里，所以这一段的异常绝不会被误标成 retrieval_error。
+        if diagnostic is None:
+            try:
+                # 【用带诊断的那个入口】普通入口只回三个键，看不出是在哪一步被拦下的——
+                # 上一轮 3 题全部降级却查不出原因，就是因为缺了这个。
+                # 拿回来的 diagnostic 是固定的短枚举，只写进评测记录，绝不进用户回答。
+                result, diagnostic = G.generate_answer_with_diagnostics(
+                    question, chunks, client, model)
+            except Exception:
+                # 能走到这里，说明 rag 内部那几道兜底也没接住 —— 属于代码缺陷，
+                # 不是模型的问题。所以单独一个标签，不和模型侧的降级混为一谈。
+                # 同样只打一个写死的标签，绝不记录异常原文。
+                result = {"decision": "insufficient_evidence",
+                          "answer": "（生成这一步出错，已跳过）",
+                          "citations": []}
+                diagnostic = DIAG_GENERATION_ERROR
 
         elapsed_ms = int(round((time.perf_counter() - start) * 1000))
 
-        record = build_record(case, chunks, result, elapsed_ms)
+        record = build_record(case, chunks, result, elapsed_ms, diagnostic)
         record.update(score_case(case, result))
         records.append(record)
 
@@ -602,6 +829,14 @@ def print_live_report(report):
               + "   严格通过 " + str(b["strict_pass"]).rjust(2)
               + "   安全通过 " + str(b["safe_pass"]).rjust(2))
 
+    # 【退菜原因单】只给后厨看：告诉我们菜是在哪一步被拦下的。
+    # 这里只出现固定的短标签，不会有异常原文、密钥、提示词或模型原话。
+    if report.get("diagnostics"):
+        print("\n【降级原因分布（只给后厨看）】")
+        for code, n in sorted(report["diagnostics"].items(), key=lambda kv: (-kv[1], kv[0])):
+            print("  " + str(code).ljust(26) + str(n).rjust(3) + " 题   "
+                  + DIAGNOSTIC_MEANINGS.get(code, ""))
+
     if report["failures"]:
         print("\n【失败清单（不安全，必须逐条看）】")
         for f in report["failures"]:
@@ -635,11 +870,41 @@ def main(argv=None):
                        help="【会产生真实费用】逐题调用 DeepSeek，33 次")
     parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K,
                         help="每题检索几段资料，默认 " + str(DEFAULT_TOP_K))
-    parser.add_argument("--limit", type=int, default=0,
-                        help="只跑前 N 题（调试用，0 表示全部）")
+
+    # 【选题范围：--limit 与 --case-id 二选一，不能同时给】
+    # 设成互斥是为了堵掉一个很容易犯的歧义：
+    # 命令里写了 4 个 --case-id、又顺手带了 --limit 3，到底跑哪几题？
+    # argparse 会直接报错，比让人猜强。
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--limit", type=int, default=None,
+                       help="只跑题库里的前 N 题（调试用；不传表示全部）")
+    scope.add_argument("--case-id", action="append", default=None, metavar="ID",
+                       help="只跑指定的题目 ID，可重复写多个，按给出顺序运行；与 --limit 互斥")
     args = parser.parse_args(argv)
 
     cases = load_cases()
+
+    # ---------- 按 ID 选题 ----------
+    # 【必须放在最前面】ID 写错时要在【任何模型调用之前】就失败，
+    # 而不是先跑掉几题才发现 —— 那样既浪费时间，又白花钱。
+    selection = select_cases(cases, args.case_id)
+    if selection["errors"]:
+        print("题目选择失败，没有运行任何题目：")
+        for e in selection["errors"]:
+            print("  · " + e)
+        return 1
+    cases = selection["cases"]
+
+    if selection["duplicates"]:
+        print("提醒：这些 ID 重复写了，已自动去重（每题只跑一次）："
+              + "、".join(selection["duplicates"]))
+
+    if args.case_id:
+        print("已按 --case-id 选中 " + str(len(cases)) + " 道题，按命令行给出的顺序运行：")
+        for c in cases:
+            print("  · " + str(c.get("id")).ljust(30) + "[" + str(c.get("category")) + "]")
+        print()
+
     if args.limit and args.limit > 0:
         cases = cases[:args.limit]
 

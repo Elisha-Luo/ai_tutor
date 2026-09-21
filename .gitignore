@@ -28,3 +28,13 @@ chat.db
 chat.db-journal
 chat.db-wal
 chat.db-shm
+
+# 【评测结果】--live 跑完产生的记录，每次带一个新时间戳。
+# 里面存着模型的完整回答，以及这一轮问过的问题原文。
+# 现在问的是自制演示资料，没什么机密；但将来换成真实客户资料时，
+# 这些东西就和 reports/ 一样敏感了——所以从一开始就别让它进仓库。
+#
+# 注意：这只忽略 results/ 这个子目录，evals/ 本身仍然会被跟踪，
+# 因为 evals/rag_cases.json（验收题库）和 evals/run_rag_eval.py 是要提交的。
+# 结果文件随时可以删掉重跑，不需要备份。
+evals/results/

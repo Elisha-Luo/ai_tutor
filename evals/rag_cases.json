@@ -234,18 +234,18 @@
   {
     "id": "trap-one-on-one-tutoring",
     "question": "课程有一对一辅导吗？",
-    "expected_behavior": "refuse",
+    "expected_behavior": "insufficient_evidence",
     "expected_sources": [],
-    "reason": "陷阱题。course_faq.md 讲的就是课程相关问题，检索必然命中，且文件中确实提到了「在学习群里提问」和「下次答疑」——但那是群内答疑，不是一对一辅导。资料从未提供一对一服务，不能顺着问题回答「有的」。",
-    "category": "trap_refuse"
+    "reason": "【重新标注：refuse → insufficient_evidence】资料提到了相关对象——course_faq.md 确实讲了「在学习群里提问」和「下次答疑」，这是课程的答疑机制。但它没有说明是否提供一对一辅导，缺的正是回答本题所需的关键信息。资料支持问题的一部分，不是完全无关，所以是「证据不足」而不是「全然无据」。绝不能顺着问题回答「有的」。",
+    "category": "trap_insufficient"
   },
   {
     "id": "trap-present-perfect-continuous",
     "question": "现在完成进行时和现在完成时有什么区别？",
-    "expected_behavior": "refuse",
+    "expected_behavior": "insufficient_evidence",
     "expected_sources": [],
-    "reason": "陷阱题，也是最容易翻车的一道。问法与 grammar_present_perfect.md 的主题几乎重合，检索命中率极高，但该文件只讲现在完成时，全文从未出现「现在完成进行时」或「进行时」，因此无法比较，只能拒答。",
-    "category": "trap_refuse"
+    "reason": "【重新标注：refuse → insufficient_evidence】这是最容易翻车的一道。问法与 grammar_present_perfect.md 的主题几乎重合，检索命中率极高。资料完整讲了比较的【一方】（现在完成时），但整篇没有出现过「现在完成进行时」——比较需要两边，缺的正是另一方。资料支持了问题的一半，属于「证据不足」，不能把时态规则套用过来硬答。",
+    "category": "trap_insufficient"
   },
   {
     "id": "trap-relative-clause",
@@ -258,9 +258,9 @@
   {
     "id": "trap-pronunciation-improvement",
     "question": "我的发音不标准，有什么纠正办法？",
-    "expected_behavior": "refuse",
+    "expected_behavior": "insufficient_evidence",
     "expected_sources": [],
-    "reason": "陷阱题。course_faq.md 在回答「零基础能学吗」时提到过课程包含发音，容易被误当成有依据，但该文件只是说明课程从发音开始教，并没有给出任何发音纠正方法。属于「提到了词，但没讲内容」。",
-    "category": "trap_refuse"
+    "reason": "【重新标注：refuse → insufficient_evidence】course_faq.md 在回答「零基础能学吗」时明确提到课程包含发音——这证明资料【提到了相关对象】。但它只说明课程从发音开始教，没有给出任何发音纠正方法，缺的正是本题要的答案。属于「提到了，但没讲内容」，是证据不足，不是完全无关。",
+    "category": "trap_insufficient"
   }
 ]

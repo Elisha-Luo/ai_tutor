@@ -40,6 +40,51 @@ DECISION_INSUFFICIENT = "insufficient_evidence"   # 资料沾边，但不足以�
 VALID_DECISIONS = {DECISION_ANSWER, DECISION_REFUSE, DECISION_INSUFFICIENT}
 
 
+# ===================== 诊断标签：只给后厨看的「退菜原因单」=====================
+#
+# 【为什么需要它】
+# 一次生成没通过校验被降级时，外面只能看到「insufficient_evidence」，
+# 看不出是哪一步拦下的——是根本没检索到资料？是 API 挂了？是模型返回的不是 JSON？
+# 还是它编了个来源？
+#
+# 对用户来说没必要区分：反正都是「这次没能给出可靠回答」。
+# 但对排查问题来说，这个区别是决定性的——修 API 和改提示词完全是两件事。
+#
+# 【所以单独给评测器开一个诊断入口】
+#     generate_answer()                   → 只回三个键，给用户 / 网页用（格式永不改变）
+#     generate_answer_with_diagnostics()  → 额外回一个 diagnostic_code，只给评测器用
+#
+# 【安全红线：这些是写死的短枚举，绝不含任何内容】
+# 任何一个标签都不可能带上：
+#   · 异常原文   · 密钥   · 完整提示词   · 模型的完整原始回答   · 请求内容
+# 诊断是为了定位问题，不是为了把厨房里的脏东西端上桌。
+
+DIAG_OK = "ok"                                          # 一切正常，回答通过全部校验
+DIAG_NO_CHUNKS = "no_chunks"                            # 没有检索结果 → 直接拒答（没调模型）
+DIAG_API_OR_RESPONSE_ERROR = "api_or_response_error"    # 调模型抛异常，或响应结构不对
+DIAG_INVALID_JSON = "invalid_json"                      # 模型返回的不是合法 JSON
+DIAG_RESPONSE_NOT_OBJECT = "response_not_object"        # JSON 合法，但不是对象（比如是数组）
+DIAG_INVALID_DECISION = "invalid_decision"              # decision 不是那三个合法值之一
+DIAG_INVALID_CITATIONS = "invalid_citations"            # 引用格式不对，或引了白名单外的来源（编造来源）
+DIAG_EMPTY_ANSWER = "empty_answer"                      # decision=answer，但正文是空的
+DIAG_MISSING_CITATIONS = "missing_citations"            # decision=answer，但一条引用都没给
+DIAG_CITATIONS_ON_NON_ANSWER = "citations_on_non_answer"  # 拒答 / 证据不足，却带着引用
+
+# 全部合法标签。测试用它核对「产出的标签必须都在这个集合里」。
+DIAGNOSTIC_CODES = frozenset({
+    DIAG_OK,
+    DIAG_NO_CHUNKS,
+    DIAG_API_OR_RESPONSE_ERROR,
+    DIAG_INVALID_JSON,
+    DIAG_RESPONSE_NOT_OBJECT,
+    DIAG_INVALID_DECISION,
+    DIAG_INVALID_CITATIONS,
+    DIAG_EMPTY_ANSWER,
+    DIAG_MISSING_CITATIONS,
+    DIAG_CITATIONS_ON_NON_ANSWER,
+})
+
+
 # ===================== 兜底文案 =====================
 # 【为什么这两条一律用固定文字，不用模型给的那段】
 # 因为 refuse 和 insufficient_evidence 本身就是「模型不可信」时的安全网。
@@ -179,18 +224,24 @@ def _normalize_citations(raw, allowed):
     return out
 
 
-def _degrade():
+def _degrade(diagnostic_code):
     """安全降级：任何一条校验没过，都回到这个结果。
+
+    【返回的是一个二元组】 (给用户看的安全结果, 只给后厨看的诊断标签)
+
+    特意用元组、而不是「往结果字典里多塞一个键」，是为了从结构上保证
+    诊断标签【不可能】漏进用户看到的回答里——generate_answer() 只取前一半，
+    后一半它压根拿不到。要是用字典加键，哪天忘了删就会一路漏到网页上。
 
     【为什么不把模型的原始错误信息告诉用户】
     原始错误可能包含内部细节、堆栈、甚至请求内容。对用户没有意义，
     还可能泄露不该露的东西。用户只需要知道「这次没能给出可靠回答」就够了。
     """
-    return {
+    return ({
         "decision": DECISION_INSUFFICIENT,
         "answer": INSUFFICIENT_TEXT,
         "citations": [],
-    }
+    }, diagnostic_code)
 
 
 # ===================== 对外的主函数 =====================
@@ -198,13 +249,37 @@ def _degrade():
 def generate_answer(question, chunks, client, model):
     """把「问题 + 已检索到的片段」交给模型，返回一个**可检查**的结果。
 
+    【格式永远不变】只返回 decision / answer / citations 这三个键，一个不多一个不少。
+    诊断信息【不从这里走】——那是后厨的事，见 generate_answer_with_diagnostics()。
+
+    网页、用户看到的就是这个函数的返回值，所以它的形状不能因为排查问题而改变。
+
+    参数和返回格式，见下面那个函数的完整说明。
+    """
+    result, _diagnostic_code = generate_answer_with_diagnostics(question, chunks, client, model)
+    return result
+
+
+def generate_answer_with_diagnostics(question, chunks, client, model):
+    """和 generate_answer 做同样的事，但额外回一个诊断标签。**只给评测器用。**
+
+    返回一个二元组：
+        ( 和 generate_answer 完全一样的结果字典, diagnostic_code )
+
+    第一个元素就是 generate_answer 的返回值，形状一模一样；
+    第二个元素是固定的短枚举（见文件顶部的 DIAG_*），
+    用来回答「这一次到底是在哪一步被拦下的」。
+
+    【安全】诊断标签只说明「哪一步失败了」，不含任何内容——
+    没有异常原文、没有密钥、没有提示词、没有模型的完整原始回答、没有请求内容。
+
     参数：
         question —— 用户问题（字符串）
         chunks   —— retriever.py 返回的检索片段列表，每项含 source / heading / text
         client   —— 外部传入的模型客户端（本模块不自己建客户端，也不碰密钥）
         model    —— 外部传入的模型名
 
-    返回（格式固定，永远是这三个键）：
+    generate_answer 的返回格式（格式固定，永远是这三个键）：
         {
           "decision": "answer" | "refuse" | "insufficient_evidence",
           "answer":   "给用户看的中文回答",
@@ -219,11 +294,11 @@ def generate_answer(question, chunks, client, model):
     # ---------- 第一道关：根本没有资料，直接拒答，【不调用模型】 ----------
     # 没有资料却还要问模型，等于逼着它凭记忆回答——那正是我们要避免的事。
     if not chunks:
-        return {
+        return ({
             "decision": DECISION_REFUSE,
             "answer": REFUSE_TEXT,
             "citations": [],
-        }
+        }, DIAG_NO_CHUNKS)
 
     # 这一批片段的「白名单」。后面所有引用都要拿它来对照。
     allowed = set()
@@ -244,26 +319,28 @@ def generate_answer(question, chunks, client, model):
     except Exception:
         # 网络抖了、模型炸了、回复结构不对……用户都不需要知道细节。
         # 注意这里【没有】把异常对象存下来、也没有往 answer 里塞 str(e)。
-        return _degrade()
+        # 诊断标签也是写死的常量，不带任何异常内容。
+        return _degrade(DIAG_API_OR_RESPONSE_ERROR)
 
     # ---------- 第三道关：解析 JSON ----------
     try:
         data = _parse_json(raw)
     except Exception:
-        return _degrade()
+        return _degrade(DIAG_INVALID_JSON)
 
     if not isinstance(data, dict):
-        return _degrade()
+        return _degrade(DIAG_RESPONSE_NOT_OBJECT)
 
     # ---------- 第四道关：decision 必须是那三个值之一 ----------
     decision = data.get("decision")
     if decision not in VALID_DECISIONS:
-        return _degrade()
+        return _degrade(DIAG_INVALID_DECISION)
 
     # ---------- 第五道关：citations 必须全部来自本次传入的片段 ----------
     citations = _normalize_citations(data.get("citations", []), allowed)
     if citations is None:
-        return _degrade()
+        # 这一步同时也是「编造来源」的拦截点：引用了没给它的文件名或标题。
+        return _degrade(DIAG_INVALID_CITATIONS)
 
     # ---------- 第六道关：分情况裁决 ----------
     if decision == DECISION_ANSWER:
@@ -271,27 +348,27 @@ def generate_answer(question, chunks, client, model):
 
         # 回答内容不能是空的——说好要回答，却没给内容，属于格式不合格
         if not isinstance(text, str) or not text.strip():
-            return _degrade()
+            return _degrade(DIAG_EMPTY_ANSWER)
 
         # 【answer 必须至少有一条引用】没有引用 = 说完话不给出处 = 不可查证。
         # 这正是 RAG 存在的意义，缺了就否掉，不留情面。
         if not citations:
-            return _degrade()
+            return _degrade(DIAG_MISSING_CITATIONS)
 
-        return {
+        return ({
             "decision": DECISION_ANSWER,
             "answer": text.strip(),
             "citations": citations,
-        }
+        }, DIAG_OK)
 
     # 走到这里只剩 refuse 和 insufficient_evidence 两种。
     # 【它们必须没有引用】没给答案却给了出处，本身自相矛盾；
     # 更麻烦的是，这种「无效却看着有据」的输出最容易骗到用户。
     if citations:
-        return _degrade()
+        return _degrade(DIAG_CITATIONS_ON_NON_ANSWER)
 
-    return {
+    return ({
         "decision": decision,
         "answer": REFUSE_TEXT if decision == DECISION_REFUSE else INSUFFICIENT_TEXT,
         "citations": [],
-    }
+    }, DIAG_OK)

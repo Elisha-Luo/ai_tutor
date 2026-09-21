@@ -760,5 +760,805 @@ class TestEnvFileIntegration(unittest.TestCase):
         self.assertEqual(self.saved_env_path, os.path.join(BASE, ".env"))
 
 
+# ===================== 11. 诊断标签（评测记录里的「退菜原因单」）=====================
+#
+# 【背景】上一轮跑了 3 题真实试水，结果是 0 严格通过、3 个安全降级。
+# 但记录里只写「insufficient_evidence」，看不出是 API 挂了、JSON 解析失败、
+# 引用不在白名单，还是输出字段无效——没法定位根因。
+# 这一组测试保证：以后每条记录都能说出「菜是在哪一步被拦下的」。
+
+class TestDiagnosticsInRecords(unittest.TestCase):
+
+    def test_live_records_carry_a_diagnostic_code(self):
+        """live 记录里必须带诊断标签。"""
+        client = FakeClient([
+            reply("answer", citations=cite("grammar_present_perfect.md")),
+            reply("answer", citations=cite("course_faq.md", "vocabulary_study_method.md")),
+            reply("refuse", citations=[]),
+            reply("refuse", citations=[]),
+        ])
+        report = runner.run_live(CASES, client, "fake-model", retrieve_fn=fake_retrieve)
+
+        for rec in report["cases"]:
+            self.assertIn("diagnostic_code", rec)
+            self.assertIn(rec["diagnostic_code"], runner.KNOWN_DIAGNOSTIC_CODES)
+        self.assertEqual(report["diagnostics"], {"ok": 4})
+
+    def test_degraded_cases_report_the_exact_stage(self):
+        """【核心】降级发生在哪一步，要能从标签直接读出来。"""
+        client = FakeClient([
+            "这不是 JSON",                                                       # a1
+            reply("answer", citations=[{"source": "假的.md", "heading": "假的"}]),  # x1
+            reply("answer", citations=[]),                                       # r1
+            reply("refuse", citations=[]),                                       # t1
+        ])
+        report = runner.run_live(CASES, client, "fake-model", retrieve_fn=fake_retrieve)
+
+        codes = {r["id"]: r["diagnostic_code"] for r in report["cases"]}
+        self.assertEqual(codes["a1"], "invalid_json")
+        self.assertEqual(codes["x1"], "invalid_citations")     # 编造来源
+        self.assertEqual(codes["r1"], "missing_citations")     # 该答却没给引用
+        self.assertEqual(codes["t1"], "ok")
+
+        self.assertEqual(report["diagnostics"]["invalid_json"], 1)
+        self.assertEqual(report["diagnostics"]["invalid_citations"], 1)
+        self.assertEqual(report["diagnostics"]["missing_citations"], 1)
+
+    def test_api_error_is_its_own_code(self):
+        """模型抛异常 → api_or_response_error，且异常原文不进报告。"""
+        marker = "EXC-DETAIL-SHOULD-NOT-LEAK-7f21"
+        client = FakeClient()
+        client.raise_error = RuntimeError(marker)
+
+        report = runner.run_live(CASES[:1], client, "fake-model", retrieve_fn=fake_retrieve)
+
+        self.assertEqual(report["cases"][0]["diagnostic_code"], "api_or_response_error")
+        self.assertNotIn(marker, json.dumps(report, ensure_ascii=False))
+
+    def test_retrieval_failure_has_its_own_code(self):
+        """检索自己炸了 → retrieval_error，不冒充成模型的问题。"""
+        def boom_retrieve(question, top_k=3):
+            raise RuntimeError("检索挂了")
+        client = FakeClient([reply("refuse")])
+
+        report = runner.run_live(CASES[:1], client, "fake-model", retrieve_fn=boom_retrieve)
+        self.assertEqual(report["cases"][0]["diagnostic_code"], "retrieval_error")
+
+    def test_dry_run_records_have_null_diagnostic(self):
+        """【核心】dry-run 不调用模型，诊断字段必须是 None。"""
+        rec = runner.build_record(CASES[0], [{"source": "x", "heading": "y"}], None, 0)
+        self.assertIsNone(rec["diagnostic_code"])
+
+        report = runner.run_dry(CASES, retrieve_fn=fake_retrieve)
+        self.assertTrue(report["record_shape_ok"], report["record_shape_problems"])
+        self.assertEqual(report["record_shape_problems"], [])
+
+    def test_dry_run_report_contains_no_model_dependent_fields(self):
+        """dry-run 不调用模型，报告里不该出现任何依赖模型产出的字段。"""
+        report = runner.run_dry(CASES, retrieve_fn=fake_retrieve)
+        self.assertNotIn("diagnostics", report)
+        self.assertNotIn("cases", report)
+
+    def test_unknown_code_is_replaced_by_unknown(self):
+        """【核心】不在固定枚举里的标签一律替换掉——绝不放过任意文本。"""
+        rec = runner.build_record(CASES[0], [], None, 0,
+                                  diagnostic_code="模型说了一段话-这不该出现在记录里")
+        self.assertEqual(rec["diagnostic_code"], "unknown")
+
+    def test_every_known_code_passes_the_gate(self):
+        """枚举里的每个标签都要能原样通过，不被误杀。"""
+        for code in runner.KNOWN_DIAGNOSTIC_CODES:
+            rec = runner.build_record(CASES[0], [], None, 0, diagnostic_code=code)
+            self.assertEqual(rec["diagnostic_code"], code)
+
+    def test_none_stays_none_through_the_gate(self):
+        """None 是「没有诊断」，不是「未知标签」，不能被换成 unknown。"""
+        self.assertIsNone(runner._safe_diagnostic(None))
+
+    def test_report_leaks_no_raw_model_output(self):
+        """【核心】模型的完整原始回答绝不能出现在结果里。"""
+        marker = "ZZTOP-RAW-MODEL-OUTPUT-必须不能出现"
+        client = FakeClient([marker + " 这根本不是 JSON"])
+
+        report = runner.run_live(CASES[:1], client, "fake-model", retrieve_fn=fake_retrieve)
+        blob = json.dumps(report, ensure_ascii=False)
+
+        self.assertNotIn(marker, blob, "模型的原始输出泄漏进结果了")
+        self.assertEqual(report["cases"][0]["diagnostic_code"], "invalid_json")
+
+    def test_report_leaks_no_secret_shaped_string(self):
+        """结果里不能出现任何像密钥的字符串。"""
+        client = FakeClient([reply("answer", citations=cite("grammar_present_perfect.md"))])
+        report = runner.run_live(CASES[:1], client, "fake-model", retrieve_fn=fake_retrieve)
+        self.assertNotIn("sk-", json.dumps(report, ensure_ascii=False))
+
+    def test_scoring_is_unaffected_by_diagnostics(self):
+        """【核心】判分逻辑完全没变：全对仍然全通过。"""
+        client = FakeClient([
+            reply("answer", citations=cite("grammar_present_perfect.md")),
+            reply("answer", citations=cite("course_faq.md", "vocabulary_study_method.md")),
+            reply("refuse", citations=[]),
+            reply("refuse", citations=[]),
+        ])
+        report = runner.run_live(CASES, client, "fake-model", retrieve_fn=fake_retrieve)
+
+        self.assertEqual(report["counts"]["strict_pass"], 4)
+        self.assertEqual(report["counts"]["safe_pass"], 4)
+        self.assertEqual(report["counts"]["failed"], 0)
+        self.assertEqual(report["failures"], [])
+        self.assertEqual(report["safe_misses"], [])
+
+    def test_diagnostic_summary_is_json_serializable(self):
+        """带诊断的整份报告仍然要能直接写进结果文件。"""
+        client = FakeClient([
+            "坏 JSON",
+            reply("answer", citations=[{"source": "假的.md", "heading": "假的"}]),
+            reply("refuse", citations=[]),
+            reply("refuse", citations=[]),
+        ])
+        report = runner.run_live(CASES, client, "fake-model", retrieve_fn=fake_retrieve)
+        json.dumps(report, ensure_ascii=False)
+        self.assertIn("diagnostics", report)
+
+    def test_every_diagnostic_has_a_human_readable_meaning(self):
+        """每个标签都要有中文说明——否则报告上会显示空白，等于没写。"""
+        for code in runner.KNOWN_DIAGNOSTIC_CODES:
+            self.assertIn(code, runner.DIAGNOSTIC_MEANINGS, "标签没有中文说明：" + code)
+            self.assertTrue(runner.DIAGNOSTIC_MEANINGS[code].strip())
+
+
+# ===================== 12. 白名单闸必须能处理任意类型（缺陷一回归）=====================
+#
+# 【缺陷一是什么】
+# `_safe_diagnostic()` 原来是这么写的：
+#     return code if code in KNOWN_DIAGNOSTIC_CODES else DIAG_UNKNOWN
+# `code in 集合` 需要先算出 code 的哈希值，而 dict / list / set 不可哈希，
+# 于是直接抛 TypeError。
+#
+# 讽刺的是：这道闸本身就是「出了意外时兜底」用的。一个本该保护记录的守卫，
+# 反而成了新的崩溃点——而且它崩的时候，正是最需要它别崩的时候。
+
+class TestSafeDiagnosticGate(unittest.TestCase):
+
+    SECRET = "SECRET-MARKER-INSIDE-AN-OBJECT-3a91"
+
+    def test_none_still_returns_none(self):
+        """None 是「没有诊断」，不是「未知标签」。"""
+        self.assertIsNone(runner._safe_diagnostic(None))
+
+    def test_known_codes_pass_through(self):
+        """枚举里的每个标签都要能原样通过，不被误杀。"""
+        for code in runner.KNOWN_DIAGNOSTIC_CODES:
+            self.assertEqual(runner._safe_diagnostic(code), code)
+
+    def test_unknown_string_becomes_unknown(self):
+        """不在枚举里的字符串 → unknown。"""
+        self.assertEqual(runner._safe_diagnostic("一个不在枚举里的标签"), "unknown")
+
+    def test_arbitrary_types_return_unknown_without_raising(self):
+        """【核心】字典、列表、集合等不可哈希对象，必须安全返回 unknown，不能抛异常。"""
+        weird_values = [
+            {"raw": self.SECRET},                       # 字典（不可哈希）—— 就是它先崩的
+            [self.SECRET],                              # 列表（不可哈希）
+            {self.SECRET},                              # 集合（不可哈希）
+            (self.SECRET,),                             # 元组（本身可哈希，内容不可哈希）
+            {"nested": {"deep": [self.SECRET]}},        # 嵌套结构
+            42,                                          # 整数
+            3.14,                                        # 浮点数
+            True,                                        # 布尔
+            object(),                                    # 裸对象
+            RuntimeError(self.SECRET),                   # 异常对象
+            b"bytes",                                    # 字节串
+        ]
+        for value in weird_values:
+            try:
+                out = runner._safe_diagnostic(value)
+            except Exception as exc:
+                self.fail("对 " + type(value).__name__ + " 抛了异常："
+                          + type(exc).__name__ + " —— 兜底逻辑自己崩了")
+            self.assertEqual(out, "unknown",
+                             type(value).__name__ + " 没有返回 unknown，而是 " + repr(out))
+
+    def test_object_content_is_never_stringified(self):
+        """【核心】绝不能把对象 str() 一下存进去——那正是泄露路径。"""
+        for value in [{"raw": self.SECRET}, [self.SECRET], RuntimeError(self.SECRET)]:
+            out = runner._safe_diagnostic(value)
+            self.assertNotIn(self.SECRET, out, "对象内容被转成字符串留下了")
+            self.assertEqual(out, "unknown")
+
+    def test_secret_objects_do_not_leak_through_build_record(self):
+        """【核心】端到端：把带秘密特征串的对象塞进诊断字段，结果里不能出现它。"""
+        for value in [{"raw": self.SECRET}, [self.SECRET], {self.SECRET},
+                      RuntimeError(self.SECRET), {"nested": [self.SECRET]}]:
+            rec = runner.build_record(CASES[0], [], None, 0, diagnostic_code=value)
+            blob = json.dumps(rec, ensure_ascii=False)
+
+            self.assertEqual(rec["diagnostic_code"], "unknown")
+            self.assertNotIn(self.SECRET, blob,
+                             type(value).__name__ + " 的内容泄露进记录了")
+
+    def test_diagnostic_field_is_always_a_short_token(self):
+        """不管传什么进来，落盘的一定是短小的固定 token 或 None。"""
+        for value in [{"a": self.SECRET}, [1, 2, 3], object(), None, "ok", "非法标签", 3.5]:
+            code = runner.build_record(CASES[0], [], None, 0,
+                                       diagnostic_code=value)["diagnostic_code"]
+            if code is None:
+                continue
+            self.assertIsInstance(code, str)
+            self.assertLessEqual(len(code), 32, "标签太长了：" + code)
+            self.assertIn(code, runner.KNOWN_DIAGNOSTIC_CODES | {"unknown"})
+
+    def test_the_gate_never_raises_for_any_input(self):
+        """穷举一遍常见类型，确认这道闸对任何输入都不抛异常。"""
+        for value in [None, "", "ok", 0, 1, -1, [], {}, set(), (), object(),
+                      Exception(), BaseException(), lambda: None, type]:
+            try:
+                runner._safe_diagnostic(value)
+            except Exception as exc:
+                self.fail("输入 " + repr(type(value)) + " 时抛了 " + type(exc).__name__)
+
+
+# ===================== 13. 检索异常 vs 生成异常（缺陷二回归）=====================
+#
+# 【缺陷二是什么】
+# `run_live()` 原来用一个 try 同时包住检索和生成，异常分支一律写死 retrieval_error。
+# 于是「检索成功、生成函数意外抛异常」会被误标成 retrieval_error——
+# 排查方向直接被带偏：检索明明是好的，却让人去查检索。
+#
+# 修复后是两个独立边界：
+#   · retrieve_fn 抛异常            → retrieval_error
+#   · 生成函数抛出未处理的异常        → generation_error
+# 两者绝不混淆。
+
+class TestGenerationVsRetrievalError(unittest.TestCase):
+
+    def patch_generate_to_raise(self, exc):
+        """把评测器用的那个生成函数换成「一定抛异常」的版本，返回还原函数。"""
+        original = runner.G.generate_answer_with_diagnostics
+
+        def boom(question, chunks, client, model):
+            raise exc
+        runner.G.generate_answer_with_diagnostics = boom
+        return lambda: setattr(runner.G, "generate_answer_with_diagnostics", original)
+
+    def test_retrieval_failure_is_labelled_retrieval_error(self):
+        """【1】检索抛异常 → retrieval_error。"""
+        def boom_retrieve(question, top_k=3):
+            raise RuntimeError("检索挂了")
+        client = FakeClient([reply("refuse")])
+
+        report = runner.run_live(CASES[:1], client, "fake-model", retrieve_fn=boom_retrieve)
+
+        self.assertEqual(report["cases"][0]["diagnostic_code"], "retrieval_error")
+        self.assertEqual(len(client.calls), 0, "检索都失败了，不该还去调用模型")
+
+    def test_generation_failure_is_labelled_generation_error(self):
+        """【2】检索成功、生成函数意外抛异常 → generation_error（不是 retrieval_error）。"""
+        restore = self.patch_generate_to_raise(RuntimeError("生成炸了"))
+        try:
+            client = FakeClient([reply("refuse")])
+            report = runner.run_live(CASES[:1], client, "fake-model", retrieve_fn=fake_retrieve)
+        finally:
+            restore()
+
+        code = report["cases"][0]["diagnostic_code"]
+        self.assertEqual(code, "generation_error")
+        # 【最关键的断言】绝不能被误标成检索的问题
+        self.assertNotEqual(code, "retrieval_error")
+
+    def test_both_failure_kinds_do_not_leak_exception_text(self):
+        """【3】两种失败都不许把异常原文写进结果。"""
+        marker = "EXC-DETAIL-MUST-NOT-LEAK-5d2a"
+
+        # 检索异常
+        def boom_retrieve(question, top_k=3):
+            raise RuntimeError(marker)
+        client = FakeClient([reply("refuse")])
+        rep1 = runner.run_live(CASES[:1], client, "fake-model", retrieve_fn=boom_retrieve)
+
+        # 生成异常
+        restore = self.patch_generate_to_raise(RuntimeError(marker))
+        try:
+            client2 = FakeClient([reply("refuse")])
+            rep2 = runner.run_live(CASES[:1], client2, "fake-model", retrieve_fn=fake_retrieve)
+        finally:
+            restore()
+
+        for rep in (rep1, rep2):
+            blob = json.dumps(rep, ensure_ascii=False)
+            self.assertNotIn(marker, blob, "异常原文泄露进结果了")
+
+    def test_failure_paths_tell_the_user_something_safe(self):
+        """两种失败给出的对外说明都必须是笼统的安全文字。"""
+        def boom_retrieve(question, top_k=3):
+            raise RuntimeError("检索挂了")
+        client = FakeClient([reply("refuse")])
+        rep = runner.run_live(CASES[:1], client, "fake-model", retrieve_fn=boom_retrieve)
+
+        answer = rep["cases"][0]["answer"]
+        self.assertIn("检索", answer)
+        self.assertNotIn("检索挂了", answer)
+
+    def test_normal_paths_and_scoring_are_unaffected(self):
+        """【4】正常诊断标签和原有判分完全不受影响。"""
+        client = FakeClient([
+            reply("answer", citations=cite("grammar_present_perfect.md")),
+            reply("answer", citations=cite("course_faq.md", "vocabulary_study_method.md")),
+            reply("refuse", citations=[]),
+            reply("refuse", citations=[]),
+        ])
+        report = runner.run_live(CASES, client, "fake-model", retrieve_fn=fake_retrieve)
+
+        self.assertEqual(report["counts"]["strict_pass"], 4)
+        self.assertEqual(report["counts"]["safe_pass"], 4)
+        self.assertEqual(report["counts"]["failed"], 0)
+        self.assertEqual(report["failures"], [])
+        self.assertEqual(report["diagnostics"], {"ok": 4})
+
+    def test_generation_error_is_registered_everywhere(self):
+        """新标签必须同时进白名单、中文说明，且是固定短枚举。"""
+        self.assertIn(runner.DIAG_GENERATION_ERROR, runner.KNOWN_DIAGNOSTIC_CODES)
+        self.assertIn(runner.DIAG_GENERATION_ERROR, runner.DIAGNOSTIC_MEANINGS)
+        self.assertTrue(runner.DIAGNOSTIC_MEANINGS[runner.DIAG_GENERATION_ERROR].strip())
+        self.assertEqual(runner.DIAG_GENERATION_ERROR, "generation_error")
+
+
+# ===================== 14. 按 case ID 精确选题 =====================
+#
+# 【为什么需要这个能力】
+# 跑完整 33 题 = 33 次真实模型调用。做风险导向的小样本验收时，其实只要几道
+# 有代表性的题就够：1 道普通回答 + 1 道跨来源 + 1 道普通拒答 + 1 道陷阱拒答，
+# 各类风险都覆盖到，又不用全场跑一遍。
+#
+# 【这一组测试盯住四件事】
+#   1. 只跑明确指定的题，一道都不多；
+#   2. ID 写错时【在调用模型之前】就失败——绝不能先跑掉几题才发现；
+#   3. 重复 ID 不会导致重复调用（重复调用会多花钱）；
+#   4. 不指定时，原有行为一字不变。
+
+def _any_retrieve(question, top_k=3):
+    """不管问什么都返回同一段资料——用来让指定的题都能走到模型那一步。"""
+    return [{"source": "grammar_present_perfect.md",
+             "heading": "H-grammar_present_perfect.md", "text": "正文"}]
+
+
+class TestSelectCases(unittest.TestCase):
+    """select_cases() 本身的规则。"""
+
+    def setUp(self):
+        self.cases = runner.load_cases()
+
+    def test_no_ids_returns_everything_unchanged(self):
+        """【核心】不传 ID → 返回全部题目，顺序原样。"""
+        out = runner.select_cases(self.cases, None)
+        self.assertEqual(out["errors"], [])
+        self.assertEqual([c["id"] for c in out["cases"]],
+                         [c["id"] for c in self.cases])
+
+    def test_empty_id_list_also_returns_everything(self):
+        out = runner.select_cases(self.cases, [])
+        self.assertEqual(len(out["cases"]), len(self.cases))
+
+    def test_multiple_ids_select_only_those(self):
+        """多个 ID 只选中对应的题，一道不多一道不少。"""
+        out = runner.select_cases(self.cases, ["pp-since-for", "refuse-price"])
+        self.assertEqual([c["id"] for c in out["cases"]], ["pp-since-for", "refuse-price"])
+        self.assertEqual(out["errors"], [])
+
+    def test_order_follows_the_command_line_not_the_bank(self):
+        """顺序按命令行给的走 —— 你在命令里怎么排，报告里就怎么出。"""
+        first = runner.select_cases(self.cases, ["refuse-price", "pp-structure"])
+        second = runner.select_cases(self.cases, ["pp-structure", "refuse-price"])
+        self.assertEqual([c["id"] for c in first["cases"]], ["refuse-price", "pp-structure"])
+        self.assertEqual([c["id"] for c in second["cases"]], ["pp-structure", "refuse-price"])
+
+    def test_selection_is_deterministic(self):
+        """同样输入永远同样输出。"""
+        ids = ["cross-why-forget", "trap-present-perfect-continuous", "faq-device"]
+        runs = [[c["id"] for c in runner.select_cases(self.cases, ids)["cases"]]
+                for _ in range(3)]
+        self.assertEqual(runs[0], runs[1])
+        self.assertEqual(runs[1], runs[2])
+
+    def test_unknown_id_produces_an_error_and_selects_nothing(self):
+        out = runner.select_cases(self.cases, ["根本没有这道题"])
+        self.assertTrue(out["errors"])
+        self.assertEqual(out["cases"], [])
+
+    def test_one_bad_id_blocks_the_whole_selection(self):
+        """【核心】只要有一个 ID 不存在，整批都不跑。
+
+        不在「部分执行」上赌运气：宁可让你改好命令重来，
+        也不要跑掉一半还让你以为跑完了。
+        """
+        out = runner.select_cases(self.cases, ["pp-since-for", "不存在的题"])
+        self.assertTrue(out["errors"])
+        self.assertEqual(out["cases"], [])
+
+    def test_error_message_names_the_bad_ids(self):
+        out = runner.select_cases(self.cases, ["假的题一", "假的题二"])
+        joined = " ".join(out["errors"])
+        self.assertIn("假的题一", joined)
+        self.assertIn("假的题二", joined)
+
+    def test_duplicate_ids_are_deduped(self):
+        """重复 ID 去重，同一道题只跑一次。"""
+        out = runner.select_cases(self.cases, ["refuse-price", "refuse-price"])
+        self.assertEqual([c["id"] for c in out["cases"]], ["refuse-price"])
+        self.assertEqual(out["duplicates"], ["refuse-price"])
+
+    def test_dedup_keeps_the_first_position(self):
+        out = runner.select_cases(self.cases, ["refuse-price", "pp-since-for", "refuse-price"])
+        self.assertEqual([c["id"] for c in out["cases"]], ["refuse-price", "pp-since-for"])
+
+    def test_selected_cases_are_the_real_objects(self):
+        out = runner.select_cases(self.cases, ["pp-structure"])
+        self.assertEqual(out["cases"][0]["id"], "pp-structure")
+        self.assertIn("question", out["cases"][0])
+        self.assertIn("expected_sources", out["cases"][0])
+
+    def test_the_risk_sample_covers_four_distinct_categories(self):
+        """风险小样本四道题，要落在四个不同的 category 上。
+
+        注意 `trap-present-perfect-continuous` 现在属于 `trap_insufficient` 而不是
+        `trap_refuse`——资料讲了比较的一方，属于「提到了但没讲透」。
+        """
+        ids = ["pp-since-for", "cross-why-forget",
+               "refuse-price", "trap-present-perfect-continuous"]
+        out = runner.select_cases(self.cases, ids)
+        self.assertEqual([c["category"] for c in out["cases"]],
+                         ["answer", "cross_source", "refuse", "trap_insufficient"])
+
+
+class TestCaseSelectionCommandLine(unittest.TestCase):
+    """命令行这一层的行为。"""
+
+    def run_main(self, argv):
+        """跑 main()，把打印接住，返回 (退出码, 输出文字)。"""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            try:
+                code = runner.main(argv)
+            except SystemExit as exc:
+                code = exc.code
+        return code, buf.getvalue()
+
+    def test_dry_run_with_case_ids_selects_only_those(self):
+        code, text = self.run_main(["--dry-run", "--case-id", "pp-since-for",
+                                    "--case-id", "refuse-price"])
+        self.assertEqual(code, 0)
+        self.assertIn("选中 2 道题", text)
+        self.assertIn("pp-since-for", text)
+        self.assertIn("refuse-price", text)
+
+    def test_unknown_id_exits_nonzero(self):
+        code, text = self.run_main(["--dry-run", "--case-id", "根本没有这道题"])
+        self.assertNotEqual(code, 0, "未知 ID 必须退出非零")
+        self.assertIn("题目选择失败", text)
+        self.assertIn("没有运行任何题目", text)
+
+    def test_unknown_id_blocks_live_before_any_model_call(self):
+        """【核心】未知 ID 在 --live 下也必须在【创建客户端之前】就失败。"""
+        created = []
+        original = runner.make_client
+        runner.make_client = lambda: (created.append(1), FakeClient())[1]
+        try:
+            code, text = self.run_main(["--live", "--case-id", "根本没有这道题"])
+        finally:
+            runner.make_client = original
+
+        self.assertNotEqual(code, 0)
+        self.assertEqual(created, [], "未知 ID 时不该创建模型客户端")
+        self.assertIn("题目选择失败", text)
+
+    def test_duplicate_ids_run_only_once(self):
+        code, text = self.run_main(["--dry-run", "--case-id", "refuse-price",
+                                    "--case-id", "refuse-price"])
+        self.assertEqual(code, 0)
+        self.assertIn("选中 1 道题", text)
+        self.assertIn("重复", text)
+
+    def test_no_case_id_keeps_the_original_behaviour(self):
+        """【核心】不指定 --case-id 时，行为完全不变。"""
+        code, text = self.run_main(["--dry-run", "--limit", "3"])
+        self.assertEqual(code, 0)
+        self.assertIn("【题库】3 道题", text)
+        self.assertNotIn("已按 --case-id", text)
+
+    def test_default_is_still_all_33(self):
+        code, text = self.run_main(["--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertIn("【题库】33 道题", text)
+
+    def test_case_id_and_limit_are_mutually_exclusive(self):
+        """两个一起给会直接报错退 2 —— 好过让人猜到底跑了哪几题。"""
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as ctx:
+                runner.main(["--dry-run", "--case-id", "refuse-price", "--limit", "2"])
+        self.assertTrue(str(ctx.exception.code) != "0")
+
+    def test_dry_run_with_case_ids_calls_no_model_and_writes_nothing(self):
+        """【核心】按 ID 跑 dry-run：不调用模型、不创建结果文件。"""
+        original = runner.RESULTS_DIR
+        with tempfile.TemporaryDirectory() as td:
+            runner.RESULTS_DIR = os.path.join(td, "不该被创建")
+            try:
+                code, text = self.run_main(["--dry-run", "--case-id", "refuse-price"])
+            finally:
+                runner.RESULTS_DIR = original
+
+            self.assertEqual(code, 0)
+            self.assertFalse(os.path.exists(os.path.join(td, "不该被创建")),
+                             "dry-run 不该创建结果目录")
+        self.assertIn("没有调用任何模型", text)
+
+    def test_live_selection_runs_only_the_selected_cases(self):
+        """【核心】live 只跑选中的题，而且只用假客户端（不碰真实 API）。"""
+        cases = runner.select_cases(
+            runner.load_cases(), ["pp-since-for", "refuse-price"])["cases"]
+
+        client = FakeClient([
+            reply("answer", citations=cite("grammar_present_perfect.md")),   # pp-since-for
+            reply("refuse", citations=[]),                                   # refuse-price
+        ])
+        report = runner.run_live(cases, client, "fake-model", retrieve_fn=_any_retrieve)
+
+        self.assertEqual(report["total"], 2)
+        self.assertEqual([r["id"] for r in report["cases"]],
+                         ["pp-since-for", "refuse-price"])
+        self.assertEqual(len(client.calls), 2, "每题只该调用一次模型")
+
+    def test_live_selection_preserves_scoring(self):
+        """选题之后判分照常工作。"""
+        cases = runner.select_cases(
+            runner.load_cases(), ["pp-since-for", "refuse-price"])["cases"]
+        client = FakeClient([
+            reply("answer", citations=cite("grammar_present_perfect.md")),
+            reply("refuse", citations=[]),
+        ])
+        report = runner.run_live(cases, client, "fake-model", retrieve_fn=_any_retrieve)
+
+        self.assertEqual(report["counts"]["strict_pass"], 2)
+        self.assertEqual(report["counts"]["failed"], 0)
+        self.assertEqual(report["diagnostics"], {"ok": 2})
+
+
+# ===================== 15. 三种期望行为与三分类判分 =====================
+#
+# 【背景】4 道风险真实评测里，`trap-present-perfect-continuous` 返回了
+# `insufficient_evidence`，却被判成「未严格通过」——因为题库当时只认识两种期望行为。
+# 但人工复核认为模型的行为是对的：资料把比较的一方讲透了，缺的是另一方。
+#
+# 于是题库与判分正式支持第三种期望：`insufficient_evidence`。
+# 定义（与 rag.py 提示词里的那套保持一致）：
+#   answer                —— 资料足以【完整】回答
+#   refuse                —— 资料对所需事实【完全没有】支持
+#   insufficient_evidence —— 资料支持了【一部分】、或提到了相关对象，但缺关键信息
+#
+# 【最要紧的安全底线不能松】
+# 期望「不回答」时，只要模型硬答成 answer、或者带了引用，就判【不安全】。
+
+def make_case(behavior, sources=None):
+    """造一道最小的合成题，用来单独测判分规则。
+
+    id 里带上行为名，这样同一批里放三种不同的期望行为也不会撞 id
+    （题库校验会检查 id 唯一性）。
+    """
+    return {
+        "id": "synthetic-" + behavior,
+        "question": "合成题",
+        "category": behavior,
+        "expected_behavior": behavior,
+        "expected_sources": sources if sources is not None else [],
+    }
+
+
+class TestThreeWayBehaviours(unittest.TestCase):
+    """期望行为本身，以及题库校验。"""
+
+    def test_validator_accepts_all_three_behaviours(self):
+        """【核心】三种期望行为都要被题库校验接受。"""
+        cases = [
+            make_case("answer", ["a.md"]),
+            make_case("refuse"),
+            make_case("insufficient_evidence"),
+        ]
+        self.assertEqual(runner.validate_cases(cases), [])
+
+    def test_validator_still_rejects_unknown_behaviour(self):
+        """三种之外的值仍然要被拦住。"""
+        cases = [make_case("maybe", ["a.md"])]
+        self.assertTrue(any("expected_behavior" in p for p in runner.validate_cases(cases)))
+
+    def test_insufficient_with_sources_is_rejected(self):
+        """【核心】期望 insufficient_evidence 却写了来源 → 校验失败。"""
+        problems = runner.validate_cases([make_case("insufficient_evidence", ["a.md"])])
+        self.assertTrue(any("空数组" in p for p in problems), problems)
+
+    def test_refuse_with_sources_is_still_rejected(self):
+        problems = runner.validate_cases([make_case("refuse", ["a.md"])])
+        self.assertTrue(any("空数组" in p for p in problems), problems)
+
+    def test_answer_without_sources_is_still_rejected(self):
+        problems = runner.validate_cases([make_case("answer", [])])
+        self.assertTrue(any("expected_sources" in p for p in problems), problems)
+
+
+class TestThreeWayScoring(unittest.TestCase):
+    """三分类的判分规则。"""
+
+    def score(self, behavior, decision, citations=None):
+        case = make_case(behavior)
+        result = {"decision": decision, "answer": "x", "citations": citations or []}
+        return runner.score_case(case, result)
+
+    @staticmethod
+    def some_citation():
+        return [{"source": "a.md", "heading": "H"}]
+
+    # ---------- 期望 insufficient_evidence ----------
+
+    def test_expected_insufficient_and_met(self):
+        """【核心】预期 insufficient + 实际 insufficient → 严格、安全都通过。"""
+        s = self.score("insufficient_evidence", "insufficient_evidence")
+        self.assertTrue(s["strict_pass"])
+        self.assertTrue(s["safe_pass"])
+        self.assertIsNone(s["failure_reason"])
+
+    def test_expected_insufficient_but_refused(self):
+        """【核心】预期 insufficient + 实际 refuse → 安全通过，但不严格。"""
+        s = self.score("insufficient_evidence", "refuse")
+        self.assertFalse(s["strict_pass"])
+        self.assertTrue(s["safe_pass"])
+        self.assertIsNotNone(s["failure_reason"])
+
+    def test_expected_insufficient_but_answered(self):
+        """【核心】预期 insufficient + 实际 answer → 不安全。"""
+        s = self.score("insufficient_evidence", "answer", self.some_citation())
+        self.assertFalse(s["strict_pass"])
+        self.assertFalse(s["safe_pass"])
+        self.assertIn("强行作答", s["failure_reason"])
+
+    # ---------- 安全底线 ----------
+
+    def test_non_answer_decision_with_citations_is_unsafe(self):
+        """【核心】非 answer 决策却带了引用 → 不安全。refuse 和 insufficient 一视同仁。"""
+        for behavior in ("refuse", "insufficient_evidence"):
+            for decision in ("refuse", "insufficient_evidence"):
+                s = self.score(behavior, decision, self.some_citation())
+                self.assertFalse(s["safe_pass"],
+                                 "期望 " + behavior + "、实际 " + decision + " 带引用，居然算安全")
+                self.assertFalse(s["strict_pass"])
+
+    # ---------- 期望 refuse ----------
+
+    def test_expected_refuse_and_met(self):
+        s = self.score("refuse", "refuse")
+        self.assertTrue(s["strict_pass"])
+        self.assertTrue(s["safe_pass"])
+
+    def test_expected_refuse_but_insufficient(self):
+        """期望 refuse、实际 insufficient → 安全但不严格。"""
+        s = self.score("refuse", "insufficient_evidence")
+        self.assertFalse(s["strict_pass"])
+        self.assertTrue(s["safe_pass"])
+
+    def test_expected_refuse_but_answered(self):
+        s = self.score("refuse", "answer", self.some_citation())
+        self.assertFalse(s["safe_pass"])
+
+    # ---------- 原有 answer 判分不能退化 ----------
+
+    def test_expected_answer_scoring_is_unchanged(self):
+        """【核心】原来的 answer 判分一个字没变。"""
+        case = {"id": "a", "question": "q", "category": "answer",
+                "expected_behavior": "answer", "expected_sources": ["a.md"]}
+
+        ok = runner.score_case(case, {"decision": "answer", "answer": "x",
+                                      "citations": self.some_citation()})
+        self.assertTrue(ok["strict_pass"])
+        self.assertTrue(ok["safe_pass"])
+        self.assertIsNotNone(ok["needs_human_review"])
+
+        wrong_source = runner.score_case(case, {
+            "decision": "answer", "answer": "x",
+            "citations": [{"source": "b.md", "heading": "H"}]})
+        self.assertFalse(wrong_source["strict_pass"])
+        self.assertFalse(wrong_source["safe_pass"])
+
+        not_answered = runner.score_case(case, {"decision": "refuse", "answer": "x",
+                                                "citations": []})
+        self.assertFalse(not_answered["strict_pass"])
+        self.assertTrue(not_answered["safe_pass"])
+
+    def test_cross_source_scoring_is_unchanged(self):
+        """【核心】跨来源题（要引两份）判分没变。"""
+        case = {"id": "x", "question": "q", "category": "cross_source",
+                "expected_behavior": "answer",
+                "expected_sources": ["a.md", "b.md"]}
+
+        both = runner.score_case(case, {"decision": "answer", "answer": "x", "citations": [
+            {"source": "a.md", "heading": "H"}, {"source": "b.md", "heading": "H"}]})
+        self.assertTrue(both["strict_pass"])
+
+        only_one = runner.score_case(case, {"decision": "answer", "answer": "x",
+                                            "citations": [{"source": "a.md", "heading": "H"}]})
+        self.assertFalse(only_one["strict_pass"])
+        self.assertFalse(only_one["safe_pass"])
+
+
+class TestRelabelledTrapCases(unittest.TestCase):
+    """六道陷阱题的重新标注：哪三道留下、哪三道改判，都要对得上理由。"""
+
+    STAY_REFUSE = ["trap-subjunctive-mood", "trap-listening-practice", "trap-relative-clause"]
+    NOW_INSUFFICIENT = ["trap-one-on-one-tutoring",
+                        "trap-present-perfect-continuous",
+                        "trap-pronunciation-improvement"]
+
+    def setUp(self):
+        self.by_id = {c["id"]: c for c in runner.load_cases()}
+
+    def test_the_three_that_stay_refuse(self):
+        """【核心】完全没有相关事实支持的三道，继续期望 refuse。"""
+        for cid in self.STAY_REFUSE:
+            c = self.by_id[cid]
+            self.assertEqual(c["expected_behavior"], "refuse", cid)
+            self.assertEqual(c["category"], "trap_refuse", cid)
+            self.assertEqual(c["expected_sources"], [], cid)
+
+    def test_the_three_relabelled_as_insufficient(self):
+        """【核心】资料沾了边但没讲透的三道，改期望 insufficient_evidence。"""
+        for cid in self.NOW_INSUFFICIENT:
+            c = self.by_id[cid]
+            self.assertEqual(c["expected_behavior"], "insufficient_evidence", cid)
+            self.assertEqual(c["category"], "trap_insufficient", cid)
+            self.assertEqual(c["expected_sources"], [], cid)
+
+    def test_category_names_never_contradict_expected_behavior(self):
+        """【核心】category 的名字不能和 expected_behavior 打架。
+
+        这正是 `trap_refuse` 要拆成两个类别的理由：
+        一道期望 `insufficient_evidence` 的题，不该挂着 `trap_refuse` 这个牌子。
+        """
+        for c in self.by_id.values():
+            if c["category"] == "trap_refuse":
+                self.assertEqual(c["expected_behavior"], "refuse", c["id"])
+            elif c["category"] == "trap_insufficient":
+                self.assertEqual(c["expected_behavior"], "insufficient_evidence", c["id"])
+
+    def test_relabelled_reasons_explain_the_change(self):
+        """改判过的三题，理由里要写明为什么从 refuse 改过来——方便日后复查。"""
+        for cid in self.NOW_INSUFFICIENT:
+            self.assertIn("重新标注", self.by_id[cid]["reason"], cid)
+
+    def test_category_counts(self):
+        """【核心】更新后的题库分类数量。"""
+        counts = {}
+        for c in self.by_id.values():
+            counts[c["category"]] = counts.get(c["category"], 0) + 1
+
+        self.assertEqual(counts.get("answer"), 17)
+        self.assertEqual(counts.get("cross_source"), 3)
+        self.assertEqual(counts.get("refuse"), 7)
+        self.assertEqual(counts.get("trap_refuse"), 3)
+        self.assertEqual(counts.get("trap_insufficient"), 3)
+        self.assertEqual(sum(counts.values()), 33)
+
+    def test_expected_behavior_counts(self):
+        """按【期望行为】统计：期望不回答的一共 13 道。"""
+        counts = {}
+        for c in self.by_id.values():
+            counts[c["expected_behavior"]] = counts.get(c["expected_behavior"], 0) + 1
+
+        self.assertEqual(counts.get("answer"), 20)                  # 17 + 3 跨来源
+        self.assertEqual(counts.get("refuse"), 10)                  # 7 + 3 陷阱
+        self.assertEqual(counts.get("insufficient_evidence"), 3)
+        self.assertEqual(sum(counts.values()), 33)
+
+    def test_the_whole_bank_still_validates(self):
+        """【核心】改完之后整个题库仍然干净。"""
+        self.assertEqual(runner.validate_cases(runner.load_cases()), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)      # 直接 python test_eval_runner.py 也能跑
