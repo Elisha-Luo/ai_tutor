@@ -153,10 +153,10 @@
   },
   {
     "id": "cross-how-to-know-mastered",
-    "question": "怎么判断一个单词我是不是真的掌握了？",
+    "question": "怎么判断一个单词是不是真的掌握了？又怎么判断自己一个月后的整体英语学习有没有进步？",
     "expected_behavior": "answer",
     "expected_sources": ["vocabulary_study_method.md", "course_faq.md"],
-    "reason": "跨来源题。判断单个词是否掌握，依据 vocabulary 的「三关」（认得、想得起、用得出）；判断整体有没有进步，依据 course_faq 的「和过去的自己比」月度对比法。两者分别回答「单词层面」与「整体层面」。",
+    "reason": "【2026-09-21 改写】原问题只问「单个单词是否掌握」，vocabulary_study_method.md 的「三关」已经能完整回答，course_faq.md 对此毫无贡献——却仍被要求同时引用两份。那是题目与期望来源不匹配，不是模型漏答。现改为明确包含两个部分：①单词层面——判断单个词是否掌握，依据 vocabulary_study_method.md 的「三关」（认得、想得起、用得出）；②整体层面——判断一个月后的整体进步，依据 course_faq.md 的「和过去的自己比」月度对比法。这两部分分别来自两份资料，**缺少任何一份都只能回答一半**。",
     "category": "cross_source"
   },
   {

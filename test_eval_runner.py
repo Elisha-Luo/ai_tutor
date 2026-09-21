@@ -197,11 +197,16 @@ class TestScoreCrossSource(unittest.TestCase):
             ["vocabulary_study_method.md", "course_faq.md"]))
         self.assertTrue(s["strict_pass"])
 
-    def test_citing_only_one_fails(self):
-        """【核心】只引一份 → 不过。这正是「该引两份只引一份」的典型错误。"""
+    def test_citing_only_one_is_incomplete_but_safe(self):
+        """【核心·新规则】只引一份 → 不算过，但**安全**。
+
+        少引的那份只是让回答可能不完整；已引的那份是真的、也没引错东西，
+        不会误导用户。**「不安全」要留给「引了期望之外的来源」**。
+        """
         s = runner.score_case(self.case(), self.result(["course_faq.md"]))
         self.assertFalse(s["strict_pass"])
-        self.assertFalse(s["safe_pass"])
+        self.assertTrue(s["safe_pass"])
+        self.assertIn("不完整", s["failure_reason"])
 
     def test_citing_one_extra_fails(self):
         """两份都引了、但另外多引一份 → 仍然判不过（要求完全一致）。"""
@@ -344,22 +349,28 @@ class TestLiveRun(unittest.TestCase):
         self.assertEqual(len(client.calls), len(CASES))
 
     def test_failed_cases_land_in_the_failure_list(self):
-        """【核心】不安全的输出必须出现在失败清单里。"""
+        """【核心】不安全的输出必须出现在失败清单里。
+
+        注意 x1 现在**不在**失败清单里：它只引了一份，属于「安全但不完整」，
+        应该落到 `safe_misses` 那张单子上。
+        """
         client = FakeClient([
-            reply("answer", citations=cite("course_faq.md")),   # a1 引了「检索到但期望之外」的来源 → 失败
-            reply("answer", citations=cite("course_faq.md")),   # x1 只引一份 → 失败
-            reply("answer", citations=cite("course_faq.md")),   # r1 该拒却硬答 → 失败
+            reply("answer", citations=cite("course_faq.md")),   # a1 引了期望之外的来源 → 不安全
+            reply("answer", citations=cite("course_faq.md")),   # x1 只引一份 → 安全但不完整
+            reply("answer", citations=cite("course_faq.md")),   # r1 该拒却硬答 → 不安全
             reply("refuse", citations=[]),                      # t1 正常拒答
         ])
         # 这里必须用带干扰项的检索：a1 要多捞一份 course_faq.md，
         # 否则 rag.py 的引用白名单会先一步拦下它，测不到评测层这一关。
         report = runner.run_live(CASES, client, "fake-model", retrieve_fn=retrieve_with_distractor)
 
-        self.assertEqual(report["counts"]["failed"], 3)
-        failed_ids = {f["id"] for f in report["failures"]}
-        self.assertEqual(failed_ids, {"a1", "x1", "r1"})
+        self.assertEqual(report["counts"]["failed"], 2)
+        self.assertEqual({f["id"] for f in report["failures"]}, {"a1", "r1"})
         for f in report["failures"]:
             self.assertTrue(f["reason"], "失败清单里必须写明原因")
+
+        # 只引一份的 x1 落到「安全但没达标」
+        self.assertEqual([m["id"] for m in report["safe_misses"]], ["x1"])
 
     def test_by_category_counts_are_correct(self):
         """分类统计要能对上。"""
@@ -1122,6 +1133,16 @@ def _any_retrieve(question, top_k=3):
              "heading": "H-grammar_present_perfect.md", "text": "正文"}]
 
 
+def _cross_source_retrieve(question, top_k=3):
+    """返回跨来源题的两份期望资料，让题目能一路走到评测层。
+
+    只有把两份都放进「检索结果」里，rag.py 的引用白名单才会放行它们，
+    评测层才有机会判「只引了一份」这种不完整情况。
+    """
+    return [{"source": s, "heading": "H-" + s, "text": "正文"}
+            for s in ("vocabulary_study_method.md", "course_faq.md")]
+
+
 class TestSelectCases(unittest.TestCase):
     """select_cases() 本身的规则。"""
 
@@ -1471,8 +1492,8 @@ class TestThreeWayScoring(unittest.TestCase):
         self.assertFalse(not_answered["strict_pass"])
         self.assertTrue(not_answered["safe_pass"])
 
-    def test_cross_source_scoring_is_unchanged(self):
-        """【核心】跨来源题（要引两份）判分没变。"""
+    def test_cross_source_scoring_follows_the_new_rule(self):
+        """【核心·新规则】跨来源题：引两份 = 双通过；只引一份 = 安全但不完整。"""
         case = {"id": "x", "question": "q", "category": "cross_source",
                 "expected_behavior": "answer",
                 "expected_sources": ["a.md", "b.md"]}
@@ -1480,11 +1501,13 @@ class TestThreeWayScoring(unittest.TestCase):
         both = runner.score_case(case, {"decision": "answer", "answer": "x", "citations": [
             {"source": "a.md", "heading": "H"}, {"source": "b.md", "heading": "H"}]})
         self.assertTrue(both["strict_pass"])
+        self.assertTrue(both["safe_pass"])
 
         only_one = runner.score_case(case, {"decision": "answer", "answer": "x",
                                             "citations": [{"source": "a.md", "heading": "H"}]})
         self.assertFalse(only_one["strict_pass"])
-        self.assertFalse(only_one["safe_pass"])
+        self.assertTrue(only_one["safe_pass"])
+        self.assertIn("不完整", only_one["failure_reason"])
 
 
 class TestRelabelledTrapCases(unittest.TestCase):
@@ -1558,6 +1581,172 @@ class TestRelabelledTrapCases(unittest.TestCase):
     def test_the_whole_bank_still_validates(self):
         """【核心】改完之后整个题库仍然干净。"""
         self.assertEqual(runner.validate_cases(runner.load_cases()), [])
+
+
+# ===================== 16. answer 的「完整性」与「安全性」分开判 =====================
+#
+# 【为什么要分】
+# 「少引了一份该引的」和「引了不该引的」是性质完全不同的两件事：
+#   · 少引 → 回答可能不完整，但每个出处都是真的，用户不会被误导；
+#   · 多引 / 引错 → 引用了一段和问题无关（甚至根本不存在）的资料，
+#                   「有据可查」这个承诺被破坏了，才是真正的不安全。
+#
+# 以前只要引用不完全一致就一律判不安全，太粗——真实 33 题评测里那次
+# 「机器判定失败」正是被这条粗规则误伤的。
+
+class TestAnswerCompletenessRule(unittest.TestCase):
+
+    CASE = {"id": "c", "question": "q", "category": "cross_source",
+            "expected_behavior": "answer",
+            "expected_sources": ["a.md", "b.md"]}
+
+    def score(self, sources):
+        return runner.score_case(self.CASE, {
+            "decision": "answer", "answer": "x",
+            "citations": [{"source": s, "heading": "H"} for s in sources]})
+
+    # ---------- 四种基本情况 ----------
+
+    def test_exact_match_passes_both(self):
+        """【核心】完全匹配 → strict 和 safe 都通过。"""
+        s = self.score(["a.md", "b.md"])
+        self.assertTrue(s["strict_pass"])
+        self.assertTrue(s["safe_pass"])
+        self.assertIsNone(s["failure_reason"])
+
+    def test_non_empty_proper_subset_is_safe_but_not_strict(self):
+        """【核心·新规则】只引期望来源的**非空真子集** → 安全，但不严格。"""
+        for subset in (["a.md"], ["b.md"]):
+            s = self.score(subset)
+            self.assertFalse(s["strict_pass"], str(subset))
+            self.assertTrue(s["safe_pass"], str(subset))
+            self.assertIn("不完整", s["failure_reason"])
+            self.assertIn("缺少部分期望来源", s["failure_reason"])
+            self.assertIsNotNone(s["needs_human_review"])
+
+    def test_extra_source_outside_expectation_is_unsafe(self):
+        """【核心·新规则】引用中出现**期望之外的来源** → strict 和 safe 都不通过。"""
+        for cited in (["a.md", "c.md"], ["b.md", "c.md"],
+                      ["a.md", "b.md", "c.md"], ["c.md"]):
+            s = self.score(cited)
+            self.assertFalse(s["strict_pass"], str(cited))
+            self.assertFalse(s["safe_pass"], str(cited))
+            self.assertIn("期望之外", s["failure_reason"])
+
+    def test_empty_citations_is_unsafe(self):
+        """【核心】answer 却一条引用都没有 → 不安全（规则没变）。"""
+        s = self.score([])
+        self.assertFalse(s["strict_pass"])
+        self.assertFalse(s["safe_pass"])
+        self.assertIn("无从查证", s["failure_reason"])
+
+    # ---------- 不能退化的既有行为 ----------
+
+    def test_single_source_case_behaviour_unchanged(self):
+        """【核心】单来源题行为完全不变：引对双过，引错不安全。"""
+        case = {"id": "s", "question": "q", "category": "answer",
+                "expected_behavior": "answer", "expected_sources": ["a.md"]}
+
+        right = runner.score_case(case, {"decision": "answer", "answer": "x",
+                                         "citations": [{"source": "a.md", "heading": "H"}]})
+        self.assertTrue(right["strict_pass"])
+        self.assertTrue(right["safe_pass"])
+
+        wrong = runner.score_case(case, {"decision": "answer", "answer": "x",
+                                         "citations": [{"source": "b.md", "heading": "H"}]})
+        self.assertFalse(wrong["strict_pass"])
+        self.assertFalse(wrong["safe_pass"])
+
+    def test_expected_answer_but_safe_refusal_unchanged(self):
+        """【核心】预期 answer、实际安全拒答 → 安全但不严格（规则没变）。"""
+        for decision in ("refuse", "insufficient_evidence"):
+            s = runner.score_case(self.CASE, {"decision": decision, "answer": "x",
+                                              "citations": []})
+            self.assertFalse(s["strict_pass"], decision)
+            self.assertTrue(s["safe_pass"], decision)
+
+    def test_subset_case_lands_in_safe_misses_not_failures(self):
+        """端到端：只引一份的跨来源题应当进「安全但没达标」，而不是失败清单。"""
+        case = runner.select_cases(
+            runner.load_cases(), ["cross-how-to-know-mastered"])["cases"][0]
+
+        client = FakeClient([reply("answer", citations=cite("course_faq.md"))])
+        report = runner.run_live([case], client, "fake-model",
+                                 retrieve_fn=_cross_source_retrieve)
+
+        self.assertEqual(report["counts"]["failed"], 0)             # 不在失败清单
+        self.assertEqual(report["counts"]["strict_pass"], 0)        # 但也不算严格通过
+        self.assertEqual(report["counts"]["safe_pass"], 1)
+        self.assertEqual(report["failures"], [])
+        self.assertEqual([m["id"] for m in report["safe_misses"]],
+                         ["cross-how-to-know-mastered"])
+
+
+class TestRewrittenCrossSourceCase(unittest.TestCase):
+    """改写后的跨来源题：文本上必须真的需要两份资料。"""
+
+    def setUp(self):
+        self.by_id = {c["id"]: c for c in runner.load_cases()}
+        self.case = self.by_id["cross-how-to-know-mastered"]
+
+    def test_question_asks_for_both_parts(self):
+        """【核心】问题必须同时问「单词掌握」和「整体进步」两部分。"""
+        q = self.case["question"]
+        for word in ("单词", "掌握", "整体", "进步"):
+            self.assertIn(word, q, "改写后的问题没提到「" + word + "」")
+
+    def test_still_a_cross_source_case_with_both_sources(self):
+        """category 和期望来源保持不变。"""
+        self.assertEqual(self.case["category"], "cross_source")
+        self.assertEqual(sorted(self.case["expected_sources"]),
+                         ["course_faq.md", "vocabulary_study_method.md"])
+
+    def test_reason_explains_why_both_are_needed(self):
+        """理由里要点明：单词层面来自 vocabulary、整体层面来自 course_faq。"""
+        reason = self.case["reason"]
+        self.assertIn("vocabulary_study_method.md", reason)
+        self.assertIn("course_faq.md", reason)
+        self.assertIn("三关", reason)
+        self.assertIn("缺少任何一份", reason)
+
+    def test_retrieval_still_finds_both_sources(self):
+        """【核心】改写后检索仍要能捞出这两份资料（top-2 覆盖）。"""
+        r = runner.R.Retriever()
+        hits = r.retrieve(self.case["question"], top_k=2)
+        sources = {h["source"] for h in hits}
+        self.assertTrue(set(self.case["expected_sources"]).issubset(sources),
+                        "top-2 没覆盖两份期望资料，实际是：" + str(sorted(sources)))
+
+
+# ===================== 17. 既有真实结果文件不得被改动 =====================
+
+class TestExistingLiveResultsUntouched(unittest.TestCase):
+    """本轮只改评测设计，不重跑全量——那份 33 题真实结果必须原样不动。"""
+
+    RESULT = os.path.join(runner.RESULTS_DIR, "20260921-134611-live.json")
+
+    def setUp(self):
+        # 它是本地生成物、不入库，别人克隆仓库时不会有——没有就跳过
+        if not os.path.exists(self.RESULT):
+            self.skipTest("本机没有这份结果文件（本地生成物，未入库）")
+
+    def _load(self):
+        with open(self.RESULT, encoding="utf-8") as f:
+            return json.load(f)
+
+    def test_still_holds_the_original_33_case_run(self):
+        """【核心】内容仍是那次 33 题运行：总数与机器统计都没变。"""
+        data = self._load()
+        self.assertEqual(data["mode"], "live")
+        self.assertEqual(data["total"], 33)
+        self.assertEqual(len(data["cases"]), 33)
+        self.assertEqual(data["counts"]["strict_pass"], 26)
+        self.assertEqual(data["counts"]["safe_pass"], 32)
+        self.assertEqual(data["counts"]["failed"], 1)
+
+    def test_recorded_time_matches_its_filename(self):
+        """文件里记录的时间要能对上它的文件名——说明就是那次运行留下的，没被重写。"""
+        self.assertEqual(self._load()["time"], "20260921-134611")
 
 
 if __name__ == "__main__":
