@@ -9,6 +9,8 @@ from datetime import datetime, timedelta            # datetime 记录消息时�
 from flask import Flask, render_template, request, redirect, url_for, session   # session 用来给每个浏览器发一个签名过的身份标记
 from openai import OpenAI                           # 从 openai 库里导入 OpenAI 类（DeepSeek 兼容它的接口）
 from env_utils import load_dotenv                   # 共用同一份 .env 读取逻辑（实现和「为什么」都在 env_utils.py）
+import retriever                                     # 本地检索层：把问题变成「最相关的几段资料」
+import rag                                           # 生成与引用层：让模型照着资料回答，并校验它引用的来源
 
 
 # ===================== 读取 .env（如果存在）=====================
@@ -48,7 +50,19 @@ if not SECRET_KEY:
 
 BASE_URL = "https://api.deepseek.com"                 # DeepSeek 的接口地址
 MODEL = "deepseek-chat"                               # 要调用的模型名字
-SYSTEM_PROMPT = "你是一个耐心的 AI 学习助手。请用简洁、通俗的中文回答问题；如果学生的描述不够清楚，就先追问一句。"
+
+RETRIEVE_TOP_K = 3                                    # 每个问题检索几段资料。和评测器用同一个默认值
+
+# 【出错时给用户看的话，永远只有这一句】
+# 为什么不写 str(e)：异常原文里可能有内部路径、请求内容、甚至密钥片段。
+# 出错的细节属于服务端的事，不该端到用户面前。
+SAFE_ERROR_MESSAGE = "抱歉，这次没能处理你的问题，请稍后再试一次。"
+
+# 【注意：这里不再有 SYSTEM_PROMPT 了】
+# 以前是网页把 SYSTEM_PROMPT + 历史记录 + 问题一起发给模型，让它自由发挥。
+# 现在 AI 的回答统一由 rag.py 负责：它有自己的提示词（要求模型只依据资料回答、
+# 并按固定 JSON 格式输出），而且会逐条校验模型引用的来源是否真的存在。
+# 提示词只保留一份——两边各写一份，迟早会悄悄漂移成两个不同的产品。
 
 # 聊天记录数据库文件。用「本文件所在位置」拼绝对路径，这样不管从哪个目录运行，记录都落在同一个文件里。
 # 允许用环境变量 CHAT_DB_PATH 覆盖——自动化测试就是靠它把数据库指向临时文件，
@@ -127,6 +141,49 @@ def save_exchange(session_id, question, answer):
         conn.close()
 
 
+# ===================== 把 RAG 结果变成「能显示的一段文字」 =====================
+
+def format_answer_with_sources(result):
+    """把 rag.generate_answer() 的返回值，格式化成最终要显示、并存入数据库的文字。
+
+    【为什么单独抽成一个纯函数】
+    它没有副作用、只看传进来的字典，所以能单独测：喂一个结果字典进去，
+    断言输出的文字对不对——不用起 Flask、不用连数据库、不用碰模型。
+    这段格式化的逻辑是网页和"引用长什么样"之间的唯一约定，值得单独钉住。
+
+    【为什么只有 answer 才加「资料来源」】
+    refuse 和 insufficient_evidence 本来就没有给出回答，更没有出处可给。
+    给它们硬加一个来源列表，等于伪造依据——那正是整个 RAG 要防的事。
+    所以这里先看 decision，不是 answer 就直接返回原话。
+
+    【为什么用纯文本而不是 HTML】
+    存进数据库的是文字，不是标签。模板那边会统一把 AI 的回复按 Markdown 渲染，
+    这里只要给出清楚的分行结构就够了，不必也不该自己拼 HTML。
+    """
+    answer = (result.get("answer") or "").strip()      # 回答正文；缺了就当成空字符串，不让它变成 None
+    citations = result.get("citations") or []
+
+    # 【第一道判断】不是真的回答了，就没有「资料来源」这回事
+    if result.get("decision") != "answer" or not citations:
+        return answer
+
+    entries = []                                       # 一行一条来源
+    for c in citations:
+        source = str(c.get("source", "")).strip()
+        heading = str(c.get("heading", "")).strip()
+        if source and heading:
+            entries.append("- " + source + " · " + heading)   # 文件名 · 二级标题
+        elif source:
+            entries.append("- " + source)                     # 只有文件名也照常显示
+
+    # 【第二道判断】万一 citations 里的每一项都缺少文件名，就干脆不加这一节
+    # ——宁可不显示，也不要留一个空的「资料来源：」标题在那儿
+    if not entries:
+        return answer
+
+    return answer + "\n\n资料来源：\n" + "\n".join(entries)
+
+
 init_db()                                             # 程序启动时先把表建好（已存在就什么都不做）
 
 
@@ -162,29 +219,53 @@ def index():                                          # 首页处理函数：用
             # try ... finally：不管中间成功还是失败，最后都必须把锁还回去。
             # 如果失败时忘了还锁，这把锁就永远拿不回来了，之后所有提问都会被拒绝，页面彻底用不了。
             try:
-                # 要发给 AI 的内容 = 系统提示 + 【这个会话自己的历史】 + 学生这次问的。
-                # 注意是从数据库按 sid 读的，所以拿到的永远是自己的对话，不会是别人的。
-                messages_to_send = (
-                    [{"role": "system", "content": SYSTEM_PROMPT}]
-                    + load_history(sid)
-                    + [{"role": "user", "content": question}]
-                )
+                # ---------- 第一步：找出相关的那几段资料 ----------
+                # 【为什么检索要单独包一层 try】
+                # 检索这一步自己炸了，属于程序缺陷，和「资料里确实没有」完全是两回事。
+                # 两者必须分开处理：
+                #   · 检索出错 → 我们并不知道资料里到底有没有答案，写一句「资料里没有」就是撒谎，
+                #                所以这里【不写数据库】，只给一句固定的抱歉提示；
+                #   · 检索正常但没找到 → 那是正常结果，交给 rag 拒答，并如实记进历史。
+                try:
+                    chunks = retriever.retrieve(question, top_k=RETRIEVE_TOP_K)
+                except Exception:
+                    return render_template(
+                        "index.html", history=load_history(sid), question=question,
+                        error=SAFE_ERROR_MESSAGE,
+                    )
 
-                response = client.chat.completions.create(                    # 调用接口，向 DeepSeek 发请求
-                    model=MODEL,
-                    messages=messages_to_send,
-                )
-                answer = response.choices[0].message.content                 # 从返回结果里一层层取出 AI 回答的文字
+                # ---------- 第二步：交给 RAG 生成，并校验它引用的来源 ----------
+                # rag.generate_answer 内部已经兜住了模型的所有异常和不合规输出：
+                # 坏 JSON、编造来源、空引用、接口报错……它一律安全降级成「不回答」。
+                # 所以拿回来的永远是一个安全的、格式固定的结果，这里不需要再判一次。
+                #
+                # 【为什么没有把历史记录发给模型】
+                # rag 只按「当前这个问题」检索和回答。多轮指代（比如「那它呢？」）
+                # 这一版还不支持，README 里已如实写明——宁可把边界说清楚，
+                # 也不要让用户误以为它能听懂上下文。
+                result = rag.generate_answer(question, chunks, client, MODEL)
 
-                save_exchange(sid, question, answer)                          # 成功之后，才把这一问一答写进数据库
+                # ---------- 第三步：格式化成能显示的文字 ----------
+                # 只有真的回答了，才会在后面附上「资料来源」；
+                # 拒答和证据不足不会凭空多出一个来源列表。
+                answer = format_answer_with_sources(result)
+
+                # ---------- 第四步：存库 ----------
+                # 存的是上面那段【格式化之后】的文字，所以历史记录里也带着来源，
+                # 刷新页面、重启程序之后看到的都和当时一样。
+                save_exchange(sid, question, answer)
 
                 # 【为什么成功后要「跳转」】这叫 POST-Redirect-GET 模式。
                 # 不跳转的话，地址栏里留的是「刚才那次 POST」的结果，用户一按 F5 浏览器就会问
                 # 「要重新提交吗」，点「是」就又问了 AI 一遍。跳转之后地址变回普通 GET，F5 不会重复提问。
                 return redirect(url_for("index"))
 
-            except Exception as e:
-                error = "出错了：" + str(e)                                  # 记下错误信息，稍后显示在网页上
+            except Exception:
+                # 【绝不显示 str(e)】
+                # 异常原文里可能有内部路径、请求内容、甚至密钥片段。
+                # 用户只需要知道「这次没成」，具体原因留在服务端就好。
+                # 注意这里也【不写数据库】——存一条半截的对话，比不存更糟。
+                error = SAFE_ERROR_MESSAGE
 
             finally:
                 _lock.release()                                              # 无论成功还是出错，都把锁还回去

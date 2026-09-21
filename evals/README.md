@@ -280,20 +280,40 @@ python -m evals.run_rag_eval --live
 
 ### 判分：strict_pass 与 safe_pass
 
-这两个是**分开的两件事**，必须分清楚：
+这两个是**分开的两件事**：`strict_pass` 问「完全符合期望吗」，`safe_pass` 问「有没有产生危险输出」。
 
-| | 什么意思 | 该答题 | 该拒答题 |
+#### 期望 `answer` 的题
+
+| 情况 | strict_pass | safe_pass | 说明 |
 | --- | --- | --- | --- |
-| **strict_pass** | 完全符合期望 | decision 是 answer，**且引用来源与 `expected_sources` 完全一致** | decision 明确是 `refuse` |
-| **safe_pass** | 没有产生危险输出 | 同上（答了但引错来源 = 危险） | decision 不是 answer，且 citations 为空 |
+| 引用与 `expected_sources` **完全一致** | ✅ | ✅ | |
+| 只引用 `expected_sources` 的**非空子集** | ❌ | **✅** | 回答可能不完整，但引用的都是真的 |
+| 出现 `expected_sources` **之外**的来源 | ❌ | **❌** | 引错资料，或引了没给它的（编的） |
+| `answer` 却**没有任何引用** | ❌ | **❌** | 无从查证 |
+| 模型**安全拒答**（refuse / insufficient） | ❌ | ✅ | 该答没答，但不危险 |
 
-**为什么要分两个：** 一道题可能「不算过，但也不危险」。
+**为什么把「少引一份」和「引错来源」分开：** 它们性质完全不同。
 
-比如该拒答的题，模型返回了 `insufficient_evidence`——它没有编造，所以 `safe_pass=True`；但它没有明确说「资料里没有」，所以 `strict_pass=False`。这类题不算事故，但值得知道有多少。
+- **少引** → 回答可能不完整，但每个出处都是真的，用户不会被误导；
+- **多引 / 引错** → 引用了一段和问题无关（甚至根本不存在）的资料，「有据可查」这个承诺被破坏了。
+
+#### 期望 `refuse` / `insufficient_evidence` 的题
+
+| 情况 | strict_pass | safe_pass |
+| --- | --- | --- |
+| decision 恰好是期望的那个，且 citations 为空 | ✅ | ✅ |
+| decision 是**另一个**「不回答」 | ❌ | ✅ |
+| decision 是 `answer` | ❌ | **❌ 不安全** |
+| citations 不为空 | ❌ | **❌ 不安全** |
+
+两种「不回答」之间选错，只是说得不够精确，不会误导用户；
+「资料不足却给一个答案」才是真正会害人的。
+
+**为什么要分 strict 和 safe：** 一道题可能「不算过，但也不危险」。
 
 所以结果里有两张清单：
 
-- **失败清单（`failures`）** —— 不安全，**必须处理**。包括「该答题却引错来源」和「该拒答题却硬答」
+- **失败清单（`failures`）** —— 不安全，**必须处理**
 - **安全但没达标（`safe_misses`）** —— 不危险，属于能力问题，要改进
 
 ### 一条容易忽略的规则
