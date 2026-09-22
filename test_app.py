@@ -28,6 +28,7 @@ import sqlite3                             # 测试里要直接查数据库，�
 import tempfile                            # 建临时文件夹，让测试用独立的数据库文件
 import unittest                            # Python 自带的测试框架，不用额外安装
 import importlib                           # 用来「重新加载模块」，模拟重启 Flask
+import threading                           # 并发测每日额度时要起多个线程一起抢
 
 # =====================================================================
 # 【顺序极其重要】下面这几行必须在 import app 之前执行，原因有两个：
@@ -659,6 +660,614 @@ class TestHarnessSafety(ChatTestCase):
         html = c.get("/").get_data(as_text=True)
         self.assertIn("第一轮问的话", html)                   # 第一轮在页面上仍然看得到
         self.assertIn("第二轮问的话", html)
+
+
+# ===================== 8. 生产化：配置读取 =====================
+#
+# 【为什么这些要单独测】配置读错是「最难查的一类故障」——
+# 程序照常启动、页面照常能用，只是限流其实没开、上限其实不是你以为的那个数。
+# 所以合法值、默认值、非法值三种情况都要有确定行为。
+
+class TestConfigParsing(unittest.TestCase):
+
+    def setUp(self):
+        self._saved = {}                                # 备份要动的环境变量，测完还原
+
+    def tearDown(self):
+        for key, value in self._saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+    def read(self, name, raw):
+        self._saved.setdefault(name, os.environ.get(name))
+        if raw is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = raw
+        return tutor._read_positive_int(name, 123, minimum=1)
+
+    def test_unset_uses_the_default(self):
+        self.assertEqual(self.read("AITUTOR_TEST_CFG", None), 123)
+
+    def test_blank_is_treated_as_unset(self):
+        """空字符串也算没设置——部署平台上清空一个变量后常常留个空串。"""
+        self.assertEqual(self.read("AITUTOR_TEST_CFG", "   "), 123)
+
+    def test_valid_value_is_used(self):
+        self.assertEqual(self.read("AITUTOR_TEST_CFG", "500"), 500)
+
+    def test_surrounding_whitespace_is_tolerated(self):
+        self.assertEqual(self.read("AITUTOR_TEST_CFG", " 500 "), 500)
+
+    def test_non_numeric_is_rejected_loudly(self):
+        """写了个不是数字的值 → 启动就报错，不静默用默认值。"""
+        with self.assertRaises(RuntimeError) as ctx:
+            self.read("AITUTOR_TEST_CFG", "abc")
+        self.assertIn("AITUTOR_TEST_CFG", str(ctx.exception))
+
+    def test_zero_and_negative_are_rejected(self):
+        for bad in ("0", "-1", "-100"):
+            with self.assertRaises(RuntimeError, msg=bad):
+                self.read("AITUTOR_TEST_CFG", bad)
+
+    def test_maximum_is_enforced(self):
+        self._saved.setdefault("AITUTOR_TEST_CFG", os.environ.get("AITUTOR_TEST_CFG"))
+        os.environ["AITUTOR_TEST_CFG"] = "70000"
+        with self.assertRaises(RuntimeError):
+            tutor._read_positive_int("AITUTOR_TEST_CFG", 5000, minimum=1, maximum=65535)
+
+    def test_shipped_defaults_are_the_documented_ones(self):
+        """默认值必须和文档里写的一致，否则文档就是错的。"""
+        self.assertEqual(tutor.MAX_QUESTION_LENGTH, 500)
+        self.assertEqual(tutor.DAILY_API_LIMIT, 50)
+        self.assertEqual(tutor.MAX_CONTENT_LENGTH, 64 * 1024)
+
+    def test_debug_is_off_unless_explicitly_enabled(self):
+        """【核心】调试模式默认必须是关的——它开到公网上等于让人在你服务器上执行代码。"""
+        self.assertFalse(tutor.DEBUG)
+
+    def test_debug_only_turns_on_for_explicit_truthy_values(self):
+        for value, expected in [("1", True), ("true", True), ("TRUE", True),
+                                ("yes", True), ("0", False), ("", False), ("no", False)]:
+            self._saved.setdefault("FLASK_DEBUG", os.environ.get("FLASK_DEBUG"))
+            os.environ["FLASK_DEBUG"] = value
+            reloaded = importlib.reload(tutor)
+            self.assertEqual(reloaded.DEBUG, expected, "FLASK_DEBUG=" + repr(value))
+        # 还原成干净状态，并重新打桩，别把真客户端留给后面的测试
+        self._saved.setdefault("FLASK_DEBUG", None)
+        os.environ.pop("FLASK_DEBUG", None)
+        importlib.reload(tutor)
+        tutor.client = FakeClient()
+        tutor.retriever.retrieve = fake_retrieve
+
+
+# ===================== 9. 生产化：健康检查 =====================
+
+class TestHealthEndpoint(ChatTestCase):
+
+    def test_health_returns_200_and_fixed_json(self):
+        """【核心】数据库正常时返回 200 和固定 JSON。"""
+        c = tutor.app.test_client()
+        r = c.get("/health")
+
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json(), {"status": "ok"})
+
+    def test_health_returns_503_when_database_is_unreachable(self):
+        """【核心】数据库不可用 → 503，而且响应体里不能有内部信息。"""
+        tutor.DB_PATH = os.path.join(self.tmpdir.name, "没有这个目录", "x.db")
+
+        c = tutor.app.test_client()
+        r = c.get("/health")
+
+        self.assertEqual(r.status_code, 503)
+        self.assertEqual(r.get_json(), {"status": "unhealthy"})
+
+        body = r.get_data(as_text=True)
+        self.assertNotIn("没有这个目录", body, "响应里泄露了数据库路径")
+        self.assertNotIn("Traceback", body)
+        self.assertNotIn("sqlite", body.lower())
+
+    def test_health_does_not_call_the_model(self):
+        c = tutor.app.test_client()
+        c.get("/health")
+        self.assertEqual(len(self.fake.calls), 0)
+
+    def test_health_does_not_touch_the_retriever(self):
+        c = tutor.app.test_client()
+        c.get("/health")
+        self.assertEqual(len(RETRIEVAL_CALLS), 0)
+
+    def test_health_does_not_write_chat_rows(self):
+        c = tutor.app.test_client()
+        c.get("/health")
+        self.assertEqual(self.all_rows(), [])
+
+    def test_health_does_not_consume_quota(self):
+        """【核心】探针会被频繁调用，绝不能吃掉用户的模型额度。"""
+        for _ in range(5):
+            tutor.app.test_client().get("/health")
+        self.assertEqual(self.used_today(), 0)
+
+    def test_health_does_not_create_a_session(self):
+        """【核心】探针没有浏览器，不该在数据库里攒下一堆垃圾会话。"""
+        c = tutor.app.test_client()
+        c.get("/health")
+        self.assertIsNone(self.session_id_of(c), "健康检查不该创建会话")
+
+    # ---------- 小工具 ----------
+
+    def used_today(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute("SELECT used FROM api_usage WHERE day = ?",
+                               (tutor._utc_day(),)).fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
+
+# ===================== 10. 生产化：输入保护 =====================
+
+class TestInputProtection(ChatTestCase):
+
+    def test_overlong_question_does_no_work_at_all(self):
+        """【核心】超长问题：不检索、不调模型、不写库——三样都不能发生。"""
+        tutor.MAX_QUESTION_LENGTH = 20
+        c = tutor.app.test_client()
+
+        r = self.ask(c, "问" * 21)
+
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(tutor.TOO_LONG_MESSAGE, r.get_data(as_text=True))
+        self.assertEqual(len(RETRIEVAL_CALLS), 0, "超长问题不该检索")
+        self.assertEqual(len(self.fake.calls), 0, "超长问题不该调用模型")
+        self.assertEqual(self.all_rows(), [], "超长问题不该写数据库")
+
+    def test_overlong_question_does_not_consume_quota(self):
+        tutor.MAX_QUESTION_LENGTH = 20
+        c = tutor.app.test_client()
+        self.ask(c, "问" * 21)
+        self.assertEqual(self.used_today(), 0)
+
+    def test_question_at_the_limit_is_allowed(self):
+        """刚好等于上限的应当放行（边界是「超过」才拦）。"""
+        tutor.MAX_QUESTION_LENGTH = 20
+        c = tutor.app.test_client()
+        self.ask(c, "问" * 20)
+        self.assertEqual(len(RETRIEVAL_CALLS), 1)
+        self.assertEqual(len(self.fake.calls), 1)
+
+    def test_oversized_request_body_is_rejected_safely(self):
+        """【核心】超大请求体要安全拒绝，不显示任何内部异常。"""
+        c = tutor.app.test_client()
+        c.get("/")
+
+        r = c.post("/", data={"question": "啊" * 200000})   # 远超 64KB 的请求体上限
+
+        self.assertEqual(r.status_code, 413)
+        html = r.get_data(as_text=True)
+        self.assertIn(tutor.TOO_LARGE_MESSAGE, html)
+        self.assertNotIn("Traceback", html)
+        self.assertNotIn("RequestEntityTooLarge", html)
+        self.assertEqual(self.all_rows(), [], "超大请求不该写数据库")
+        self.assertEqual(len(self.fake.calls), 0, "超大请求不该调用模型")
+
+    def used_today(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute("SELECT used FROM api_usage WHERE day = ?",
+                               (tutor._utc_day(),)).fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
+
+# ===================== 11. 生产化：每日额度 =====================
+
+class TestDailyQuota(ChatTestCase):
+
+    def used_today(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute("SELECT used FROM api_usage WHERE day = ?",
+                               (tutor._utc_day(),)).fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
+    def test_normal_question_consumes_exactly_one(self):
+        c = tutor.app.test_client()
+        self.ask(c, "随便问一句")
+        self.assertEqual(self.used_today(), 1)
+        self.assertEqual(len(self.fake.calls), 1)
+
+    def test_requests_within_the_limit_reach_the_model(self):
+        tutor.DAILY_API_LIMIT = 3
+        c = tutor.app.test_client()
+        for i in range(3):
+            self.ask(c, "第 " + str(i) + " 个问题")
+        self.assertEqual(len(self.fake.calls), 3)
+        self.assertEqual(self.used_today(), 3)
+
+    def test_requests_beyond_the_limit_do_not_reach_the_model(self):
+        """【核心】额度用完后不再调用模型，给固定提示。"""
+        tutor.DAILY_API_LIMIT = 2
+        c = tutor.app.test_client()
+
+        self.ask(c, "第一个")
+        self.ask(c, "第二个")
+        r = self.ask(c, "第三个")                        # 这一次应该被挡住
+
+        self.assertEqual(len(self.fake.calls), 2, "超额后不该再调用模型")
+        self.assertIn(tutor.QUOTA_MESSAGE, r.get_data(as_text=True))
+        self.assertEqual(self.used_today(), 2, "被挡住的那次不该再加计数")
+
+    def test_quota_rejection_is_not_counted_as_an_error(self):
+        """额度用完是正常业务情况，不该被当成内部错误。"""
+        tutor.DAILY_API_LIMIT = 1
+        c = tutor.app.test_client()
+        self.ask(c, "第一个")
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            self.ask(c, "第二个")
+        self.assertNotIn("internal_error", "\n".join(captured.output))
+
+    def test_empty_question_does_not_consume_quota(self):
+        c = tutor.app.test_client()
+        self.ask(c, "")
+        self.ask(c, "   ")
+        self.assertEqual(self.used_today(), 0)
+
+    def test_no_chunks_does_not_consume_quota(self):
+        """【核心】没检索到资料时不会调用模型，自然也不该占额度。"""
+        self.use_empty_retrieval()
+        c = tutor.app.test_client()
+        self.ask(c, "课程多少钱？")
+
+        self.assertEqual(len(self.fake.calls), 0)
+        self.assertEqual(self.used_today(), 0, "没调模型就不该占额度")
+
+    def test_model_failure_still_counts(self):
+        """【核心】模型调用失败，这次仍然计入额度。
+
+        理由：失败的这一次【已经真实发出过外部请求】了，风险已经产生。
+        网络抖动、接口报错都不该变成「免费重试」的漏洞。
+        """
+        def boom(model, messages, **kwargs):
+            raise RuntimeError("模拟故障")
+        self.fake.chat.completions.create = boom
+
+        c = tutor.app.test_client()
+        self.ask(c, "这一问会失败")
+
+        self.assertEqual(self.used_today(), 1, "失败的那次也必须计数")
+
+    def test_quota_survives_an_app_restart(self):
+        """【核心】额度存在数据库里，重启应用不会自动归零。"""
+        global tutor
+        tutor.DAILY_API_LIMIT = 1
+        c = tutor.app.test_client()
+        self.ask(c, "重启前用掉唯一一次")
+        self.assertEqual(self.used_today(), 1)
+
+        # ---- 模拟重启 ----
+        tutor = importlib.reload(tutor)
+        tutor.client = FakeClient()
+        tutor.retriever.retrieve = fake_retrieve
+        tutor.DAILY_API_LIMIT = 1
+
+        c2 = tutor.app.test_client()
+        self.ask(c2, "重启后还想再问")
+
+        self.assertEqual(len(tutor.client.calls), 0, "额度应该已经用完了，不该再调模型")
+        self.assertEqual(self.used_today(), 1)
+
+    def test_quota_is_tracked_per_utc_day(self):
+        """额度按 UTC 日期分组，昨天的用量不影响今天。"""
+        yesterday = "2026-01-01"
+        ok, used = tutor.reserve_api_call(1, day=yesterday)
+        self.assertTrue(ok)
+        self.assertEqual(used, 1)
+
+        ok2, used2 = tutor.reserve_api_call(1, day=yesterday)
+        self.assertFalse(ok2)
+
+        ok3, _ = tutor.reserve_api_call(1, day="2026-01-02")     # 换一天，额度是新的
+        self.assertTrue(ok3)
+
+    def test_concurrent_reservations_never_exceed_the_limit(self):
+        """【核心】多线程同时抢，拿到的总数绝不能超过上限。
+
+        这正是要 BEGIN IMMEDIATE 的原因：如果实现是「先读再写」，
+        两个线程都会读到「还有名额」，然后各加一次，就超了。
+        """
+        limit = 5
+        results = []
+        guard = threading.Lock()
+
+        def worker():
+            ok, _ = tutor.reserve_api_call(limit)
+            with guard:
+                results.append(ok)
+
+        threads = [threading.Thread(target=worker) for _ in range(20)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(sum(results), limit, "并发时超额了")
+        self.assertEqual(self.used_today_limited(limit), limit)
+
+    def used_today_limited(self, limit):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute("SELECT used FROM api_usage WHERE day = ?",
+                               (tutor._utc_day(),)).fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
+    def test_sequential_reservations_stop_exactly_at_the_limit(self):
+        for i in range(4):
+            ok, _ = tutor.reserve_api_call(3)
+            self.assertEqual(ok, i < 3, "第 " + str(i + 1) + " 次的判定不对")
+
+
+# ===================== 12. 生产化：日志不泄露 =====================
+
+class TestLoggingSafety(ChatTestCase):
+
+    def test_logs_never_contain_user_or_model_content(self):
+        """【核心】问题正文、回答正文、密钥、session_id 都不能进日志。"""
+        marker_q = "特征问题串-ZZTOP-8f3a"
+        marker_a = "特征回答串-ZZTOP-4b7c"
+        self.fake.reply = rag_reply(answer=marker_a)
+
+        c = tutor.app.test_client()
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            self.ask(c, marker_q)
+
+        sid = self.session_id_of(c)
+        blob = "\n".join(captured.output)
+
+        self.assertNotIn(marker_q, blob, "问题正文进了日志")
+        self.assertNotIn(marker_a, blob, "回答正文进了日志")
+        self.assertNotIn(tutor.API_KEY, blob, "API 密钥进了日志")
+        self.assertNotIn(tutor.SECRET_KEY, blob, "FLASK_SECRET_KEY 进了日志")
+        self.assertIsNotNone(sid)
+        self.assertNotIn(sid, blob, "原始 session_id 进了日志")
+
+    def test_logs_never_contain_exception_text(self):
+        """【核心】异常原文不能进日志，只记异常类型。"""
+        marker = "特征异常串-ZZTOP-9d1e"
+
+        def boom(model, messages, **kwargs):
+            raise RuntimeError(marker)
+        self.fake.chat.completions.create = boom
+
+        c = tutor.app.test_client()
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            self.ask(c, "随便问一句")
+
+        blob = "\n".join(captured.output)
+        self.assertNotIn(marker, blob)
+        self.assertNotIn("RuntimeError", blob)           # 连类型都不必暴露给业务日志
+
+    def test_rag_decision_is_logged_without_content(self):
+        """该记的统计量要记：决策、引用数、耗时。"""
+        c = tutor.app.test_client()
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            self.ask(c, "随便问一句")
+
+        blob = "\n".join(captured.output)
+        self.assertIn("question_received", blob)
+        self.assertIn("question_length=", blob)
+        self.assertIn("rag_decision", blob)
+        self.assertIn("decision=answer", blob)
+        self.assertIn("citation_count=", blob)
+        self.assertIn("elapsed_ms=", blob)
+
+    def test_field_whitelist_drops_unknown_field_names(self):
+        """【核心】字段名不在白名单里就自动丢掉——这是结构性的防泄露，不靠人自觉。"""
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            tutor.log_event("synthetic_event", question="绝密内容", raw_answer="绝密回答",
+                            decision="answer")
+
+        line = "\n".join(captured.output)
+        self.assertNotIn("绝密内容", line)
+        self.assertNotIn("绝密回答", line)
+        self.assertIn("decision=answer", line)
+
+    def test_log_values_are_truncated_to_one_line(self):
+        """就算有人塞了一长串带换行的东西进去，日志也不会被撑爆。"""
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            tutor.log_event("synthetic_event", decision="x" * 500 + "\n伪造的第二行")
+
+        line = "\n".join(captured.output)
+        self.assertNotIn("伪造的第二行", line)
+        self.assertLess(len(line), 200)
+
+    def test_startup_is_logged(self):
+        """启动日志必须存在——而且它在模块级，线上 Gunicorn 也能打到。"""
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            importlib.reload(tutor)
+        self.assertIn("app_start", "\n".join(captured.output))
+        tutor.client = FakeClient()
+        tutor.retriever.retrieve = fake_retrieve
+
+
+# ===================== 13. 部署产物 =====================
+
+class TestDeploymentArtifacts(unittest.TestCase):
+    """检查 requirements 和部署文档里该有的东西——它们容易写着写着就漏了。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = os.path.dirname(os.path.abspath(__file__))
+
+    def read(self, name):
+        with open(os.path.join(self.root, name), encoding="utf-8") as f:
+            return f.read()
+
+    def test_gunicorn_is_a_declared_dependency(self):
+        self.assertIn("gunicorn", self.read("requirements.txt").lower())
+
+    def test_deployment_doc_exists(self):
+        self.assertTrue(os.path.exists(os.path.join(self.root, "DEPLOYMENT.md")))
+
+    def test_deployment_doc_covers_the_essentials(self):
+        """部署文档必须写清单 worker、$PORT、/health、持久卷路径。"""
+        doc = self.read("DEPLOYMENT.md")
+        self.assertIn("--workers 1", doc, "没写清单 worker")
+        self.assertIn("$PORT", doc, "没写启动命令里的端口变量")
+        self.assertIn("/health", doc, "没写健康检查路径")
+        self.assertIn("/data/chat.db", doc, "没写持久卷上的数据库路径")
+
+    def test_deployment_doc_lists_the_env_vars(self):
+        doc = self.read("DEPLOYMENT.md")
+        for name in ("DEEPSEEK_API_KEY", "FLASK_SECRET_KEY", "CHAT_DB_PATH",
+                     "MAX_QUESTION_LENGTH", "DAILY_API_LIMIT"):
+            self.assertIn(name, doc, "部署文档漏了环境变量 " + name)
+
+    def test_readme_links_to_the_deployment_doc(self):
+        self.assertIn("DEPLOYMENT.md", self.read("README.md"))
+
+    def test_no_railway_config_files_were_added(self):
+        """Railway 的旧 Config as Code 已弃用，本阶段不新增这类文件。"""
+        for name in ("railway.toml", "railway.json"):
+            self.assertFalse(os.path.exists(os.path.join(self.root, name)),
+                             name + " 不该存在（部署参数写在 DEPLOYMENT.md 里）")
+
+    # ---------- 平台事实的防回归检查 ----------
+    #
+    # 【为什么这些要写成测试】
+    # 部署文档写错平台行为，比代码写错更难发现：它不会报错、不会崩，
+    # 只会让人按错误的心智模型去运维。这两条都是被独立验收抓出来的错误，
+    # 所以钉成测试，防止以后改写文档时又漂回去。
+
+    def test_doc_says_health_check_is_not_continuous_monitoring(self):
+        """【防回归】必须写清楚：健康检查不是持续监控，而是部署时的一次性验收。"""
+        doc = self.read("DEPLOYMENT.md")
+
+        self.assertIn("不是「持续监控」", doc, "没写明健康检查不是持续监控")
+        self.assertIn("验收", doc, "没说明它其实是「部署前的验收」")
+
+    def test_doc_says_restarts_are_governed_by_restart_policy(self):
+        """【防回归】重启是另一套机制管的，不能和 /health 混为一谈。"""
+        doc = self.read("DEPLOYMENT.md")
+
+        self.assertIn("Restart Policy", doc, "没写清重启由 Restart Policy 管理")
+        # 部署完成后 Railway 就不再访问这个端点——这一点必须写明
+        self.assertIn("不再访问", doc, "没写清部署完成后就不再调用 /health")
+
+    def test_doc_no_longer_claims_health_failures_restart_the_service(self):
+        """【防回归】原来那句「连续失败就会重启服务」必须已经不在了。"""
+        doc = self.read("DEPLOYMENT.md")
+
+        self.assertNotIn("连续失败就会重启服务", doc, "原来那句错误说法还在")
+
+        # 如果文中还提到「连续失败」这个概念，必须是在【否定】它
+        # （现在它只出现在「常见误解」对照表里，带着 ❌ 标记）
+        for para in doc.split("\n\n"):
+            if "连续失败" in para:
+                self.assertIn("❌", para, "提到「连续失败」却没有明确否定它")
+
+    def test_doc_no_longer_points_at_volume_download(self):
+        """【防回归】「在卷操作里下载」不是 Railway 的正式备份方式，不能写。"""
+        doc = self.read("DEPLOYMENT.md")
+        self.assertNotIn("卷操作里下载", doc)
+
+    def test_doc_does_not_present_a_same_volume_copy_as_a_backup(self):
+        """【防回归】`cp` 到同一个卷，绝不能写成备份方案。
+
+        文档里【允许】出现这条命令——但只能在「不要这么做」的警告里。
+        所以这里查两件事：
+          1. 原来那两句推荐语必须已经不在了；
+          2. 凡出现这条命令的地方，必须同时有明确的否定措辞。
+        """
+        doc = self.read("DEPLOYMENT.md")
+
+        self.assertNotIn("备份很简单", doc, "原来那句把 cp 当方案的话还在")
+        self.assertNotIn("或者临时起一个能跑", doc, "原来那句把 cp 当方案的话还在")
+
+        for para in doc.split("\n\n"):
+            if "cp /data/chat.db" in para:
+                self.assertIn("不要", para, "提到了 cp 却没有明确否定它")
+
+    def test_doc_explains_a_same_volume_copy_is_not_a_disaster_backup(self):
+        """【防回归】要讲明白为什么同卷拷贝不算备份——两份会一起没。"""
+        doc = self.read("DEPLOYMENT.md")
+        self.assertIn("同一个卷里的一份拷贝", doc)
+        self.assertIn("一起没", doc)
+
+    def test_doc_describes_the_official_volume_backup_flow(self):
+        """【防回归】备份要走 Railway 官方的卷备份流程，四要素缺一不可。"""
+        doc = self.read("DEPLOYMENT.md")
+
+        self.assertIn("Backups", doc, "没提 Backups 页面")
+        self.assertIn("手动备份", doc, "没提手动创建备份")
+        self.assertIn("恢复", doc, "没提怎么恢复")
+        self.assertIn("计费", doc, "没提备份会产生存储费用")
+
+    def test_doc_is_honest_that_no_backup_was_created(self):
+        """【诚实性】没做过的事就要写没做过。"""
+        doc = self.read("DEPLOYMENT.md")
+        self.assertIn("没有实际创建任何备份", doc)
+
+    # ---------- 健康检查的「请求次数」与「重新部署停机」（第二轮修正） ----------
+    #
+    # 【为什么同一个地方被改了两轮】
+    # 第一轮修的是「不是持续监控」；但那一版又把「反复请求直到 2xx」写成了「调用一次」，
+    # 还顺手加了一句「旧版本继续服务，用户不受影响」——后者没有官方依据，属于过度承诺。
+    #
+    # 部署文档里一句没根据的承诺，会让人对停机毫无准备，比不写还糟。
+    # 所以在测试里同时钉住「该有的」和「不该有的」。
+
+    def test_doc_says_health_check_is_retried_until_2xx(self):
+        """【核心】健康检查是【反复请求】直到收到 2xx，不是只调用一次。"""
+        doc = self.read("DEPLOYMENT.md")
+
+        self.assertIn("反复请求", doc, "没写清楚健康检查会反复请求")
+        self.assertIn("直到收到 2xx", doc, "没写清楚反复请求的终止条件")
+
+    def test_doc_does_not_say_the_health_check_is_called_once(self):
+        """【核心】不能写成「调用一次 /health」。"""
+        doc = self.read("DEPLOYMENT.md")
+        self.assertNotIn("调用一次", doc,
+                         "「调用一次」的说法回来了——它是错的，Railway 会反复请求")
+
+    def test_doc_does_not_promise_the_old_version_keeps_serving(self):
+        """【核心】不要对失败后的流量行为作没有官方依据的承诺。"""
+        doc = self.read("DEPLOYMENT.md")
+        self.assertNotIn("旧版本继续服务", doc)
+        self.assertNotIn("用户不受影响", doc)
+
+    def test_doc_says_a_timed_out_deploy_is_marked_failed(self):
+        """超时仍未成功 → 新部署被标记为失败。"""
+        doc = self.read("DEPLOYMENT.md")
+        self.assertIn("标记为失败", doc)
+        self.assertIn("超时", doc)
+
+    def test_doc_warns_that_redeploying_causes_downtime(self):
+        """【核心】必须写明：挂了持久卷的服务，重新部署会短暂停机。"""
+        doc = self.read("DEPLOYMENT.md")
+
+        self.assertIn("短暂停机", doc, "没写明重新部署会短暂停机")
+        self.assertIn("不能保证零停机", doc, "没写明健康检查也不能保证零停机")
+
+    def test_doc_explains_why_the_downtime_is_unavoidable(self):
+        """还要解释原因：Railway 要避免两个部署同时挂载同一个卷。"""
+        doc = self.read("DEPLOYMENT.md")
+        self.assertIn("两个部署同时挂载同一个卷", doc)
+
+    def test_doc_frames_the_downtime_as_a_known_architecture_limit(self):
+        """要把它说成「SQLite + 单卷架构的已知限制」，而不是配置失误。"""
+        doc = self.read("DEPLOYMENT.md")
+        self.assertIn("已知限制", doc)
+        self.assertIn("PostgreSQL", doc)                 # 指明了真正的出路
 
 
 if __name__ == "__main__":

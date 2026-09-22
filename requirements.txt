@@ -4,3 +4,8 @@
 
 flask>=3.0          # 网页框架，负责路由、模板渲染
 openai>=1.0         # 用来调用 DeepSeek —— 它兼容 OpenAI 的接口，所以直接用这个库
+
+# 生产服务器。本地开发用不到（python app.py 就够了），只有部署到 Linux 平台时才用。
+# 【只装不用也没关系】它在 Windows 上装不上，但 Windows 上本来也不需要——
+# 本地是 python app.py，线上是 gunicorn，两条路各走各的。
+gunicorn>=21.0      # 部署时用它拉起应用；必须只开 1 个 worker，原因见 DEPLOYMENT.md
