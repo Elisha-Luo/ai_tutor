@@ -199,6 +199,8 @@ if not logger.handlers:                               # 避免被重复添加（
 _SAFE_LOG_FIELDS = frozenset({
     "port", "workers", "db_file", "debug",            # 启动信息
     "question_length", "decision", "citation_count", "elapsed_ms",   # 每个问题的统计
+    "diagnostic_code",                                # 固定诊断枚举：区分「模型主动判的」和「校验没过降级的」
+    "context_messages", "context_chars",              # 上下文【只记条数和字符数】，绝不记正文
     "limit", "used",                                  # 额度
     "error_type", "stage",                            # 内部错误（只记类型，不记内容）
 })
@@ -291,6 +293,43 @@ def load_history(session_id):
         conn.close()
     # 把数据库的「行」转成模板需要的「字典列表」，模板那边一行都不用改
     return [{"role": r[0], "content": r[1]} for r in rows]
+
+
+def load_recent_messages(session_id, limit=None):
+    """读出某个会话【最近的几条】消息，按时间顺序返回。只给模型当短期上下文用。
+
+    【它和 load_history 的区别，一定要分清楚】
+      load_history()         —— 读【全部】记录，给页面展示用（用户要能往回翻）
+      load_recent_messages() —— 读【最近几条】，只喂给模型当对话上下文
+
+    合成一个函数是错的：展示要完整，上下文要克制，两者目的相反。
+    合并之后迟早会有人为了「省一次查询」把整段历史塞进提示词。
+
+    【会话隔离】WHERE session_id = ? —— 只可能读到当前这个会话的记录。
+    绝不按 learner 读，也绝不读全库：那会把别人的对话拼进你的上下文里。
+    （这个项目现在只有 session_id 这一层身份，还没有 learner 的概念，
+     但话要说死 —— 免得以后加了 learner 就从这里开始漏。）
+
+    【为什么按 id DESC 取完再翻回来】
+    先取【最新】的几条（DESC + LIMIT），再把顺序翻正（老 → 新）。
+    写成 ORDER BY id ASC LIMIT 6 取到的是【最早】的 6 条 —— 正好是错的那一头。
+
+    【条数上限为什么从 rag 那边取】
+    「上下文带几条」属于提示词预算，归 rag.py 管。这里只按它说的条数去读，
+    两边不会各写一个 6、然后慢慢漂移成两个不同的数。
+    """
+    if limit is None:
+        limit = rag.RECENT_MESSAGE_LIMIT                 # 单一事实来源：rag 里的常量
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+            (session_id, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
 
 def save_exchange(session_id, question, answer):
@@ -551,7 +590,28 @@ def index():                                          # 用户每次打开页面
                     log_event("retrieval_failed", error_type=type(exc).__name__)
                     return _render(sid, question=question, error=SAFE_ERROR_MESSAGE)
 
-                # ---------- 第二步：占一次额度 ----------
+                # ---------- 第二步：取【本会话】最近的几条消息，当短期上下文 ----------
+                # 用户问完「帮我改一下这句」，接着问「再给一个例子」「为什么这样改」，
+                # 这两句离开上一轮就无从作答。所以把最近的几条历史一起带给模型。
+                #
+                # 【为什么必须在这里取，不能更晚】
+                # 当前这个问题【还没有存库】（存库在第四步）。所以此刻读到的历史，
+                # 一定是「当前问题之前」的 —— 不会把当前问题重复当成上下文喂回去。
+                #
+                # 【只取本会话】load_recent_messages 里写死了 WHERE session_id = ?。
+                # 别人的会话、全库，都不在读取范围内。
+                #
+                # 【取不到怎么办：降级成「没有上下文」，而不是让整个请求失败】
+                # 上下文是锦上添花的东西。读不到它，答案会差一点，但仍然能用；
+                # 为了它把用户刚问的问题整个丢掉，代价大于收益。
+                # 异常只记类型，正文和原文都不进日志。
+                try:
+                    recent_messages = load_recent_messages(sid)
+                except Exception as exc:
+                    log_event("history_load_failed", error_type=type(exc).__name__)
+                    recent_messages = []
+
+                # ---------- 第三步：占一次额度 ----------
                 # 【为什么现在是无条件占】
                 # 以前是「没检索到资料就不调模型、不占额度」。
                 # 现在不行了 —— 检索为空也可能要调模型（去判断这是不是一个正常的英语问题），
@@ -566,27 +626,52 @@ def index():                                          # 用户每次打开页面
                     log_event("quota_rejected", limit=DAILY_API_LIMIT, used=used)
                     return _render(sid, question=question, error=QUOTA_MESSAGE)
 
-                # ---------- 第三步：交给 RAG 生成，并校验它引用的来源 ----------
-                # rag.generate_answer 内部已经兜住了模型的所有异常和不合规输出：
+                # ---------- 第四步：交给 RAG 生成，并校验它引用的来源 ----------
+                # rag.generate_answer_with_context 内部已经兜住了模型的所有异常和不合规输出：
                 # 坏 JSON、编造来源、空引用、接口报错……它一律安全降级成「不回答」。
-                # 它现在还能处理「资料没支持、但属于正常英语问题」的情况（general_answer）。
+                # 它还能处理「资料没支持、但属于正常英语问题」的情况（general_answer）。
+                #
+                # 【为什么用带上下文的那个入口】历史只在这里拼进那一次请求，
+                # 而且是【唯一一次】模型调用 —— 不会为了「先理解指代再回答」调两次。
                 #
                 # 【额度什么时候算掉】只要走进了这一步，就已经占过一次了。
                 # 哪怕模型调用失败、哪怕 rag 内部降级，这一次【照样计入】——
                 # 因为它已经真实地发出去过一次外部请求，风险已经产生了。
-                result = rag.generate_answer(question, chunks, client, MODEL)
+                # 【为什么用带诊断的那个入口】
+                # 日志里原来只有最终的 decision，看不出这个结论是模型主动给的，
+                # 还是某一关校验没过、被安全降级下来的 —— 两者排查方向完全相反。
+                # diagnostic_code 是一个【不含任何内容的固定短枚举】，
+                # 只写日志，【绝不】进页面、也不进数据库（result 仍然只有三个键）。
+                result, diagnostic_code = rag.generate_answer_with_context_and_diagnostics(
+                    question, chunks, recent_messages, client, MODEL)
 
-                # ---------- 第四步：格式化 + 存库 ----------
+                # ---------- 第五步：格式化 + 存库 ----------
                 # 只有真的回答了，才会在后面附上「资料来源」；
                 # 拒答和证据不足不会凭空多出一个来源列表。
                 answer = format_answer_with_sources(result)
                 save_exchange(sid, question, answer)
 
-                # 【日志只记统计量】决策、引用数、耗时。
-                # 绝不记问题正文、也绝不记回答正文。
+                # 【日志只记统计量】决策、引用数、耗时、上下文的条数和字符数。
+                # 上下文【只记这两个数字】，历史正文一个字都不许进日志 ——
+                # 那是用户的内容，和 problem/answer 正文同一条红线。
+                #
+                # 这里的 context_for_log 是拿同一个纯函数算出来的，输入相同结果就一定相同，
+                # 所以它反映的就是真正拼进提示词的那一份（不是「读到的条数」）。
+                #
+                # 【diagnostic_code 就是这把尺子】
+                #   · ok                       → 这个 decision 是模型主动给的
+                #   · invalid_json             → 模型没按 JSON 格式回，被降级
+                #   · invalid_citations        → 引了本次片段之外的来源，被降级
+                #   · citations_on_general_answer → 通用知识回答却带了引用，被降级
+                #   · api_or_response_error    → 接口层就没成功，压根没拿到模型输出
+                # 全部是写死的短枚举，不含模型原文、异常内容、问题、回答或上下文。
+                context_for_log = rag.build_recent_context(recent_messages)
                 log_event("rag_decision",
                           decision=result.get("decision"),
+                          diagnostic_code=diagnostic_code,
                           citation_count=len(result.get("citations") or []),
+                          context_messages=len(context_for_log),
+                          context_chars=sum(len(e["text"]) for e in context_for_log),
                           elapsed_ms=int(round((time.perf_counter() - started) * 1000)))
 
                 # 【为什么成功后要「跳转」】这叫 POST-Redirect-GET 模式。

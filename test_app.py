@@ -568,6 +568,438 @@ class TestRagPipeline(ChatTestCase):
         self.assertEqual(len(self.fake.calls), 0, "检索都失败了，不该再去调模型")
 
 
+# ===================== 5d. 短期对话上下文（网页层）=====================
+#
+# 【这一组在测什么】网页把【本会话最近的几条消息】带给模型这条链路上，
+# 三件事必须同时成立：
+#   1. 带对了 —— 最近的进去、更老的出来、顺序是正的、不超过三条上限
+#   2. 只带自己的 —— A 会话的历史绝不会出现在 B 会话的上下文里
+#   3. 只当上下文 —— 历史里的来源名【不能】变成引用，仍然只认本次检索到的片段
+#
+# 【解析提示词而不是直接调 rag.build_recent_context】
+# 下面那个 context_entries() 解析的是【真正发给模型的那串字】。
+# 所以它同时证明了两件事：「上限生效」和「app.py 确实把历史传下去了」——
+# 只调纯函数的话，app.py 万一忘了传，测试照样绿。
+
+class TestShortTermContext(ChatTestCase):
+
+    # ---------- 小工具 ----------
+
+    def ask_turn(self, client, question, answer):
+        """问一轮，并让这一轮的回答带上可辨认的标记。"""
+        self.fake.reply = rag_reply(answer=answer)
+        return self.ask(client, question)
+
+    def user_text(self, index=-1):
+        """取出发给模型的 user 消息正文（-1 = 最后一次调用）。"""
+        return self.fake.calls[index]["messages"][1]["content"]
+
+    def context_entries(self, index=-1):
+        """把提示词里那段『最近上下文』解析成 [(role, 正文), ...]。
+
+        正文里的换行（比如回答带的『资料来源：』那一节）会归到上一条，
+        不会被算成新的一条，也不会被漏掉 —— 预算断言必须算上它们。
+        """
+        sent = self.user_text(index)
+        open_mark = "======== 最近上下文开始 ========"
+        close_mark = "======== 最近上下文结束 ========"
+
+        start = sent.index(open_mark) + len(open_mark)
+        end = sent.index(close_mark)
+
+        entries = []
+        for line in sent[start:end].strip("\n").split("\n"):
+            for prefix, role in (("用户：", "用户"), ("助手：", "助手")):
+                if line.startswith(prefix):
+                    entries.append([role, line[len(prefix):]])
+                    break
+            else:
+                if entries:                                 # 续行：接到上一条后面
+                    entries[-1][1] += "\n" + line
+        return [tuple(e) for e in entries]
+
+    # ---------- 一、带对了 ----------
+
+    def test_first_turn_has_no_context(self):
+        """第一轮没有历史可带 —— 提示词里不该凭空出现一个空的上下文区。"""
+        c = tutor.app.test_client()
+        self.ask_turn(c, "第一轮的问题", "第一轮的回答")
+
+        sent = self.user_text()
+        self.assertIn("第一轮的问题", sent)
+        self.assertNotIn("最近上下文", sent, "第一轮不该有上下文区")
+
+    def test_previous_turn_reaches_the_model(self):
+        """【核心】上一轮的问和答都要进上下文 —— 只带问题不够，
+        「为什么这样改」要靠上一轮的回答才答得出来。
+
+        【助手那条为什么不是「就是回答原文」】
+        数据库里存的是【格式化之后】的整段文字，带「资料来源」那一节。
+        所以上下文里也一定带着它 —— 这恰恰是下面
+        test_a_source_name_from_history_cannot_be_cited 必须存在的原因：
+        历史里躺着一个长得跟真引用一模一样的来源块，绝不能让它变成引用。
+        """
+        c = tutor.app.test_client()
+        self.ask_turn(c, "第一轮的问题", "第一轮的回答")
+        self.ask_turn(c, "再给一个例子", "第二轮的回答")
+
+        entries = self.context_entries()
+        self.assertEqual([role for role, _ in entries], ["用户", "助手"])
+        self.assertEqual(entries[0][1], "第一轮的问题")
+        self.assertTrue(entries[1][1].startswith("第一轮的回答"))
+        self.assertIn("资料来源：", entries[1][1], "存进历史的应该是格式化后的整段文字")
+
+    def test_context_is_in_chronological_order(self):
+        """【核心】交出去的一定是「先问后答」，不能倒着来。"""
+        c = tutor.app.test_client()
+        for i in range(3):
+            self.ask_turn(c, "问题" + str(i), "回答" + str(i))
+
+        roles = [role for role, _ in self.context_entries()]
+        self.assertEqual(roles[:2], ["用户", "助手"])
+        self.assertEqual(roles, ["用户", "助手"] * 2, "顺序或条数不对")
+
+    def test_at_most_six_messages_reach_the_model(self):
+        """【核心】最多 6 条，而且留下的是【最新】那 6 条。"""
+        c = tutor.app.test_client()
+        for i in range(5):                                  # 5 轮 = 库里 10 条
+            self.ask_turn(c, "问题" + str(i), "回答" + str(i))
+
+        self.ask_turn(c, "第六轮的问题", "第六轮的回答")        # 第 6 轮时再看上下文
+        entries = self.context_entries()
+
+        self.assertEqual(len(entries), tutor.rag.RECENT_MESSAGE_LIMIT)
+        block = " ".join(text for _role, text in entries)
+        for i in (2, 3, 4):                                 # 最近 6 条 = 第 2~4 轮
+            self.assertIn("问题" + str(i), block)
+        for i in (0, 1):                                    # 更老的必须已经出去
+            self.assertNotIn("问题" + str(i), block)
+            self.assertNotIn("回答" + str(i), block)
+
+    def test_single_message_stays_within_the_per_message_cap(self):
+        """【核心】单条历史不超过 1200 字 —— 一条超长回答不能挤爆上下文。"""
+        c = tutor.app.test_client()
+        self.ask_turn(c, "第一轮的问题", "乙" * 3000)          # 回答远超 1200
+        self.ask_turn(c, "再给一个例子", "第二轮的短回答")
+
+        for role, body in self.context_entries():
+            self.assertLessEqual(len(body), tutor.rag.MAX_HISTORY_MESSAGE_CHARS,
+                                 role + " 那一条超长了")
+
+    def test_total_context_stays_within_the_total_budget(self):
+        """【核心】所有历史加起来不超过 4000 字。"""
+        c = tutor.app.test_client()
+        for i in range(4):
+            self.ask_turn(c, "问题" + str(i), "答" * 1500)     # 每轮都被截到 1200
+        self.ask_turn(c, "最后一个问题", "ok")
+
+        entries = self.context_entries()
+        total = sum(len(body) for _role, body in entries)
+
+        self.assertLessEqual(total, tutor.rag.MAX_HISTORY_TOTAL_CHARS,
+                             "上下文总长度超预算：" + str(total))
+        self.assertLessEqual(len(entries), tutor.rag.RECENT_MESSAGE_LIMIT)
+
+    # ---------- 二、只带自己的 ----------
+
+    def test_a_session_never_sees_another_sessions_history(self):
+        """【核心】A 会话的历史绝不能出现在 B 会话的上下文里。"""
+        a = tutor.app.test_client()
+        b = tutor.app.test_client()
+
+        self.ask_turn(a, "甲会话的秘密问题", "甲会话的秘密回答")
+        self.ask_turn(b, "乙会话的问题", "乙会话的回答")
+        self.ask_turn(b, "乙会话的追问", "乙会话的第二次回答")
+
+        sent_b = self.user_text()                           # B 的最后一次调用
+        self.assertNotIn("甲会话的秘密问题", sent_b, "B 的上下文里混进了 A 的问题")
+        self.assertNotIn("甲会话的秘密回答", sent_b, "B 的上下文里混进了 A 的回答")
+        self.assertIn("乙会话的问题", sent_b, "B 自己的历史反而没带进去")
+
+        self.ask_turn(a, "甲会话的追问", "甲会话的第二次回答")
+        sent_a = self.user_text()                           # A 的最后一次调用
+        self.assertNotIn("乙会话的问题", sent_a, "A 的上下文里混进了 B 的历史")
+        self.assertIn("甲会话的秘密问题", sent_a)
+
+    # ---------- 三、只当上下文 ----------
+
+    def test_current_question_is_not_counted_as_history(self):
+        """【核心】当前问题还没存库，所以它只该出现在『当前问题』那一处。
+
+        一旦取历史的时机放错（比如先存后取），当前问题就会被当成上下文
+        再喂一遍，模型会以为用户在重复问同一件事。
+        """
+        c = tutor.app.test_client()
+        self.ask_turn(c, "第一轮的问题", "第一轮的回答")
+        self.ask_turn(c, "再给一个例子", "第二轮的回答")
+
+        sent = self.user_text()
+        self.assertEqual(sent.count("再给一个例子"), 1, "当前问题被出现了一次以上")
+
+        context_text = " ".join(text for _role, text in self.context_entries())
+        self.assertNotIn("再给一个例子", context_text, "当前问题被塞进上下文了")
+
+    def test_retriever_only_ever_receives_the_current_question(self):
+        """【核心】检索只拿当前问题，绝不把历史拼进查询。
+
+        检索决定了「这次能引用什么」。要是把历史也拼进去，
+        命中的片段会跟着上一轮漂移，引用就不可控了。
+        """
+        c = tutor.app.test_client()
+        self.ask_turn(c, "第一轮的问题", "第一轮独特回答")
+        self.ask_turn(c, "第二轮的问题", "第二轮独特回答")
+
+        self.assertEqual([call["question"] for call in RETRIEVAL_CALLS],
+                         ["第一轮的问题", "第二轮的问题"],
+                         "检索收到的不是「每轮各自的问题」")
+        for call in RETRIEVAL_CALLS:
+            self.assertNotIn("独特回答", call["question"], "回答正文被拼进检索查询了")
+
+    def test_a_source_name_from_history_cannot_be_cited(self):
+        """【本轮最关键的一条】历史里出现过的来源不算数 —— 引用只认本次片段。
+
+        构造：第一轮的回答正文里提到了 grammar_present_perfect.md；
+        第二轮【什么都没检索到】（白名单是空的），模型却引用了那个来源。
+        正确行为：白名单拦下 → 安全降级 → 页面和数据库都不能出现那段回答。
+        """
+        c = tutor.app.test_client()
+
+        # 第一轮：正文里提到一个来源名（general_answer 不带引用，但正文可以提到）
+        self.fake.reply = rag_reply(
+            decision="general_answer",
+            answer="我上次是参考 grammar_present_perfect.md 的「基本结构」讲的",
+            citations=[])
+        self.ask(c, "第一轮的问题")
+
+        # 第二轮：检索为空，模型从上一轮「记得的」来源里挑了一个来引
+        self.use_empty_retrieval()
+        self.fake.reply = rag_reply(answer="顺手引一个来源。", citations=[
+            {"source": "grammar_present_perfect.md", "heading": "基本结构"}])
+        self.ask(c, "再给一个例子")
+
+        rows = self.all_rows()
+        self.assertEqual(len(rows), 4)
+        second_answer = rows[3][2]                          # 第二轮的 assistant 那条
+
+        self.assertEqual(second_answer, tutor.rag.INSUFFICIENT_TEXT,
+                         "引了历史里的来源却当成合法回答存下来了")
+        self.assertNotIn("顺手引一个", second_answer)
+        self.assertNotIn("资料来源", second_answer)
+
+        html = c.get("/").get_data(as_text=True)
+        self.assertNotIn("顺手引一个", html)
+        self.assertNotIn("资料来源：", html)
+
+    def test_model_is_called_exactly_once_per_question(self):
+        """【核心】有上下文时仍然一次提问 = 一次模型调用。
+
+        上下文是【拼进那一次请求】的，不是「先调一次理解指代、再调一次回答」。
+        """
+        c = tutor.app.test_client()
+        self.ask_turn(c, "问题一", "回答一")
+        self.ask_turn(c, "问题二", "回答二")
+        self.ask_turn(c, "问题三", "回答三")
+
+        self.assertEqual(len(self.fake.calls), 3, "每轮只该有一次模型调用")
+
+    # ---------- 四、日志与持久化 ----------
+
+    def test_logs_never_contain_history_text(self):
+        """【核心】上下文的正文一个字都不许进日志 —— 只记条数和字符数。"""
+        c = tutor.app.test_client()
+
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            self.ask_turn(c, "特征历史问题-ZZT-1a", "特征历史回答-ZZT-2b")
+            self.ask_turn(c, "再给一个例子", "第二轮的回答")
+
+        blob = "\n".join(captured.output)
+        self.assertNotIn("特征历史问题-ZZT-1a", blob, "历史问题正文进了日志")
+        self.assertNotIn("特征历史回答-ZZT-2b", blob, "历史回答正文进了日志")
+        # 该记的统计量要有，否则「没记」和「没泄露」就分不出来了
+        self.assertIn("context_messages=", blob)
+        self.assertIn("context_chars=", blob)
+
+    def test_context_survives_an_app_restart(self):
+        """【核心】重启后，同一个 cookie 仍能从 SQLite 里取到最近上下文。
+
+        上下文没有存在内存里、也没有单独的会话状态 —— 它就是数据库里的最近几条。
+        所以「重启后还认得上一轮」是自动成立的，这条测试把它钉住。
+        """
+        global tutor
+        c = tutor.app.test_client()
+        self.ask_turn(c, "重启前的第一轮", "重启前的回答")
+        cookie = c.get_cookie("session")
+        self.assertIsNotNone(cookie)
+
+        # ---- 模拟重启 ----
+        tutor = importlib.reload(tutor)
+        tutor.client = FakeClient()
+        tutor.retriever.retrieve = fake_retrieve
+        self.fake = tutor.client                            # 后面继续用新模块的假客户端
+
+        c2 = tutor.app.test_client()
+        c2.set_cookie("session", cookie.value)              # 同一个浏览器
+        self.ask_turn(c2, "重启后的追问", "重启后的回答")
+
+        entries = self.context_entries()
+        self.assertEqual([role for role, _ in entries], ["用户", "助手"])
+        self.assertEqual(entries[0][1], "重启前的第一轮")
+        self.assertTrue(entries[1][1].startswith("重启前的回答"))
+
+
+# ===================== 5e. 网页路径的诊断标签（只进日志）=====================
+#
+# 【为什么需要这一组】
+# 两轮真实上下文验收里，两次最终的 decision 都是 insufficient_evidence，
+# 但日志看不出这到底是「模型就是这么判的」，还是「某一关校验没过、被降级下来的」——
+# 前者要动提示词，后者要查模型的输出格式或引用，排查方向完全相反。
+#
+# 这一组把那条区分钉住：decision 照旧对外（页面 + 数据库），
+# diagnostic_code 只进安全日志，且永远是固定短枚举。
+
+class TestContextDiagnostics(ChatTestCase):
+
+    def logs_of(self, question="随便问一句"):
+        """问一次，把这一轮打的日志和测试客户端一起拿回来。"""
+        c = tutor.app.test_client()
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            self.ask(c, question)
+        return "\n".join(captured.output), c
+
+    # ---------- 六种情况要能分辨 ----------
+
+    def test_a_healthy_answer_logs_ok(self):
+        """正常回答 → ok。免得「ok」被误读成「有问题」。"""
+        blob, _c = self.logs_of()
+
+        self.assertIn("decision=answer", blob)
+        self.assertIn("diagnostic_code=ok", blob)
+
+    def test_valid_insufficient_evidence_logs_ok(self):
+        """【核心】模型主动判 insufficient_evidence 且校验通过 → 仍然是 ok。
+
+        这条正好对应两轮真实验收的现象：decision 是 insufficient_evidence，
+        但日志里必须能看出【模型就是这么说】，而不是被降级了。
+        """
+        self.fake.reply = rag_reply(decision="insufficient_evidence",
+                                    answer="信息不够完整。", citations=[])
+        blob, _c = self.logs_of()
+
+        self.assertIn("decision=insufficient_evidence", blob)
+        self.assertIn("diagnostic_code=ok", blob, "模型主动判的被误报成降级")
+
+    def test_invalid_json_is_distinguishable_from_a_real_decision(self):
+        """【核心】坏 JSON 降级后 decision 一模一样，但标签必须是 invalid_json。"""
+        self.fake.reply = "我觉得应该这样回答：主语 + have + 过去分词。"
+        blob, _c = self.logs_of()
+
+        self.assertIn("decision=insufficient_evidence", blob)
+        self.assertIn("diagnostic_code=invalid_json", blob)
+        self.assertNotIn("diagnostic_code=ok", blob, "降级了却报成 ok")
+        self.assertNotIn("我觉得应该这样回答", self.all_rows()[1][2],
+                         "坏 JSON 的原文被当成回答存下来了")
+
+    def test_fabricated_citation_logs_invalid_citations(self):
+        """编造来源被拦下 → invalid_citations。"""
+        self.fake.reply = rag_reply(citations=[{"source": "编造.md", "heading": "编造标题"}])
+        blob, _c = self.logs_of()
+
+        self.assertIn("diagnostic_code=invalid_citations", blob)
+
+    def test_general_answer_with_citations_logs_its_own_code(self):
+        """通用知识回答却带了引用 → citations_on_general_answer。"""
+        self.fake.reply = rag_reply(decision="general_answer", answer="通用回答",
+                                    citations=[{"source": "grammar_present_perfect.md",
+                                                "heading": "基本结构"}])
+        blob, _c = self.logs_of()
+
+        self.assertIn("diagnostic_code=citations_on_general_answer", blob)
+
+    def test_api_error_logs_api_or_response_error(self):
+        """接口层就没成功 → api_or_response_error，且不泄露异常原文。"""
+        def boom(model, messages, **kwargs):
+            raise RuntimeError("接口炸了")
+        self.fake.chat.completions.create = boom
+
+        blob, _c = self.logs_of()
+
+        self.assertIn("diagnostic_code=api_or_response_error", blob)
+        self.assertNotIn("RuntimeError", blob)
+        self.assertNotIn("接口炸了", blob)
+
+    # ---------- 标签只能进日志 ----------
+
+    def test_diagnostic_code_never_reaches_the_page_or_the_database(self):
+        """【核心】诊断标签是后厨的东西，页面和数据库都不能出现。"""
+        self.fake.reply = "这不是 JSON"
+        blob, c = self.logs_of()
+
+        self.assertIn("diagnostic_code=invalid_json", blob)      # 日志里有
+
+        dump = " ".join(str(r) for r in self.all_rows())
+        self.assertNotIn("invalid_json", dump, "诊断标签进了数据库")
+        self.assertNotIn("diagnostic", dump)
+
+        html = c.get("/").get_data(as_text=True)
+        self.assertNotIn("invalid_json", html, "诊断标签进了页面")
+        self.assertNotIn("diagnostic", html)
+
+    def test_public_result_still_has_exactly_three_keys(self):
+        """【核心】对外结果一个键都不许多 —— 页面/数据库拿到的仍是三键。"""
+        self.fake.reply = "这不是 JSON"
+        c = tutor.app.test_client()
+        self.ask(c, "随便问一句")
+
+        rows = self.all_rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1][2], tutor.rag.INSUFFICIENT_TEXT)
+
+    # ---------- 上下文与调用次数不受影响 ----------
+
+    def test_context_is_still_used_and_counted(self):
+        """带上下文时诊断入口复用同一实现：上下文进提示词，两轮只有两次调用。"""
+        c = tutor.app.test_client()
+        self.fake.reply = rag_reply(answer="第一轮的回答")
+        self.ask(c, "第一轮的问题")
+
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            self.ask(c, "再给一个例子")
+        blob = "\n".join(captured.output)
+
+        self.assertIn("context_messages=2", blob)
+        self.assertIn("context_chars=", blob)
+        self.assertEqual(len(self.fake.calls), 2, "两轮只该有两次模型调用")
+
+        sent = self.fake.calls[-1]["messages"][1]["content"]
+        self.assertIn("第一轮的问题", sent, "上下文没有带进去")
+
+    # ---------- 日志里不能有任何正文 ----------
+
+    def test_logs_never_contain_any_content(self):
+        """【核心】模型原文、问题、回答、上下文、异常原文、密钥，一个都不许进日志。"""
+        marker_q = "特征问题-ZZD-1a"
+        marker_ctx = "特征上下文-ZZD-3c"
+        marker_exc = "特征异常-ZZD-4d"
+
+        c = tutor.app.test_client()
+        self.fake.reply = rag_reply(answer=marker_ctx)          # 第一轮的回答会进第二轮的上下文
+        self.ask(c, "第一轮的问题")
+
+        def boom(model, messages, **kwargs):
+            raise RuntimeError(marker_exc)
+        self.fake.chat.completions.create = boom
+
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            self.ask(c, marker_q)
+        blob = "\n".join(captured.output)
+
+        self.assertIn("diagnostic_code=api_or_response_error", blob)   # 该记的记了
+
+        for marker in (marker_q, marker_ctx, marker_exc,
+                       tutor.API_KEY, tutor.SECRET_KEY):
+            self.assertNotIn(marker, blob, "日志里出现了不该有的内容")
+
+
 # ===================== 6. 纯函数：格式化成显示文本 =====================
 
 class TestFormatAnswerWithSources(unittest.TestCase):
@@ -665,13 +1097,13 @@ class TestHarnessSafety(ChatTestCase):
         self.assertIn("验证假客户端有被调用", sent[1]["content"])
         self.assertIn("基本结构", sent[1]["content"])       # 检索到的资料也一起带上了
 
-    def test_model_receives_only_the_current_question(self):
-        """【本轮的边界】模型只收到当前问题，不再携带历史。
+    def test_previous_turn_is_now_sent_as_context(self):
+        """【本轮的行为变化】上一轮的话现在会作为【上下文】发给模型。
 
-        以前是把整段历史一起发给模型，让它「有上下文」。
-        现在走 RAG：只按当前问题检索资料再回答。
-        于是依赖上一轮指代的问题（比如「那它呢？」）这一版不保证正确——
-        这是刻意的取舍，README 里已如实写明，不让用户误以为它能听懂上下文。
+        以前是「只按当前问题检索、历史一律不发」，于是「再给一个例子」
+        「为什么这样改」这类依赖上一轮的问题答不了。
+        现在会把同一会话最近的几条带上 —— 但只当上下文，不当资料（详见
+        TestShortTermContext 里的安全测试）。
         """
         c = tutor.app.test_client()
         self.ask(c, "第一轮问的话")
@@ -681,10 +1113,15 @@ class TestHarnessSafety(ChatTestCase):
         contents = " ".join(m["content"] for m in sent["messages"])
 
         self.assertIn("第二轮问的话", contents)
-        self.assertNotIn("第一轮问的话", contents, "历史不该被发给模型")
+        self.assertIn("第一轮问的话", contents, "上一轮没有被当成上下文带进去")
+        self.assertIn("最近上下文", contents, "带进去了，但没标明这是上下文而不是资料")
 
-    def test_history_is_still_stored_even_though_it_is_not_sent(self):
-        """历史不再发给模型，但仍要照常保存和展示——两件事不能混为一谈。"""
+    def test_history_is_stored_displayed_and_also_sent_as_context(self):
+        """历史现在有三件事同时成立：存下来、显示出来、还被当成上下文带上。
+
+        注意展示和上下文是【两条独立的路】：展示读全部记录，
+        上下文只读最近几条。这里三件事一起钉住。
+        """
         c = tutor.app.test_client()
         self.ask(c, "第一轮问的话")
         self.ask(c, "第二轮问的话")
@@ -693,6 +1130,10 @@ class TestHarnessSafety(ChatTestCase):
         html = c.get("/").get_data(as_text=True)
         self.assertIn("第一轮问的话", html)                   # 第一轮在页面上仍然看得到
         self.assertIn("第二轮问的话", html)
+
+        sent = self.fake.calls[-1]
+        contents = " ".join(m["content"] for m in sent["messages"])
+        self.assertIn("第一轮问的话", contents)               # 同时也在上下文里
 
 
 # ===================== 8. 生产化：配置读取 =====================

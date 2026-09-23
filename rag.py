@@ -143,6 +143,28 @@ INSUFFICIENT_TEXT = (
 )
 
 
+# ===================== 短期对话上下文 =====================
+#
+# 【要解决什么】用户问完「帮我改一下这句话」，接着问「再给一个例子」「为什么这样改？」——
+# 后两句离开上一轮就无从作答。所以要把【同一个会话最近的几条消息】拼进这一次请求，
+# 让模型知道「刚才那句话」指的是什么。
+#
+# 【它和「资料」完全是两回事，绝不能混】
+#   · 资料（chunks）—— 本次检索出来的知识库片段，是【唯一】可以引用的东西
+#   · 历史消息     —— 只是对话上下文，用来理解指代；【不许】从它里面取 citation
+#
+# 为什么这条界线要划得这么硬：历史里带着上一轮回答的「资料来源：xxx.md · yyy」。
+# 一旦允许模型从上下文里挑来源，它就能引用一段【本次根本没检索到】的资料 ——
+# 引用白名单就形同虚设了。所以白名单只认本次 chunks（见 _normalize_citations），
+# 历史里出现过的来源名一律不算数。
+#
+# 【为什么只带 6 条】上下文越长越贵、越慢，也越容易把「当前问题」淹没。
+# 6 条 = 3 轮问答，足够支撑「刚才那句」「再举个例」这类最近指代。
+RECENT_MESSAGE_LIMIT = 6            # 最多带入几条历史消息
+MAX_HISTORY_MESSAGE_CHARS = 1200    # 单条历史最多多少字符
+MAX_HISTORY_TOTAL_CHARS = 4000      # 所有历史加起来最多多少字符
+
+
 # ===================== 给模型的提示词 =====================
 
 SYSTEM_PROMPT = """你是一名 AI 英语学习助手。用户的问题属于下面四种情况之一，请判断是哪一种，并如实填写 decision。
@@ -191,6 +213,14 @@ SYSTEM_PROMPT = """你是一名 AI 英语学习助手。用户的问题属于下
    · citations 必须是空数组 []
    · 【绝对不要】用你自己的知识去编造课程的业务事实 —— 这是最严重的一类错误
 
+【最近的对话上下文（如果这次有的话）】
+
+- 它只用来理解用户在指代什么，比如「刚才那句话」「再给一个例子」「为什么这样改」
+- 它【不是资料】。绝不能依据上下文里出现过的内容、来源名或标题给出 citation
+- citations 永远只能从本次「资料片段」里列出的来源和标题中选
+- 上下文里如果写着「资料来源：xxx.md」，那个来源【不算数】——本次没检索到的资料就是不能引用
+- 上下文和资料片段冲突时，一律以【资料片段】和【用户本次的问题】为准
+
 【引用规则（非常严格，务必遵守）】
 
 - decision 为 answer 时，citations 至少要有 1 项
@@ -210,14 +240,98 @@ SYSTEM_PROMPT = """你是一名 AI 英语学习助手。用户的问题属于下
 """
 
 
-def _build_user_prompt(question, chunks):
-    """把资料片段和用户问题拼成这一次要发给模型的内容。
+def build_recent_context(recent_messages):
+    """把历史消息裁成「能安全拼进提示词的一小段上下文」。
+
+    返回一个列表，每项形如 {"role": "用户"|"助手", "text": ...}，按【时间顺序】排列。
+
+    【输入必须是时间顺序（老 → 新）】
+    调用方按这个顺序传进来。本函数内部会从【最新】那头开始挑，
+    但返回时一定翻回时间顺序 —— 模型读到的必须是「先问后答」，不能倒着来。
+
+    【三条上限，谁先撞上谁生效】
+      1. 条数：最多 RECENT_MESSAGE_LIMIT 条（只留最新的）
+      2. 单条：每条最多 MAX_HISTORY_MESSAGE_CHARS 个字符（超了就截断并加省略号）
+      3. 总量：所有历史加起来不超过 MAX_HISTORY_TOTAL_CHARS
+
+    【单条上限顺带解决了「一条超长历史占满预算」】
+    因为 1200 < 4000，单条再长也吃不掉整份预算，至少还能再放下两条。
+
+    【预算不够时：先丢最老的，而且丢到就停】
+    用户说「再给一个例子」时，靠的是【最近】那几轮，所以先丢的一定是最老的那条。
+    至于「装不下这条、要不要跳过它去拿更老的」——不跳。
+    那样会留下一个跳着选的窟窿：中间少一轮，模型更容易把上下文理解错。
+    宁可少带，也要带【连续的一段】。
+
+    【role 只认 user / assistant】
+    别的值一律丢掉。数据库里理论上只有这两种，但万一哪天多了第三种，
+    宁可少带一条，也不要把它当成「用户说的话」塞给模型。
+    """
+    if not recent_messages:
+        return []
+
+    picked = []
+    for item in recent_messages:
+        if not isinstance(item, dict):                 # 结构不对，不猜
+            continue
+        role = item.get("role")
+        if role not in ("user", "assistant"):          # 不认识的 role：不猜
+            continue
+        text = item.get("content")
+        if not isinstance(text, str):
+            continue
+        text = text.strip()
+        if not text:                                   # 空消息没有任何信息量
+            continue
+        if len(text) > MAX_HISTORY_MESSAGE_CHARS:      # 单条上限：截断，并留个省略号
+            text = text[:MAX_HISTORY_MESSAGE_CHARS - 1] + "…"
+        picked.append({"role": "用户" if role == "user" else "助手", "text": text})
+
+    picked = picked[-RECENT_MESSAGE_LIMIT:]            # 条数上限：只留最新的几条
+
+    kept = []                                          # 总量上限：从最新往老累加
+    total = 0
+    for entry in reversed(picked):
+        if total + len(entry["text"]) > MAX_HISTORY_TOTAL_CHARS:
+            break                                      # 装不下就停，连带丢掉更老的
+        kept.append(entry)
+        total += len(entry["text"])
+
+    kept.reverse()                                     # 翻回时间顺序再交给模型
+    return kept
+
+
+def _format_recent_context(recent_context):
+    """把 build_recent_context 的结果拼成提示词里那一段文字。"""
+    if not recent_context:
+        return ""
+
+    lines = []
+    for entry in recent_context:
+        lines.append(entry["role"] + "：" + entry["text"])
+
+    return (
+        "下面是本次对话的【最近上下文】。它只是对话记录，【不是资料】，不能引用：\n"
+        "======== 最近上下文开始 ========\n"
+        + "\n".join(lines) +
+        "\n======== 最近上下文结束 ========\n\n"
+    )
+
+
+def _build_user_prompt(question, chunks, recent_context=None):
+    """把【历史上下文】+【资料片段】+【用户问题】拼成这一次要发给模型的内容。
+
+    【三块的顺序是刻意的】
+    上下文在最前，资料居中，当前问题在最后 —— 越靠近末尾的内容，模型越当回事。
+    「当前问题」必须紧贴着指令，不能被一大段历史和资料埋在中间。
 
     【为什么用字符串拼接，不用 .format()】
     这段提示词里含有 JSON 的 { }。一旦用 .format()，Python 会把花括号当成
     占位符，直接抛 KeyError。evaluate.py 里是靠把 { 写成 {{ 才躲过去的，
     写法很丑而且容易改错。所以这里一律用 + 拼接，绝不对含 JSON 的提示词 format()。
     """
+    context_section = _format_recent_context(recent_context)
+
     if chunks:
         blocks = []                                # 每段资料拼成一小块文字
         for i, c in enumerate(chunks, 1):          # 从 1 开始编号，方便模型引用
@@ -247,7 +361,8 @@ def _build_user_prompt(question, chunks):
         )
 
     return (
-        material_section
+        context_section
+        + material_section
         + "用户的问题：\n" + str(question) + "\n\n"
         "请严格按照 system 里的规则判断 decision，并只输出那一个 JSON 对象。"
     )
@@ -339,6 +454,25 @@ def _degrade(diagnostic_code):
 
 
 # ===================== 对外的主函数 =====================
+#
+# 四个入口，职责分得很清楚：
+#
+#   generate_answer(question, chunks, client, model)                        ← 老入口，不带上下文
+#   generate_answer_with_context(question, chunks, recent_messages, ...)    ← 网页用，带短期上下文
+#   generate_answer_with_diagnostics(question, chunks, client, model)       ← 评测器用，多回一个诊断码
+#   generate_answer_with_context_and_diagnostics(...)                       ← 网页用，带上下文 + 诊断码
+#
+# 【最后一个为什么存在】网页要把「模型主动判的」和「校验没过降级来的」区分开，
+# 否则日志里两种情况长得一模一样。它只多回一个固定枚举，仍只给安全日志用。
+#
+# 【为什么分成四个，而不是给老入口加个可选参数】
+# 老入口的签名是已经上线的契约。给它加个可选参数虽然向后兼容，
+# 但「这一次到底会不会带上下文」就变成要看调用点才知道了。
+# 分开写，谁带上下文一眼可见；评测器的路径也仍然完全不碰历史。
+#
+# 【四个入口最后都走同一个内部实现 _generate()】
+# 提示词只有一份、五道校验只有一份、模型调用只有一处 —— 不会漂移成四个不同的产品。
+# 而且不管从哪个入口进，一次提问【只调用模型一次】。
 
 def generate_answer(question, chunks, client, model):
     """把「问题 + 已检索到的片段」交给模型，返回一个**可检查**的结果。
@@ -346,32 +480,93 @@ def generate_answer(question, chunks, client, model):
     【格式永远不变】只返回 decision / answer / citations 这三个键，一个不多一个不少。
     诊断信息【不从这里走】——那是后厨的事，见 generate_answer_with_diagnostics()。
 
-    网页、用户看到的就是这个函数的返回值，所以它的形状不能因为排查问题而改变。
+    【这个入口不带对话上下文】老入口保持原样，等价于「上下文为空」。
+    网页要带上下文，用 generate_answer_with_context()。
 
-    参数和返回格式，见下面那个函数的完整说明。
+    参数和返回格式，见 _generate() 的完整说明。
     """
-    result, _diagnostic_code = generate_answer_with_diagnostics(question, chunks, client, model)
+    result, _diagnostic_code = _generate(question, chunks, None, client, model)
     return result
 
 
+def generate_answer_with_context(question, chunks, recent_messages, client, model):
+    """网页专用入口：在「问题 + 片段」之外，再带上【同一会话最近的几条消息】。
+
+    返回值和 generate_answer 完全一样（还是那三个键），所以网页那边
+    「格式化 → 存库 → 展示」的流程一个字都不用改。
+
+    参数：
+        recent_messages —— 当前会话的历史消息，形如 [{"role": "user", "content": "…"}]，
+                           按【时间顺序】（老 → 新）排列；可以传 None 或空列表。
+
+    【两条保证，这个入口自己负责，不指望调用方】
+      1. 上限一定生效：条数 / 单条字符数 / 总字符数三条闸都在 build_recent_context()
+         里，无论调用方塞进来多少，拼进提示词的都不会超。
+      2. 上下文【不可能变成引用来源】：白名单只从本次 chunks 建。
+         历史里就算写着「资料来源：xxx.md」，模型引了也会被 _normalize_citations()
+         拦下并安全降级。
+    """
+    recent_context = build_recent_context(recent_messages)
+    result, _diagnostic_code = _generate(question, chunks, recent_context, client, model)
+    return result
+
+
+def generate_answer_with_context_and_diagnostics(question, chunks, recent_messages,
+                                                client, model):
+    """网页专用：带短期上下文，同时回一个诊断标签。**只给 app.py 写日志用。**
+
+    【为什么网页需要这个入口】
+    日志里原来只有最终的 `decision`，看不出这个结论是怎么来的 ——
+    「模型主动判的 insufficient_evidence」和「模型返回了坏 JSON、被安全降级成
+    insufficient_evidence」在日志里长得一模一样，但排查方向完全相反：
+    前者要动提示词，后者要查模型的输出格式或引用。
+
+    【它和评测器那个诊断入口的唯一区别：带不带上下文】
+    两者最后都走同一个 `_generate()`，提示词、五道校验、模型调用点都只有一份，
+    不存在「复制一套逻辑」的可能。一次提问仍然只有一次模型调用。
+
+    【安全】返回的第二个元素依然是不含任何内容的固定短枚举（见文件顶部的 DIAG_*）。
+    调用方【只能把它写进安全日志】——绝不能放进给用户看的响应、也不能存进数据库。
+    拼进提示词的上下文在这里被裁过（走的是 build_recent_context），
+    所以调用方塞进来多少条都不会超预算。
+    """
+    recent_context = build_recent_context(recent_messages)
+    return _generate(question, chunks, recent_context, client, model)
+
+
 def generate_answer_with_diagnostics(question, chunks, client, model):
-    """和 generate_answer 做同样的事，但额外回一个诊断标签。**只给评测器用。**
+    """和 generate_answer 做同样的事，但额外多回一个诊断标签。**只给评测器用。**
+
+    【它不带上下文】评测必须只针对「问题 + 片段」判分，
+    掺进历史会让同一个问题在不同上下文里得到不同结果，评分就不可复现了。
+
+    返回 (结果字典, diagnostic_code)，说明见 _generate()。
+    """
+    return _generate(question, chunks, None, client, model)
+
+
+def _generate(question, chunks, recent_context, client, model):
+    """四个对外入口共用的实现。**不要直接调用它**，走上面那四个入口之一。
 
     返回一个二元组：
-        ( 和 generate_answer 完全一样的结果字典, diagnostic_code )
+        ( 结果字典, diagnostic_code )
 
-    第一个元素就是 generate_answer 的返回值，形状一模一样；
+    第一个元素就是 generate_answer 的返回值，形状一模一样（永远三个键）；
     第二个元素是固定的短枚举（见文件顶部的 DIAG_*），
     用来回答「这一次到底是在哪一步被拦下的」。
+
+    recent_context 是【已经裁好】的上下文（build_recent_context 的返回值），
+    不是原始的历史消息。传 None 就等于「本次没有上下文」。
 
     【安全】诊断标签只说明「哪一步失败了」，不含任何内容——
     没有异常原文、没有密钥、没有提示词、没有模型的完整原始回答、没有请求内容。
 
     参数：
-        question —— 用户问题（字符串）
-        chunks   —— retriever.py 返回的检索片段列表，每项含 source / heading / text
-        client   —— 外部传入的模型客户端（本模块不自己建客户端，也不碰密钥）
-        model    —— 外部传入的模型名
+        question       —— 用户问题（字符串）
+        chunks         —— retriever.py 返回的检索片段列表，每项含 source / heading / text
+        recent_context —— 已裁好的短期上下文（可传 None）
+        client         —— 外部传入的模型客户端（本模块不自己建客户端，也不碰密钥）
+        model          —— 外部传入的模型名
 
     generate_answer 的返回格式（格式固定，永远是这三个键）：
         {
@@ -407,12 +602,15 @@ def generate_answer_with_diagnostics(question, chunks, client, model):
     # 【注意：这里不再有「没资料就拒答」的分支】
     # 不管有没有检索到片段，都要问一次模型 —— 只有它知道这是个正常的英语问题，
     # 还是一个超出范围的问题。
+    #
+    # 【一次提问 = 一次调用】上下文是【拼进这一次请求】的，不是先调一次去理解指代、
+    # 再调一次去回答。所以下面这个 create() 是全流程唯一的模型调用点。
     try:
         response = client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": _build_user_prompt(question, chunks)},
+                {"role": "user", "content": _build_user_prompt(question, chunks, recent_context)},
             ],
         )
         raw = response.choices[0].message.content

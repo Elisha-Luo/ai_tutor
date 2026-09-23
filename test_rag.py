@@ -385,6 +385,302 @@ class TestDecisionBoundaryPrompt(RagTestCase):
         self.assertNotIn("询问课程的业务事实，而资料里没有记录", self.system_prompt())
 
 
+# ===================== 5c. 短期对话上下文 =====================
+#
+# 分成两组：
+#   · TestRecentContextBudget        —— 纯函数，管「带几条、每条多长、总共多长、顺序」
+#   · TestContextInThePrompt         —— 管「拼进提示词之后，安全边界还在不在」
+#
+# 【最要紧的一条】上下文【不是资料】。
+# 历史里带着上一轮回答的「资料来源：xxx.md · yyy」，如果模型从那里挑来源就能通过校验，
+# 引用白名单就形同虚设 —— 这是本轮最危险的一处，必须有测试钉住。
+
+class TestRecentContextBudget(unittest.TestCase):
+    """只测 rag.build_recent_context 这个纯函数：四条闸，一条一条来。"""
+
+    @staticmethod
+    def msg(role, text):
+        return {"role": role, "content": text}
+
+    def build(self, messages):
+        return rag.build_recent_context(messages)
+
+    # ---------- 上限本身 ----------
+
+    def test_shipped_limits_are_the_documented_ones(self):
+        """三个上限是写死的约定，不能被悄悄改掉（文档和测试都按这个数写）。"""
+        self.assertEqual(rag.RECENT_MESSAGE_LIMIT, 6)
+        self.assertEqual(rag.MAX_HISTORY_MESSAGE_CHARS, 1200)
+        self.assertEqual(rag.MAX_HISTORY_TOTAL_CHARS, 4000)
+
+    # ---------- 空输入 ----------
+
+    def test_no_history_gives_an_empty_context(self):
+        """None 和空列表都算「本次没有上下文」，不能崩，也不能拼出空壳。"""
+        for empty in (None, []):
+            self.assertEqual(self.build(empty), [], "输入=" + repr(empty))
+
+    # ---------- 闸一：条数 ----------
+
+    def test_at_most_six_messages_and_the_newest_win(self):
+        """10 条历史只留 6 条，而且是【最新】那 6 条 —— 不是最早的。"""
+        history = [self.msg("user", "第" + str(i) + "条") for i in range(10)]
+        out = self.build(history)
+
+        self.assertEqual(len(out), 6)
+        self.assertEqual([e["text"] for e in out],
+                         ["第4条", "第5条", "第6条", "第7条", "第8条", "第9条"])
+
+    def test_output_is_in_chronological_order(self):
+        """从最新那头挑选，但交出去时必须翻回「先问后答」的正常顺序。"""
+        history = [self.msg("user", "问题一"), self.msg("assistant", "回答一"),
+                   self.msg("user", "问题二"), self.msg("assistant", "回答二")]
+        out = self.build(history)
+
+        self.assertEqual([e["role"] for e in out], ["用户", "助手", "用户", "助手"])
+        self.assertEqual([e["text"] for e in out], ["问题一", "回答一", "问题二", "回答二"])
+
+    # ---------- 闸二：单条长度 ----------
+
+    def test_a_single_message_is_truncated_to_the_cap(self):
+        """单条超长 → 截断，并且末尾留一个省略号说明「这里被切了」。"""
+        out = self.build([self.msg("assistant", "甲" * 3000)])
+
+        self.assertEqual(len(out), 1)
+        self.assertEqual(len(out[0]["text"]), rag.MAX_HISTORY_MESSAGE_CHARS)
+        self.assertTrue(out[0]["text"].endswith("…"))
+
+    def test_a_huge_message_cannot_eat_the_whole_budget(self):
+        """【核心】一条超长历史不能把 4000 的预算吃光。
+
+        因为单条先被截到 1200（< 4000），所以它最多只能占掉一小部分，
+        更老的正常消息仍然进得来 —— 这正是「不能让一条超长历史占满预算」。
+        """
+        history = [self.msg("user", "老问题"),
+                   self.msg("assistant", "老回答"),
+                   self.msg("assistant", "乙" * 10000)]        # 最新这条超大
+        out = self.build(history)
+
+        self.assertEqual([e["text"] for e in out],
+                         ["老问题", "老回答", "乙" * 1199 + "…"])
+
+    # ---------- 闸三：总量 ----------
+
+    def test_total_budget_is_respected(self):
+        """6 条 × 1000 字 = 6000，超过 4000 → 只留下装得下的那几条。"""
+        history = [self.msg("user", "丙" * 1000) for _ in range(6)]
+        out = self.build(history)
+
+        total = sum(len(e["text"]) for e in out)
+        self.assertLessEqual(total, rag.MAX_HISTORY_TOTAL_CHARS)
+        self.assertEqual(len(out), 4, "1000 × 4 = 4000 刚好装满，第 5 条进不来")
+
+    def test_the_oldest_are_the_ones_dropped(self):
+        """预算不够时先丢最老的 —— 靠「刚才那句」的时候，最近的最有用。"""
+        history = [self.msg("user", "标记" + str(i) + "-" + "丁" * 995) for i in range(6)]
+        out = self.build(history)
+
+        kept = [e["text"][:3] for e in out]
+        self.assertEqual(kept, ["标记2", "标记3", "标记4", "标记5"], "丢的不是最老的")
+
+    # ---------- 脏数据 ----------
+
+    def test_unknown_roles_and_malformed_entries_are_dropped(self):
+        """role 不认识、内容不是字符串、空内容 —— 一律丢掉，绝不猜、绝不塞空壳。"""
+        out = self.build([
+            self.msg("system", "系统消息不该进来"),
+            self.msg("user", "正常消息"),
+            {"role": "user"},                            # 缺 content
+            {"role": "user", "content": None},            # content 不是字符串
+            {"role": "user", "content": "   "},           # 只有空白
+            "我压根不是字典",
+            {"content": "没有 role"},
+            self.msg("assistant", "正常回答"),
+        ])
+
+        self.assertEqual([e["text"] for e in out], ["正常消息", "正常回答"])
+
+    def test_whitespace_is_stripped_from_the_edges(self):
+        out = self.build([self.msg("user", "  前后有空格  ")])
+        self.assertEqual(out[0]["text"], "前后有空格")
+
+    def test_building_twice_gives_the_same_answer(self):
+        """纯函数：同样的输入必须给同样的输出（app.py 靠这个算日志数字）。"""
+        history = [self.msg("user", "问题"), self.msg("assistant", "回答")]
+        self.assertEqual(self.build(history), self.build(history))
+
+
+class TestContextInThePrompt(RagTestCase):
+    """上下文拼进提示词之后：该带进去的带进去了，不该越的界一步没越。"""
+
+    def ask_with_context(self, recent, question="再给一个例子", reply=None, chunks=None):
+        """走【带上下文】的那个入口。"""
+        if reply is not None:
+            self.fake.reply = reply if isinstance(reply, str) else json.dumps(
+                reply, ensure_ascii=False)
+        if chunks is None:
+            chunks = [dict(c) for c in CHUNKS]
+        return rag.generate_answer_with_context(question, chunks, recent, self.fake, MODEL)
+
+    def sent_user_text(self, index=0):
+        """取出发给模型的 user 消息正文。"""
+        return self.fake.calls[index]["messages"][1]["content"]
+
+    @staticmethod
+    def msg(role, text):
+        return {"role": role, "content": text}
+
+    # ---------- 上下文确实进去了 ----------
+
+    def test_recent_history_reaches_the_model(self):
+        """【核心】上一轮的原话必须出现在这次发给模型的内容里。"""
+        self.ask_with_context([self.msg("user", "帮我把这句改简单一点"),
+                               self.msg("assistant", "改成这样：……")])
+
+        sent = self.sent_user_text()
+        self.assertIn("帮我把这句改简单一点", sent)
+        self.assertIn("改成这样：……", sent)
+        self.assertIn("最近上下文", sent, "没有标出哪一段是上下文")
+
+    def test_context_comes_before_the_current_question(self):
+        """顺序：上下文 → 资料 → 当前问题。当前问题必须紧贴着指令，不能被埋掉。"""
+        self.ask_with_context([self.msg("user", "上一轮的话")], question="再给一个例子")
+
+        sent = self.sent_user_text()
+        self.assertLess(sent.index("上一轮的话"), sent.index("再给一个例子"))
+
+    def test_only_one_model_call_even_with_context(self):
+        """【核心】有上下文时仍然只调用模型一次 —— 不是「先理解指代再回答」两次。"""
+        self.ask_with_context([self.msg("user", "上一轮的话")])
+        self.assertEqual(len(self.fake.calls), 1)
+
+    def test_no_context_still_works(self):
+        """没有历史时，提示词里不该出现上下文那一段。"""
+        self.ask_with_context(None)
+        self.assertNotIn("最近上下文", self.sent_user_text())
+
+    # ---------- 向后兼容 ----------
+
+    def test_old_entry_point_sends_no_history(self):
+        """【核心】老入口 generate_answer 保持原样：不带上下文。
+
+        评测器走的就是它 —— 判分必须只针对「问题 + 片段」，
+        掺进历史会让同一个问题在不同上下文里得出不同结果，评分不可复现。
+        """
+        rag.generate_answer("再给一个例子", [dict(c) for c in CHUNKS], self.fake, MODEL)
+
+        sent = self.sent_user_text()
+        self.assertNotIn("最近上下文", sent)
+
+    def test_all_entry_points_never_add_a_second_model_call(self):
+        """挨个调用三个入口，一共只有三次模型调用 —— 一个不多。
+
+        （第四个入口 generate_answer_with_context_and_diagnostics 由本类
+          下面那几条测试单独覆盖，也各自断言过「只调一次」。）
+        """
+        rag.generate_answer("问题一", [dict(c) for c in CHUNKS], self.fake, MODEL)
+        rag.generate_answer_with_context(
+            "问题二", [dict(c) for c in CHUNKS], [self.msg("user", "历史")], self.fake, MODEL)
+        rag.generate_answer_with_diagnostics("问题三", [dict(c) for c in CHUNKS], self.fake, MODEL)
+
+        self.assertEqual(len(self.fake.calls), 3)
+
+    # ---------- 安全边界：上下文绝不能被当成资料 ----------
+
+    def test_a_source_name_seen_in_history_cannot_be_cited(self):
+        """【本轮最关键的一条】历史里出现过的来源名，不算数。
+
+        构造：上一轮回答正文里提到了 grammar_present_perfect.md，
+        本次检索【什么都没捞到】（白名单是空的），模型却引用了那个来源。
+        正确行为：白名单拦下 → 安全降级 → 一条引用都不许留下。
+        """
+        history = [self.msg("assistant",
+                            "上一轮我引用的是 grammar_present_perfect.md 的「基本结构」一节")]
+
+        result = self.ask_with_context(
+            history, chunks=[],                      # 本次白名单为空
+            reply={"decision": "answer", "answer": "顺手引一个来源。",
+                   "citations": [{"source": "grammar_present_perfect.md",
+                                  "heading": "基本结构"}]})
+
+        self.assertEqual(result["decision"], "insufficient_evidence")
+        self.assertEqual(result["citations"], [], "历史里的来源被当成合法引用了")
+
+    def test_context_never_leaks_into_citations_even_when_chunks_are_real(self):
+        """本次有真片段时也一样：引历史里的标题 → 依然被拦。"""
+        history = [self.msg("assistant", "资料来源：course_faq.md · 以前的标题")]
+
+        result = self.ask_with_context(
+            history,
+            reply={"decision": "answer", "answer": "回答。",
+                   "citations": [{"source": "course_faq.md", "heading": "以前的标题"}]})
+
+        self.assertEqual(result["decision"], "insufficient_evidence",
+                         "引了历史里的标题（不是本次片段）却没被拦下")
+        self.assertEqual(result["citations"], [])
+
+    def test_return_shape_is_still_exactly_three_keys(self):
+        """带上下文之后，返回结构一个键都不许多。"""
+        result = self.ask_with_context([self.msg("user", "历史")])
+        self.assertEqual(set(result.keys()), {"decision", "answer", "citations"})
+
+    def test_diagnostics_entry_point_is_unaffected(self):
+        """评测器入口的返回值还是二元组，且不掺历史。"""
+        result, code = rag.generate_answer_with_diagnostics(
+            "问题", [dict(c) for c in CHUNKS], self.fake, MODEL)
+
+        self.assertEqual(set(result.keys()), {"decision", "answer", "citations"})
+        self.assertIn(code, rag.DIAGNOSTIC_CODES)
+
+    # ---------- 带上下文的诊断入口（网页写日志用） ----------
+
+    def test_context_diagnostics_entry_returns_a_pair(self):
+        """回二元组，第一个元素仍然是那三个键。"""
+        self.fake.reply = json.dumps(
+            {"decision": "insufficient_evidence", "answer": "信息不够完整。", "citations": []},
+            ensure_ascii=False)
+
+        result, code = rag.generate_answer_with_context_and_diagnostics(
+            "问题", [dict(c) for c in CHUNKS], [self.msg("user", "历史")], self.fake, MODEL)
+
+        self.assertEqual(set(result.keys()), {"decision", "answer", "citations"})
+        self.assertIn(code, rag.DIAGNOSTIC_CODES)
+        self.assertEqual(code, rag.DIAG_OK)
+
+    def test_context_diagnostics_entry_reuses_the_context_mechanism(self):
+        """它复用同一个实现，所以上下文照样进提示词，而且只有一次模型调用。"""
+        rag.generate_answer_with_context_and_diagnostics(
+            "再给一个例子", [dict(c) for c in CHUNKS], [self.msg("user", "上一轮的话")],
+            self.fake, MODEL)
+
+        self.assertEqual(len(self.fake.calls), 1, "诊断入口不该多调一次模型")
+        self.assertIn("上一轮的话", self.sent_user_text())
+
+    def test_context_diagnostics_agrees_with_the_plain_context_entry(self):
+        """同一份模型回复，两个入口的判断必须完全一致（它们共用同一个实现）。"""
+        reply = {"decision": "insufficient_evidence", "answer": "信息不够。", "citations": []}
+        plain = self.ask_with_context([self.msg("user", "历史")], reply=reply)
+
+        result, code = rag.generate_answer_with_context_and_diagnostics(
+            "再给一个例子", [dict(c) for c in CHUNKS], [self.msg("user", "历史")],
+            self.fake, MODEL)
+
+        self.assertEqual(result["decision"], plain["decision"])
+        self.assertEqual(result["answer"], plain["answer"])
+        self.assertEqual(code, rag.DIAG_OK)
+
+    def test_context_diagnostics_reports_degradation_honestly(self):
+        """【核心】被降级时 decision 和普通入口一样，但标签说出了真相。"""
+        self.fake.reply = "这不是 JSON"
+
+        result, code = rag.generate_answer_with_context_and_diagnostics(
+            "问题", [dict(c) for c in CHUNKS], [self.msg("user", "历史")], self.fake, MODEL)
+
+        self.assertEqual(result["decision"], "insufficient_evidence")
+        self.assertEqual(code, rag.DIAG_INVALID_JSON,
+                         "降级了却报成 ok —— 那日志就又看不出根因了")
+
+
 # ===================== 6. 安全降级 =====================
 
 class TestSafeDegradation(RagTestCase):
