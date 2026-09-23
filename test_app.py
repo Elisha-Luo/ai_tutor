@@ -410,18 +410,51 @@ class TestRagPipeline(ChatTestCase):
         self.assertIn("grammar_present_perfect.md", html)
         self.assertIn("基本结构", html)
 
-    def test_no_chunks_skips_the_model_and_saves_a_refusal(self):
-        """【核心】没检索到资料时，绝不调用模型，但要把这条安全拒答记下来。"""
-        self.use_empty_retrieval()
-        c = tutor.app.test_client()
-        self.ask(c, "课程多少钱？")
+    def test_empty_retrieval_still_calls_the_model(self):
+        """【本轮核心改动】没检索到资料时【仍然】调用模型。
 
-        self.assertEqual(len(self.fake.calls), 0, "没有资料时不该调用模型")
+        因为「资料里没有」和「这不是个正当的英语问题」完全是两回事。
+        模型会判断：正常的英语问题用 general_answer，超范围的用 refuse。
+        """
+        self.use_empty_retrieval()
+        self.fake.reply = rag_reply(decision="general_answer",
+                                    answer="这是通用知识回答。", citations=[])
+        c = tutor.app.test_client()
+        self.ask(c, "this 和 that 有什么区别？")
+
+        self.assertEqual(len(self.fake.calls), 1, "chunks 为空时也该调用模型")
         self.assertEqual(len(RETRIEVAL_CALLS), 1, "检索还是要跑一次的")
 
         rows = self.all_rows()
-        self.assertEqual(len(rows), 2, "拒答也要如实记进历史")
-        self.assertTrue(rows[1][2].strip(), "拒答内容不能是空的")
+        self.assertEqual(len(rows), 2, "回答要如实记进历史")
+        self.assertIn("通用知识回答", rows[1][2])
+
+    def test_general_answer_shows_the_marker_and_no_sources(self):
+        """【核心】general_answer 要显示「AI 通用知识回答」，且【绝不出】资料来源。"""
+        self.fake.reply = rag_reply(decision="general_answer",
+                                    answer="this 和 that 的区别是……", citations=[])
+        c = tutor.app.test_client()
+        self.ask(c, "this 和 that 有什么区别？")
+
+        saved = self.all_rows()[1][2]
+        self.assertIn("AI 通用知识回答", saved)
+        self.assertNotIn("资料来源", saved)
+
+        html = c.get("/").get_data(as_text=True)
+        self.assertIn("AI 通用知识回答", html)
+        self.assertNotIn("资料来源：", html)
+
+    def test_general_answer_with_citations_is_degraded_not_displayed(self):
+        """【核心】general_answer 如果带了引用，会安全降级 —— 引用不能显示出来。"""
+        self.fake.reply = rag_reply(
+            decision="general_answer", answer="通用回答",
+            citations=[{"source": "grammar_present_perfect.md", "heading": "基本结构"}])
+        c = tutor.app.test_client()
+        self.ask(c, "this 和 that 有什么区别？")
+
+        saved = self.all_rows()[1][2]
+        self.assertNotIn("AI 通用知识回答", saved)
+        self.assertNotIn("基本结构", saved)
 
     def test_refusal_never_shows_a_sources_section(self):
         """【核心】拒答绝不能伪造「资料来源」。
@@ -920,13 +953,30 @@ class TestDailyQuota(ChatTestCase):
         self.ask(c, "   ")
         self.assertEqual(self.used_today(), 0)
 
-    def test_no_chunks_does_not_consume_quota(self):
-        """【核心】没检索到资料时不会调用模型，自然也不该占额度。"""
-        self.use_empty_retrieval()
-        c = tutor.app.test_client()
-        self.ask(c, "课程多少钱？")
+    def test_empty_retrieval_still_consumes_quota(self):
+        """【本轮改动】没检索到资料【也会】调用模型，所以也要占额度。
 
-        self.assertEqual(len(self.fake.calls), 0)
+        以前「检索为空」等于不花钱；现在它可能变成一次真实调用
+        （去判断这是不是正常的英语问题），因此必须占额度。
+        """
+        self.use_empty_retrieval()
+        self.fake.reply = rag_reply(decision="general_answer", answer="通用回答", citations=[])
+        c = tutor.app.test_client()
+        self.ask(c, "this 和 that 有什么区别？")
+
+        self.assertEqual(len(self.fake.calls), 1, "chunks 为空时也该调用模型")
+        self.assertEqual(self.used_today(), 1, "调了模型就该占额度")
+
+    def test_retrieval_error_does_not_consume_quota(self):
+        """【核心】检索本身出错时不调模型，也不该占额度。"""
+        def boom(question, top_k=3):
+            raise RuntimeError("检索挂了")
+        tutor.retriever.retrieve = boom
+
+        c = tutor.app.test_client()
+        self.ask(c, "随便问一句")
+
+        self.assertEqual(len(self.fake.calls), 0, "检索失败不该调模型")
         self.assertEqual(self.used_today(), 0, "没调模型就不该占额度")
 
     def test_model_failure_still_counts(self):

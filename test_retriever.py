@@ -130,7 +130,7 @@ class TestRetrievalQuality(unittest.TestCase):
 
     def test_there_are_cases_to_test(self):
         """先确认题库读出来了，否则后面的循环会「空转通过」。"""
-        self.assertEqual(len(self.cases), 33, len(self.cases))
+        self.assertEqual(len(self.cases), 37, len(self.cases))
 
     def test_all_single_source_questions_hit_top1(self):
         """所有单来源题：top_1 的结果必须来自期望的那份资料。"""

@@ -11,6 +11,19 @@
 #
 # 「先检索、再照着检索结果回答」——这就是 RAG 的核心思路。
 # =====================================================================
+# 【2026-09-23 更新：从「三种结论」扩展到「四种结论」】
+#
+# 以前只有「答 / 拒答 / 证据不足」，而且「检索不到资料」就直接拒答、不调模型。
+# 那撑不住真实的英语学习问题 ——
+# 用户问「this 和 that 有什么区别」，知识库里根本没有相关内容，
+# 但那是一个完全正当的英语问题，不该被拒答。
+#
+# 所以现在多了第四种结论 general_answer：
+#   正常的英语问题 + 资料没有支持 + 用模型的通用知识回答
+#
+# 而且 chunks 为空时【也要】调用模型 ——
+# 因为只有模型能判断「这是个正当的英语问题」还是「这压根不该答」。
+# =====================================================================
 # 【这一层真正的工作量在哪：不在「调模型」，而在「不信模型」】
 #
 # 模型非常擅长一本正经地编——不光编内容，还会编来源。
@@ -31,13 +44,27 @@
 import json      # 解析模型返回的 JSON
 
 
-# ===================== 三种结论 =====================
+# ===================== 四种结论 =====================
+#
+# 【为什么是四种，不是三种】
+# 以前只有「答 / 拒答 / 证据不足」三种，靠「有没有检索到资料」来决定走哪条路。
+# 那撑不住真实的英语学习问题：用户问「this 和 that 有什么区别」时，
+# 知识库里根本没有相关内容——按老规则会被直接拒答，但那明明是个正当问题。
+#
+# 所以现在多了第四种：general_answer —— 「这是正常的英语问题，但资料没支持，
+# 用模型的通用知识回答」。它和 answer 的区别只有一个：**有没有资料依据**。
 
-DECISION_ANSWER = "answer"                        # 资料能完整支持，给出回答
-DECISION_REFUSE = "refuse"                        # 资料里完全没有相关内容
-DECISION_INSUFFICIENT = "insufficient_evidence"   # 资料沾边，但不足以完整回答
+DECISION_ANSWER = "answer"                        # 资料确实支持，给出回答（必须带引用）
+DECISION_GENERAL_ANSWER = "general_answer"        # 正常英语问题，但资料没支持（必须不带引用）
+DECISION_INSUFFICIENT = "insufficient_evidence"   # 问的是课程/知识库事实，资料只支持一部分
+DECISION_REFUSE = "refuse"                        # 超出英语学习范围 / 危险 / 不能编造的业务事实
 
-VALID_DECISIONS = {DECISION_ANSWER, DECISION_REFUSE, DECISION_INSUFFICIENT}
+VALID_DECISIONS = {
+    DECISION_ANSWER,
+    DECISION_GENERAL_ANSWER,
+    DECISION_INSUFFICIENT,
+    DECISION_REFUSE,
+}
 
 
 # ===================== 诊断标签：只给后厨看的「退菜原因单」=====================
@@ -60,20 +87,24 @@ VALID_DECISIONS = {DECISION_ANSWER, DECISION_REFUSE, DECISION_INSUFFICIENT}
 # 诊断是为了定位问题，不是为了把厨房里的脏东西端上桌。
 
 DIAG_OK = "ok"                                          # 一切正常，回答通过全部校验
-DIAG_NO_CHUNKS = "no_chunks"                            # 没有检索结果 → 直接拒答（没调模型）
 DIAG_API_OR_RESPONSE_ERROR = "api_or_response_error"    # 调模型抛异常，或响应结构不对
 DIAG_INVALID_JSON = "invalid_json"                      # 模型返回的不是合法 JSON
 DIAG_RESPONSE_NOT_OBJECT = "response_not_object"        # JSON 合法，但不是对象（比如是数组）
-DIAG_INVALID_DECISION = "invalid_decision"              # decision 不是那三个合法值之一
+DIAG_INVALID_DECISION = "invalid_decision"              # decision 不是那四个合法值之一
 DIAG_INVALID_CITATIONS = "invalid_citations"            # 引用格式不对，或引了白名单外的来源（编造来源）
-DIAG_EMPTY_ANSWER = "empty_answer"                      # decision=answer，但正文是空的
+DIAG_EMPTY_ANSWER = "empty_answer"                      # 说好要回答，但正文是空的
 DIAG_MISSING_CITATIONS = "missing_citations"            # decision=answer，但一条引用都没给
+DIAG_CITATIONS_ON_GENERAL_ANSWER = "citations_on_general_answer"  # general_answer 却带了引用
 DIAG_CITATIONS_ON_NON_ANSWER = "citations_on_non_answer"  # 拒答 / 证据不足，却带着引用
+
+# 【注意】原来的 DIAG_NO_CHUNKS 已经删掉了。
+# 它表示「没有检索结果 → 直接拒答、不调模型」—— 那条规则本轮已经取消：
+# 现在 chunks 为空也要调用模型（去判断这是不是一个正常的英语问题）。
+# 留着一个永远不会被产生的标签，只会让人误以为还有这条路径。
 
 # 全部合法标签。测试用它核对「产出的标签必须都在这个集合里」。
 DIAGNOSTIC_CODES = frozenset({
     DIAG_OK,
-    DIAG_NO_CHUNKS,
     DIAG_API_OR_RESPONSE_ERROR,
     DIAG_INVALID_JSON,
     DIAG_RESPONSE_NOT_OBJECT,
@@ -81,6 +112,7 @@ DIAGNOSTIC_CODES = frozenset({
     DIAG_INVALID_CITATIONS,
     DIAG_EMPTY_ANSWER,
     DIAG_MISSING_CITATIONS,
+    DIAG_CITATIONS_ON_GENERAL_ANSWER,
     DIAG_CITATIONS_ON_NON_ANSWER,
 })
 
@@ -91,9 +123,18 @@ DIAGNOSTIC_CODES = frozenset({
 # 把对外话术再交回给模型，等于把安全网又交回给它——它可能在这里继续夹带私货。
 # 固定文案还有第二个好处：行为确定、可测试。
 
+# 【refuse 的话术为什么不能只说「资料里没有」】
+# 因为 refuse 现在管三种情况，不只是「资料没写」：
+#   · 超出英语学习范围（问天气、写代码、闲聊）
+#   · 危险或不当请求
+#   · 询问课程业务事实，而资料里没记录（价格、退费、开课时间……）
+# 如果只说「资料里没有相关内容」，第一二种情况就显得答非所问。
+# 所以改成一句既准确、又不会误导的通用话术。
 REFUSE_TEXT = (
-    "资料里没有和这个问题相关的内容，我不能凭猜想回答。"
-    "如果你需要，可以换个问法，或者补充说明你想了解的是哪一部分。"
+    "这个问题我帮不上忙。"
+    "我是英语学习助手，主要处理语法、词汇、写作、翻译和表达方面的问题；"
+    "如果是课程价格、开课时间这类信息，我手头没有资料，也不能凭空编造，"
+    "建议直接向课程方确认。"
 )
 
 INSUFFICIENT_TEXT = (
@@ -104,20 +145,59 @@ INSUFFICIENT_TEXT = (
 
 # ===================== 给模型的提示词 =====================
 
-SYSTEM_PROMPT = """你是一名严谨的 AI 助教。你只能依据用户提供的「资料片段」回答问题，不许使用任何资料之外的知识。
+SYSTEM_PROMPT = """你是一名 AI 英语学习助手。用户的问题属于下面四种情况之一，请判断是哪一种，并如实填写 decision。
 
-你必须判断当前属于下面哪一种情况，并如实填写：
+【四种情况】
 
-1. answer —— 资料片段能够完整支持一个回答
-2. insufficient_evidence —— 资料片段涉及了相关话题，但缺少关键信息，不足以完整回答。这时不要猜测、不要脑补，如实返回这个结论
-3. refuse —— 资料片段和用户的问题完全无关，没有任何可用内容
+1. answer —— 本次提供的资料片段【确实支持】回答这个问题。
+   · citations 至少要有 1 项
+   · 【重要】检索到了片段，【不代表】片段真的支持这个问题。
+     如果片段只是表面上沾边、内容其实无关，就不能用它来 answer —— 那种情况应该选 general_answer
+   · 【重要】不能用资料之外的知识来 answer
 
-引用规则（非常严格，务必遵守）：
+2. general_answer —— 这是正常的英语学习问题（语法、词汇、写作、翻译、表达），
+   但本次的资料片段没有提供支持（或者检索到的片段与问题无关）。
+   这时请用你自己的知识来回答。
+   · citations 必须是空数组 []
+   · 【不要】因为「资料里没有」就拒绝回答一个正常的英语问题
+
+3. insufficient_evidence —— 用户问的是【本课程或知识库的事实】，
+   资料里【提到了与这个问题直接相关的服务、机制或相近事实】，
+   但没有说清用户问的【那件具体事】。这时不要猜测、不要脑补。
+   · citations 必须是空数组 []
+   · 【和第 4 条的区别只看一件事：资料里到底提没提到相关的东西】
+     提到了相关的东西，只是没讲到用户问的那个点 → 选本条
+     跟这个问题直接相关的信息，资料里【一个字都没有】 → 选第 4 条 refuse
+   · 例子：用户问「课程有一对一辅导吗？」
+     资料里写了「可以在学习群里提问」和「在下次答疑时集中处理」——
+     这说明课程确实有答疑机制，属于【相关事实】；
+     但资料没说有没有「一对一辅导」，缺的正好是回答这个问题所需的关键信息。
+     所以这属于本条：不能顺着问题回答「有的」，也不该说成「跟资料完全无关」。
+
+4. refuse —— 属于下面任意一种：
+   · 超出英语学习范围（比如问天气、写代码、闲聊）
+   · 危险或不当请求
+   · 询问课程的业务事实，而资料里【完全没有】任何与它相关的信息
+     （价格、优惠、退费、开课时间、证书、教师身份或资历、联系方式等）
+     · 例子：用户问「这个课程多少钱？」，资料里没有任何关于收费、优惠或价格的
+       实际信息 —— 这就是「完全没有」，选本条。
+     · 反过来，只要资料里真的写了与问题直接相关的服务、机制或事实，
+       就不要选本条，回去看第 3 条怎么判断。
+   · 【什么才算「提到」，务必看清楚】
+     「提到」指的是资料里真的写了与问题相关的服务、机制或事实。
+     如果只是恰好出现了同一个词，那【不算】提到 —— 比如一句
+     「本文不包含价格、退费、证书信息」的免责声明，虽然出现了「价格」两个字，
+     但它等于告诉你资料里没有这类信息，仍然选 refuse，不能当成「提到过」。
+   · citations 必须是空数组 []
+   · 【绝对不要】用你自己的知识去编造课程的业务事实 —— 这是最严重的一类错误
+
+【引用规则（非常严格，务必遵守）】
 
 - decision 为 answer 时，citations 至少要有 1 项
-- 每一项 citation 的 source 和 heading，必须与上面资料片段里「来源：」「标题：」后面写的文字完全一致（一个字、一个标点都不能改），只能从提供的资料片段里选
+- 每一项 citation 的 source 和 heading，必须与资料片段里「来源：」「标题：」后面写的文字完全一致（一个字、一个标点都不能改），只能从本次提供的资料片段里选
 - 绝对不许自己编造文件名或标题，也不许引用没有出现在本次资料片段里的内容
 - decision 不是 answer 时，citations 必须是空数组 []
+- general_answer 尤其要注意：它【没有】资料依据，所以【绝对不能】给出任何 citation
 
 输出要求：
 
@@ -138,23 +218,37 @@ def _build_user_prompt(question, chunks):
     占位符，直接抛 KeyError。evaluate.py 里是靠把 { 写成 {{ 才躲过去的，
     写法很丑而且容易改错。所以这里一律用 + 拼接，绝不对含 JSON 的提示词 format()。
     """
-    blocks = []                                    # 每段资料拼成一小块文字
-    for i, c in enumerate(chunks, 1):              # 从 1 开始编号，方便模型引用
-        blocks.append(
-            "[" + str(i) + "]\n"
-            "来源：" + str(c.get("source", "")) + "\n"
-            "标题：" + str(c.get("heading", "")) + "\n"
-            "正文：" + str(c.get("text", "")).strip()
+    if chunks:
+        blocks = []                                # 每段资料拼成一小块文字
+        for i, c in enumerate(chunks, 1):          # 从 1 开始编号，方便模型引用
+            blocks.append(
+                "[" + str(i) + "]\n"
+                "来源：" + str(c.get("source", "")) + "\n"
+                "标题：" + str(c.get("heading", "")) + "\n"
+                "正文：" + str(c.get("text", "")).strip()
+            )
+        material = "\n\n".join(blocks)             # 各段之间空一行
+
+        material_section = (
+            "下面是本次可用的资料片段。\n\n"
+            "======== 资料片段开始 ========\n"
+            + material +
+            "\n======== 资料片段结束 ========\n\n"
+        )
+    else:
+        # 【chunks 为空时也必须把话说明白】
+        # 如果只留一个空白的「资料片段」区域，模型可能以为格式坏了、或者片段被截断了，
+        # 判断会变得不可预测。明确告诉它「这次没有资料」，它才知道该走 general_answer 或 refuse。
+        material_section = (
+            "本次【没有】可用的资料片段。\n"
+            "（所以你不能给出 answer，也不能引用任何来源；\n"
+            " 如果这是正常的英语问题，请用 general_answer；\n"
+            " 如果问的是课程的业务事实，请用 refuse。）\n\n"
         )
 
-    material = "\n\n".join(blocks)                 # 各段之间空一行
-
     return (
-        "下面是本次可用的资料片段。\n\n"
-        "======== 资料片段开始 ========\n"
-        + material +
-        "\n======== 资料片段结束 ========\n\n"
-        "用户的问题：\n" + str(question) + "\n\n"
+        material_section
+        + "用户的问题：\n" + str(question) + "\n\n"
         "请严格按照 system 里的规则判断 decision，并只输出那一个 JSON 对象。"
     )
 
@@ -281,32 +375,38 @@ def generate_answer_with_diagnostics(question, chunks, client, model):
 
     generate_answer 的返回格式（格式固定，永远是这三个键）：
         {
-          "decision": "answer" | "refuse" | "insufficient_evidence",
+          "decision": "answer" | "general_answer" | "insufficient_evidence" | "refuse",
           "answer":   "给用户看的中文回答",
           "citations": [{"source": "文件名", "heading": "二级标题"}]
         }
+
+    【chunks 为空时也会调用模型】
+    以前「检索不到资料」等于直接拒答、不花钱。现在不是了——
+    因为「检索不到」和「这是个正常的英语问题」是两回事：
+    用户问「this 和 that 有什么区别」，知识库里没有，但那是一个完全正当的问题，
+    应该由模型用通用知识回答（general_answer），而不是拒答。
 
     【为什么 client 和 model 要从外面传进来，而不是在这里读环境变量自己建】
     这样这个模块就完全不碰密钥、不依赖网络库，测试时塞一个假的客户端进去
     就能把每条分支都跑一遍。职责单一，也更好测。
     """
 
-    # ---------- 第一道关：根本没有资料，直接拒答，【不调用模型】 ----------
-    # 没有资料却还要问模型，等于逼着它凭记忆回答——那正是我们要避免的事。
-    if not chunks:
-        return ({
-            "decision": DECISION_REFUSE,
-            "answer": REFUSE_TEXT,
-            "citations": [],
-        }, DIAG_NO_CHUNKS)
+    # 【先把 None 归一成空列表】
+    # 以前这里有 `if not chunks: return refuse`，顺带把 None 挡住了；
+    # 那道关去掉之后，`for c in None` 会直接抛 TypeError —— 所以必须显式处理。
+    chunks = chunks or []
 
     # 这一批片段的「白名单」。后面所有引用都要拿它来对照。
+    # 【chunks 为空时这里就是个空集合】—— 那是对的：没有片段，谁也不能引用。
     allowed = set()
     for c in chunks:
         allowed.add((str(c.get("source", "")).strip(),
                      str(c.get("heading", "")).strip()))
 
-    # ---------- 第二道关：调用模型（任何异常都不外泄） ----------
+    # ---------- 第一道关：调用模型（任何异常都不外泄） ----------
+    # 【注意：这里不再有「没资料就拒答」的分支】
+    # 不管有没有检索到片段，都要问一次模型 —— 只有它知道这是个正常的英语问题，
+    # 还是一个超出范围的问题。
     try:
         response = client.chat.completions.create(
             model=model,
@@ -322,7 +422,7 @@ def generate_answer_with_diagnostics(question, chunks, client, model):
         # 诊断标签也是写死的常量，不带任何异常内容。
         return _degrade(DIAG_API_OR_RESPONSE_ERROR)
 
-    # ---------- 第三道关：解析 JSON ----------
+    # ---------- 第二道关：解析 JSON ----------
     try:
         data = _parse_json(raw)
     except Exception:
@@ -331,21 +431,22 @@ def generate_answer_with_diagnostics(question, chunks, client, model):
     if not isinstance(data, dict):
         return _degrade(DIAG_RESPONSE_NOT_OBJECT)
 
-    # ---------- 第四道关：decision 必须是那三个值之一 ----------
+    # ---------- 第三道关：decision 必须是那四个值之一 ----------
     decision = data.get("decision")
     if decision not in VALID_DECISIONS:
         return _degrade(DIAG_INVALID_DECISION)
 
-    # ---------- 第五道关：citations 必须全部来自本次传入的片段 ----------
+    # ---------- 第四道关：citations 必须全部来自本次传入的片段 ----------
     citations = _normalize_citations(data.get("citations", []), allowed)
     if citations is None:
         # 这一步同时也是「编造来源」的拦截点：引用了没给它的文件名或标题。
         return _degrade(DIAG_INVALID_CITATIONS)
 
-    # ---------- 第六道关：分情况裁决 ----------
-    if decision == DECISION_ANSWER:
-        text = data.get("answer")
+    # ---------- 第五道关：分情况裁决 ----------
+    text = data.get("answer")
 
+    # ===== 情况一：answer —— 有资料依据 =====
+    if decision == DECISION_ANSWER:
         # 回答内容不能是空的——说好要回答，却没给内容，属于格式不合格
         if not isinstance(text, str) or not text.strip():
             return _degrade(DIAG_EMPTY_ANSWER)
@@ -361,7 +462,24 @@ def generate_answer_with_diagnostics(question, chunks, client, model):
             "citations": citations,
         }, DIAG_OK)
 
-    # 走到这里只剩 refuse 和 insufficient_evidence 两种。
+    # ===== 情况二：general_answer —— 有回答，但没有资料依据 =====
+    if decision == DECISION_GENERAL_ANSWER:
+        # 正文同样不能是空的
+        if not isinstance(text, str) or not text.strip():
+            return _degrade(DIAG_EMPTY_ANSWER)
+
+        # 【它必须没有引用】general_answer 的定义就是「资料没支持」。
+        # 带着引用的话，用户会以为这段话有资料依据 —— 那是伪造出处，比不回答更危险。
+        if citations:
+            return _degrade(DIAG_CITATIONS_ON_GENERAL_ANSWER)
+
+        return ({
+            "decision": DECISION_GENERAL_ANSWER,
+            "answer": text.strip(),
+            "citations": [],
+        }, DIAG_OK)
+
+    # ===== 情况三、四：insufficient_evidence / refuse —— 都没有给出回答 =====
     # 【它们必须没有引用】没给答案却给了出处，本身自相矛盾；
     # 更麻烦的是，这种「无效却看着有据」的输出最容易骗到用户。
     if citations:

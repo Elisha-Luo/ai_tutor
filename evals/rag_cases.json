@@ -218,18 +218,18 @@
   {
     "id": "trap-subjunctive-mood",
     "question": "虚拟语气怎么用？",
-    "expected_behavior": "refuse",
+    "expected_behavior": "general_answer",
     "expected_sources": [],
-    "reason": "陷阱题。grammar_present_perfect.md 属于「英语语法」类内容，检索时会与「语气/时态」类问题高度匹配，但该文件从头到尾只讲现在完成时，完全没有提到虚拟语气。正确行为是拒答，不能把时态的规则套用过来。",
-    "category": "trap_refuse"
+    "reason": "【本轮重新标注：refuse → general_answer】这仍然是个陷阱——grammar_present_perfect.md 属于语法类内容，检索会与「语气/时态」类问题高度匹配，但该文件只讲现在完成时，没提过虚拟语气。但正确的行为【不是拒答】：虚拟语气是一个完全正当的英语语法问题，应该用模型的通用知识回答（general_answer），并且【绝不能】引用那段无关的语法资料。",
+    "category": "trap_general"
   },
   {
     "id": "trap-listening-practice",
     "question": "怎么练英语听力？有没有推荐的方法？",
-    "expected_behavior": "refuse",
+    "expected_behavior": "general_answer",
     "expected_sources": [],
-    "reason": "陷阱题。vocabulary_study_method.md 讲的是「英语学习方法」，与「怎么练听力」在语义上很接近，检索容易命中，但该文件只讲词汇的学法，没有任何听力训练内容。",
-    "category": "trap_refuse"
+    "reason": "【本轮重新标注：refuse → general_answer】vocabulary_study_method.md 讲的是「英语学习方法」，与「怎么练听力」语义接近、检索容易命中，但该文件只讲词汇学法，没有听力训练内容。然而「怎么练听力」是一个正当的英语学习问题，应该用通用知识回答，【不能】引用那份无关的词汇资料。",
+    "category": "trap_general"
   },
   {
     "id": "trap-one-on-one-tutoring",
@@ -242,25 +242,57 @@
   {
     "id": "trap-present-perfect-continuous",
     "question": "现在完成进行时和现在完成时有什么区别？",
-    "expected_behavior": "insufficient_evidence",
+    "expected_behavior": "general_answer",
     "expected_sources": [],
-    "reason": "【重新标注：refuse → insufficient_evidence】这是最容易翻车的一道。问法与 grammar_present_perfect.md 的主题几乎重合，检索命中率极高。资料完整讲了比较的【一方】（现在完成时），但整篇没有出现过「现在完成进行时」——比较需要两边，缺的正是另一方。资料支持了问题的一半，属于「证据不足」，不能把时态规则套用过来硬答。",
-    "category": "trap_insufficient"
+    "reason": "【本轮重新标注：insufficient_evidence → general_answer】这是最容易翻车的一道。问法与 grammar_present_perfect.md 的主题几乎重合，检索命中率极高。资料讲了比较的【一方】，但整篇没有「现在完成进行时」。不过——这是一个完全正常的英语语法问题，应该用通用知识把两者的区别讲清楚（general_answer），而不是说「证据不足」。唯一的红线是：【不能】引用那段只讲了半边的资料，也不能编造它的内容。",
+    "category": "trap_general"
   },
   {
     "id": "trap-relative-clause",
     "question": "定语从句怎么用？",
-    "expected_behavior": "refuse",
+    "expected_behavior": "general_answer",
     "expected_sources": [],
-    "reason": "陷阱题。grammar_present_perfect.md 属于语法类内容，与「从句怎么用」这类问题语义相近、检索容易命中，但该文件只覆盖现在完成时这一个语法点，没有任何从句相关内容。",
-    "category": "trap_refuse"
+    "reason": "【本轮重新标注：refuse → general_answer】grammar_present_perfect.md 属于语法类内容，与「从句怎么用」语义相近、检索容易命中，但该文件只覆盖现在完成时，没有任何从句内容。正确行为是用通用知识回答这个正当的语法问题，并且【不能】引用那份无关资料。",
+    "category": "trap_general"
   },
   {
     "id": "trap-pronunciation-improvement",
     "question": "我的发音不标准，有什么纠正办法？",
-    "expected_behavior": "insufficient_evidence",
+    "expected_behavior": "general_answer",
     "expected_sources": [],
-    "reason": "【重新标注：refuse → insufficient_evidence】course_faq.md 在回答「零基础能学吗」时明确提到课程包含发音——这证明资料【提到了相关对象】。但它只说明课程从发音开始教，没有给出任何发音纠正方法，缺的正是本题要的答案。属于「提到了，但没讲内容」，是证据不足，不是完全无关。",
-    "category": "trap_insufficient"
+    "reason": "【本轮重新标注：insufficient_evidence → general_answer】course_faq.md 在回答「零基础能学吗」时提到课程包含发音，检索会命中——但它只是说课程从发音开始教，没有任何纠正方法。然而「怎么纠正发音」是一个正当的英语学习问题，应该用通用知识回答，【不能】引用那份课程介绍。",
+    "category": "trap_general"
+  },
+  {
+    "id": "gen-translate",
+    "question": "帮我把这句话翻译成英文：我今天有点累。",
+    "expected_behavior": "general_answer",
+    "expected_sources": [],
+    "reason": "【本轮新增】翻译是明确正当的英语学习需求，三份资料里没有任何翻译内容。正确行为是用通用知识给出翻译（general_answer），并且【不能】引用任何资料。",
+    "category": "general_answer"
+  },
+  {
+    "id": "gen-vocab-pair",
+    "question": "awesome 和 amazing 有什么区别？",
+    "expected_behavior": "general_answer",
+    "expected_sources": [],
+    "reason": "【本轮新增】具体词汇的辨析——vocabulary_study_method.md 讲的是【学习方法】，不是具体单词，所以资料不支持。正确行为是用通用知识解释这两个词的差别（general_answer），不能拿「学习方法」那一段来凑。",
+    "category": "general_answer"
+  },
+  {
+    "id": "gen-grammar-other",
+    "question": "被动语态怎么构成？",
+    "expected_behavior": "general_answer",
+    "expected_sources": [],
+    "reason": "【本轮新增】另一个知识库没覆盖的语法点。grammar_present_perfect.md 只讲现在完成时。正确行为是用通用知识回答（general_answer），且不能引用那份资料。",
+    "category": "general_answer"
+  },
+  {
+    "id": "gen-writing-revision",
+    "question": "请帮我修改这段英文，只修正语法和明显不通顺的地方，保留我的原意：I think online classes is convenient, but sometimes I feel lonely and hard to focus.",
+    "expected_behavior": "general_answer",
+    "expected_sources": [],
+    "reason": "【本轮新增】这是最基本的英语写作修改需求——和访谈里用户 A、C、E 提的一模一样。三份知识库资料讲的是「现在完成时」「词汇学习方法」「课程常见问题」，【没有任何一份】能支持对这句话的具体改写。所以正确行为是用通用知识改写（general_answer），并且【绝不能】引用无关资料来假装有依据。这一条也顺带验证：产品最核心的场景（改作文）在知识库覆盖不到时仍然能工作。",
+    "category": "general_answer"
   }
 ]

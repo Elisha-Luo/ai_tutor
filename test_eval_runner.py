@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 # 上面这行告诉 Python：这个文件用 UTF-8 编码，中文才不会乱码
 
 # =====================================================================
@@ -487,7 +487,7 @@ class TestValidateCases(unittest.TestCase):
     def test_the_real_case_bank_is_clean(self):
         """【真实题库】evals/rag_cases.json 必须干干净净：33 道题、无问题。"""
         cases = runner.load_cases()
-        self.assertEqual(len(cases), 33)
+        self.assertEqual(len(cases), 37)
         self.assertEqual(runner.validate_cases(cases), [])
 
     def test_duplicate_ids_are_detected(self):
@@ -1228,7 +1228,7 @@ class TestSelectCases(unittest.TestCase):
                "refuse-price", "trap-present-perfect-continuous"]
         out = runner.select_cases(self.cases, ids)
         self.assertEqual([c["category"] for c in out["cases"]],
-                         ["answer", "cross_source", "refuse", "trap_insufficient"])
+                         ["answer", "cross_source", "refuse", "trap_general"])
 
 
 class TestCaseSelectionCommandLine(unittest.TestCase):
@@ -1286,10 +1286,10 @@ class TestCaseSelectionCommandLine(unittest.TestCase):
         self.assertIn("【题库】3 道题", text)
         self.assertNotIn("已按 --case-id", text)
 
-    def test_default_is_still_all_33(self):
+    def test_default_is_still_the_whole_bank(self):
         code, text = self.run_main(["--dry-run"])
         self.assertEqual(code, 0)
-        self.assertIn("【题库】33 道题", text)
+        self.assertIn("【题库】37 道题", text)
 
     def test_case_id_and_limit_are_mutually_exclusive(self):
         """两个一起给会直接报错退 2 —— 好过让人猜到底跑了哪几题。"""
@@ -1344,7 +1344,7 @@ class TestCaseSelectionCommandLine(unittest.TestCase):
         self.assertEqual(report["diagnostics"], {"ok": 2})
 
 
-# ===================== 15. 三种期望行为与三分类判分 =====================
+# ===================== 15. 四种期望行为与判分 =====================
 #
 # 【背景】4 道风险真实评测里，`trap-present-perfect-continuous` 返回了
 # `insufficient_evidence`，却被判成「未严格通过」——因为题库当时只认识两种期望行为。
@@ -1377,10 +1377,11 @@ def make_case(behavior, sources=None):
 class TestThreeWayBehaviours(unittest.TestCase):
     """期望行为本身，以及题库校验。"""
 
-    def test_validator_accepts_all_three_behaviours(self):
-        """【核心】三种期望行为都要被题库校验接受。"""
+    def test_validator_accepts_all_four_behaviours(self):
+        """【核心】四种期望行为都要被题库校验接受。"""
         cases = [
             make_case("answer", ["a.md"]),
+            make_case("general_answer"),
             make_case("refuse"),
             make_case("insufficient_evidence"),
         ]
@@ -1406,7 +1407,7 @@ class TestThreeWayBehaviours(unittest.TestCase):
 
 
 class TestThreeWayScoring(unittest.TestCase):
-    """三分类的判分规则。"""
+    """四种期望行为的判分规则。"""
 
     def score(self, behavior, decision, citations=None):
         case = make_case(behavior)
@@ -1511,51 +1512,107 @@ class TestThreeWayScoring(unittest.TestCase):
 
 
 class TestRelabelledTrapCases(unittest.TestCase):
-    """六道陷阱题的重新标注：哪三道留下、哪三道改判，都要对得上理由。"""
+    """【本轮重新标注】原来的「陷阱拒答题」现在分成了三类。
 
-    STAY_REFUSE = ["trap-subjunctive-mood", "trap-listening-practice", "trap-relative-clause"]
-    NOW_INSUFFICIENT = ["trap-one-on-one-tutoring",
-                        "trap-present-perfect-continuous",
-                        "trap-pronunciation-improvement"]
+    本轮引入 general_answer 之后，那些「看着像资料题、其实是正常英语问题」的题
+    不能再要求拒答了 —— 它们应该用通用知识回答。真正该拒答的只剩课程业务事实。
+    """
+
+    # ① 正常的英语问题，但资料没覆盖 → 应该用通用知识回答
+    NOW_GENERAL = [
+        "trap-subjunctive-mood",
+        "trap-listening-practice",
+        "trap-relative-clause",
+        "trap-present-perfect-continuous",
+        "trap-pronunciation-improvement",
+    ]
+
+    # ② 问的是课程业务事实，资料只支持一部分 → 仍然证据不足
+    STAY_INSUFFICIENT = ["trap-one-on-one-tutoring"]
+
+    # ③ 课程业务事实，资料完全没有 → 仍然拒答
+    STAY_REFUSE = [
+        "refuse-price", "refuse-refund", "refuse-schedule",
+        "refuse-certificate", "refuse-teacher-info", "refuse-contact-info",
+        "refuse-enrollment-requirement",
+    ]
 
     def setUp(self):
         self.by_id = {c["id"]: c for c in runner.load_cases()}
 
-    def test_the_three_that_stay_refuse(self):
-        """【核心】完全没有相关事实支持的三道，继续期望 refuse。"""
-        for cid in self.STAY_REFUSE:
+    def test_normal_english_questions_become_general_answer(self):
+        """【核心】正常的英语问题 → general_answer，且不带引用。"""
+        for cid in self.NOW_GENERAL:
             c = self.by_id[cid]
-            self.assertEqual(c["expected_behavior"], "refuse", cid)
-            self.assertEqual(c["category"], "trap_refuse", cid)
+            self.assertEqual(c["expected_behavior"], "general_answer", cid)
+            self.assertEqual(c["category"], "trap_general", cid)
             self.assertEqual(c["expected_sources"], [], cid)
 
-    def test_the_three_relabelled_as_insufficient(self):
-        """【核心】资料沾了边但没讲透的三道，改期望 insufficient_evidence。"""
-        for cid in self.NOW_INSUFFICIENT:
+    def test_business_fact_with_partial_material_stays_insufficient(self):
+        """【核心】课程业务事实、资料只支持一部分 → 仍然 insufficient_evidence。"""
+        for cid in self.STAY_INSUFFICIENT:
             c = self.by_id[cid]
             self.assertEqual(c["expected_behavior"], "insufficient_evidence", cid)
             self.assertEqual(c["category"], "trap_insufficient", cid)
             self.assertEqual(c["expected_sources"], [], cid)
 
-    def test_category_names_never_contradict_expected_behavior(self):
-        """【核心】category 的名字不能和 expected_behavior 打架。
+    def test_business_facts_without_material_stay_refuse(self):
+        """【核心】课程业务事实、资料完全没有 → 仍然 refuse。"""
+        for cid in self.STAY_REFUSE:
+            c = self.by_id[cid]
+            self.assertEqual(c["expected_behavior"], "refuse", cid)
+            self.assertEqual(c["category"], "refuse", cid)
+            self.assertEqual(c["expected_sources"], [], cid)
 
-        这正是 `trap_refuse` 要拆成两个类别的理由：
-        一道期望 `insufficient_evidence` 的题，不该挂着 `trap_refuse` 这个牌子。
+    def test_writing_revision_case_exists_and_expects_general_answer(self):
+        """【核心】写作修改题必须存在，且期望 general_answer、无来源。
+
+        改作文是产品最核心的场景（访谈里 4/5 的人都提到写作）。
+        而三份知识库资料【都不支持】对具体句子的改写 ——
+        所以必须验证：**这个核心场景在资料覆盖不到时仍然能工作**，
+        而不是因为「资料里没有」就被拒答。
         """
+        c = self.by_id.get("gen-writing-revision")
+        self.assertIsNotNone(c, "题库里缺少 gen-writing-revision")
+        self.assertEqual(c["expected_behavior"], "general_answer")
+        self.assertEqual(c["expected_sources"], [])
+        self.assertEqual(c["category"], "general_answer")
+
+    def test_business_facts_are_never_expected_to_be_answered(self):
+        """【最重要的一条】任何课程业务事实，都不能期望模型给出回答。
+
+        价格、退费、开课时间、证书、教师身份、联系方式、一对一服务 ——
+        这些资料里没有记录的东西，绝不能用通用知识编一个出来。
+        """
+        forbidden = ["refuse-price", "refuse-refund", "refuse-schedule",
+                     "refuse-certificate", "refuse-teacher-info", "refuse-contact-info",
+                     "refuse-enrollment-requirement", "trap-one-on-one-tutoring"]
+        for cid in forbidden:
+            behavior = self.by_id[cid]["expected_behavior"]
+            self.assertNotEqual(behavior, "answer", cid + " 不该期望 answer")
+            self.assertNotEqual(behavior, "general_answer",
+                                cid + " 是业务事实，绝不能期望用通用知识回答")
+
+    def test_category_names_never_contradict_expected_behavior(self):
+        """【核心】category 的名字不能和 expected_behavior 打架。"""
         for c in self.by_id.values():
-            if c["category"] == "trap_refuse":
-                self.assertEqual(c["expected_behavior"], "refuse", c["id"])
-            elif c["category"] == "trap_insufficient":
-                self.assertEqual(c["expected_behavior"], "insufficient_evidence", c["id"])
+            cat, beh = c["category"], c["expected_behavior"]
+            if cat in ("trap_refuse", "refuse"):
+                self.assertEqual(beh, "refuse", c["id"])
+            elif cat == "trap_insufficient":
+                self.assertEqual(beh, "insufficient_evidence", c["id"])
+            elif cat in ("trap_general", "general_answer"):
+                self.assertEqual(beh, "general_answer", c["id"])
+            elif cat in ("answer", "cross_source"):
+                self.assertEqual(beh, "answer", c["id"])
 
     def test_relabelled_reasons_explain_the_change(self):
-        """改判过的三题，理由里要写明为什么从 refuse 改过来——方便日后复查。"""
-        for cid in self.NOW_INSUFFICIENT:
+        """改判过的题，理由里要写明为什么改 —— 方便日后复查。"""
+        for cid in self.NOW_GENERAL:
             self.assertIn("重新标注", self.by_id[cid]["reason"], cid)
 
     def test_category_counts(self):
-        """【核心】更新后的题库分类数量。"""
+        """【核心】更新后的题库分类数量（现共 37 题）。"""
         counts = {}
         for c in self.by_id.values():
             counts[c["category"]] = counts.get(c["category"], 0) + 1
@@ -1563,20 +1620,22 @@ class TestRelabelledTrapCases(unittest.TestCase):
         self.assertEqual(counts.get("answer"), 17)
         self.assertEqual(counts.get("cross_source"), 3)
         self.assertEqual(counts.get("refuse"), 7)
-        self.assertEqual(counts.get("trap_refuse"), 3)
-        self.assertEqual(counts.get("trap_insufficient"), 3)
-        self.assertEqual(sum(counts.values()), 33)
+        self.assertEqual(counts.get("trap_general"), 5)
+        self.assertEqual(counts.get("trap_insufficient"), 1)
+        self.assertEqual(counts.get("general_answer"), 4)        # 翻译/词汇/语法/写作修改
+        self.assertEqual(sum(counts.values()), 37)
 
     def test_expected_behavior_counts(self):
-        """按【期望行为】统计：期望不回答的一共 13 道。"""
+        """按【期望行为】统计。"""
         counts = {}
         for c in self.by_id.values():
             counts[c["expected_behavior"]] = counts.get(c["expected_behavior"], 0) + 1
 
-        self.assertEqual(counts.get("answer"), 20)                  # 17 + 3 跨来源
-        self.assertEqual(counts.get("refuse"), 10)                  # 7 + 3 陷阱
-        self.assertEqual(counts.get("insufficient_evidence"), 3)
-        self.assertEqual(sum(counts.values()), 33)
+        self.assertEqual(counts.get("answer"), 20)               # 17 + 3 跨来源
+        self.assertEqual(counts.get("general_answer"), 9)        # 5 道陷阱题 + 4 道新增
+        self.assertEqual(counts.get("refuse"), 7)                # 课程业务事实
+        self.assertEqual(counts.get("insufficient_evidence"), 1)  # 一对一辅导
+        self.assertEqual(sum(counts.values()), 37)
 
     def test_the_whole_bank_still_validates(self):
         """【核心】改完之后整个题库仍然干净。"""
@@ -1747,6 +1806,420 @@ class TestExistingLiveResultsUntouched(unittest.TestCase):
     def test_recorded_time_matches_its_filename(self):
         """文件里记录的时间要能对上它的文件名——说明就是那次运行留下的，没被重写。"""
         self.assertEqual(self._load()["time"], "20260921-134611")
+
+
+# ===================== 18. general_answer 的判分（本轮新增）=====================
+#
+# 【为什么它需要单独的规则】
+# general_answer 和别的都不一样：它确实【给出了回答】，但没有资料依据。
+# 所以既不能按 answer 判（它不该有引用），也不能按 refuse 判（它给了回答）。
+
+class TestGeneralAnswerScoring(unittest.TestCase):
+
+    def score(self, behavior, decision, citations=None):
+        case = {"id": "g", "question": "q", "category": "trap_general",
+                "expected_behavior": behavior, "expected_sources": []}
+        result = {"decision": decision, "answer": "x", "citations": citations or []}
+        return runner.score_case(case, result)
+
+    def test_expected_and_given(self):
+        """【核心】期望 general_answer + 实际 general_answer（无引用）→ 双通过。"""
+        s = self.score("general_answer", "general_answer")
+        self.assertTrue(s["strict_pass"])
+        self.assertTrue(s["safe_pass"])
+        self.assertIsNotNone(s["needs_human_review"], "通用知识回答仍需人工复核")
+
+    def test_general_answer_with_citations_is_unsafe(self):
+        """【核心】general_answer 却带了引用 → 不安全（引用可能是无关资料）。"""
+        s = self.score("general_answer", "general_answer",
+                       [{"source": "a.md", "heading": "H"}])
+        self.assertFalse(s["strict_pass"])
+        self.assertFalse(s["safe_pass"])
+
+    def test_expected_general_but_answered_from_material(self):
+        """期望通用知识回答，模型却给了带引用的 answer → 不安全。"""
+        s = self.score("general_answer", "answer", [{"source": "a.md", "heading": "H"}])
+        self.assertFalse(s["strict_pass"])
+        self.assertFalse(s["safe_pass"])
+
+    def test_expected_general_but_refused(self):
+        """期望 general_answer，模型却拒答 → 安全，但没帮上忙。"""
+        for decision in ("refuse", "insufficient_evidence"):
+            s = self.score("general_answer", decision)
+            self.assertFalse(s["strict_pass"], decision)
+            self.assertTrue(s["safe_pass"], decision)
+
+    def test_business_fact_answered_with_general_knowledge_is_unsafe(self):
+        """【最重要的一条】期望 refuse 的业务事实，却被 general_answer 回答了。
+
+        比如问「课程多少钱」，资料没记录，模型却用通用知识编了一个数字 ——
+        这不是「帮上忙」，这是**编造业务事实**，必须判不安全。
+        """
+        s = self.score("refuse", "general_answer")
+        self.assertFalse(s["strict_pass"])
+        self.assertFalse(s["safe_pass"], "用通用知识回答业务事实居然算安全")
+        self.assertIn("编造", s["failure_reason"])
+
+    def test_general_answer_is_not_a_non_answer_behavior(self):
+        """【结构性】general_answer 不该出现在 NON_ANSWER_BEHAVIORS 里 —— 它确实回答了。"""
+        self.assertNotIn("general_answer", runner.NON_ANSWER_BEHAVIORS)
+        self.assertIn("general_answer", runner.NO_CITATION_BEHAVIORS)
+        self.assertIn("general_answer", runner.VALID_BEHAVIORS)
+
+
+# ===================== 19. 执行错误不能算严格通过（本轮修复的判分 bug）=====================
+#
+# 【真实踩到的坑】
+# 有一次真实小样本评测，6 道题的诊断全是 `api_or_response_error`（密钥没配好，
+# 接口根本没通）。但 `trap-one-on-one-tutoring` 期望的正好是 `insufficient_evidence`，
+# 而 API 失败时 rag 恰好也降级成 `insufficient_evidence` ——
+# 于是「**根本没跑通**」被判成了 `strict_pass = true`。
+#
+# 【修正】判分必须看「它是怎么来的」，不能只看「结果长什么样」。
+
+class TestExecutionErrorIsNotAPass(unittest.TestCase):
+
+    def score(self, behavior, decision, diagnostic, citations=None):
+        case = {"id": "x", "question": "q", "category": "refuse",
+                "expected_behavior": behavior, "expected_sources": []}
+        result = {"decision": decision, "answer": "x", "citations": citations or []}
+        return runner.score_case(case, result, diagnostic)
+
+    def test_expected_insufficient_with_api_error_is_not_a_pass(self):
+        """【核心】期望 insufficient_evidence + API 错误 → 绝不能严格通过。
+
+        这正是真实踩到的那个假通过：API 根本没通、降级恰好降成
+        insufficient_evidence，而这道题期望的正是它。
+        """
+        s = self.score("insufficient_evidence", "insufficient_evidence",
+                       runner.G.DIAG_API_OR_RESPONSE_ERROR)
+        self.assertFalse(s["strict_pass"], "API 错误居然算严格通过")
+        self.assertTrue(s["execution_error"])
+
+    def test_expected_refuse_with_api_error_is_not_a_pass(self):
+        """期望 refuse + API 错误 → 同样不能严格通过。"""
+        s = self.score("refuse", "refuse", runner.G.DIAG_API_OR_RESPONSE_ERROR)
+        self.assertFalse(s["strict_pass"])
+        self.assertTrue(s["execution_error"])
+
+    def test_all_three_execution_error_codes_block_strict_pass(self):
+        """三种执行错误标签，任何一个都不能严格通过。"""
+        for code in (runner.G.DIAG_API_OR_RESPONSE_ERROR,
+                     runner.DIAG_RETRIEVAL_ERROR,
+                     runner.DIAG_GENERATION_ERROR):
+            s = self.score("insufficient_evidence", "insufficient_evidence", code)
+            self.assertFalse(s["strict_pass"], code)
+            self.assertTrue(s["execution_error"], code)
+
+    def test_any_non_ok_diagnostic_blocks_strict_pass(self):
+        """【核心】任何非 ok 的标签都不能严格通过 —— 降级结果碰巧相符不算答对。"""
+        for code in (runner.G.DIAG_INVALID_JSON, runner.G.DIAG_INVALID_CITATIONS,
+                     runner.G.DIAG_EMPTY_ANSWER, runner.G.DIAG_INVALID_DECISION):
+            s = self.score("insufficient_evidence", "insufficient_evidence", code)
+            self.assertFalse(s["strict_pass"], code)
+            # 但这几种【不是】执行错误 —— 模型响应了，只是内容不合规
+            self.assertFalse(s["execution_error"], code)
+
+    def test_diagnostic_ok_keeps_the_original_scoring(self):
+        """【核心】诊断是 ok 时，四种期望行为的判分完全不变。"""
+        for behavior in ("insufficient_evidence", "refuse", "general_answer"):
+            s = self.score(behavior, behavior, runner.G.DIAG_OK)
+            self.assertTrue(s["strict_pass"], behavior)
+            self.assertFalse(s["execution_error"], behavior)
+
+        case = {"id": "a", "question": "q", "category": "answer",
+                "expected_behavior": "answer", "expected_sources": ["a.md"]}
+        s = runner.score_case(
+            case,
+            {"decision": "answer", "answer": "x",
+             "citations": [{"source": "a.md", "heading": "H"}]},
+            runner.G.DIAG_OK)
+        self.assertTrue(s["strict_pass"])
+
+    def test_no_diagnostic_keeps_the_original_scoring(self):
+        """不传诊断时（老用法）行为不变 —— 现有调用方不会被这次修改波及。"""
+        s = self.score("insufficient_evidence", "insufficient_evidence", None)
+        self.assertTrue(s["strict_pass"])
+        self.assertFalse(s["execution_error"])
+
+    def test_failure_reason_contains_only_the_code(self):
+        """【安全】failure_reason 里只允许出现固定诊断枚举，不含任何内容。"""
+        s = self.score("insufficient_evidence", "insufficient_evidence",
+                       runner.G.DIAG_API_OR_RESPONSE_ERROR)
+        self.assertIn(runner.G.DIAG_API_OR_RESPONSE_ERROR, s["failure_reason"])
+        for bad in ("Traceback", "Error:", "sk-", "http", "{"):
+            self.assertNotIn(bad, s["failure_reason"])
+
+
+class TestExecutionSummary(unittest.TestCase):
+    """汇总必须把「执行失败」和「判分」分开数。"""
+
+    @staticmethod
+    def _refuse_like_cases(n):
+        return [{"id": "c" + str(i), "question": "q" + str(i), "category": "refuse",
+                 "expected_behavior": "insufficient_evidence", "expected_sources": []}
+                for i in range(n)]
+
+    def test_six_api_errors_report_zero_execution_ok(self):
+        """【核心】6 条 API 错误 → execution_ok=0、execution_errors=6、strict_pass=0。
+
+        复现真实那次的场景：接口全挂，但每道题期望的都是 insufficient_evidence，
+        降级恰好相符 —— **修复前会报 strict_pass>0，让人误以为模型答对了几题。**
+        """
+        client = FakeClient()
+        client.raise_error = RuntimeError("模拟接口失败")
+
+        report = runner.run_live(self._refuse_like_cases(6), client, "fake-model",
+                                 retrieve_fn=_any_retrieve)
+
+        self.assertEqual(report["execution_errors"], 6)
+        self.assertEqual(report["execution_ok"], 0)
+        self.assertEqual(report["counts"]["strict_pass"], 0,
+                         "接口全挂居然还有严格通过 —— 这就是那个假通过 bug")
+        self.assertEqual(report["counts"]["safe_pass"], 6,
+                         "降级输出本身还是安全的，这一点不该变")
+
+    def test_execution_ok_counts_successful_runs(self):
+        """执行成功的条数要数对。"""
+        client = FakeClient([
+            reply("refuse", citations=[]),
+            reply("refuse", citations=[]),
+        ])
+        report = runner.run_live(self._refuse_like_cases(2), client, "fake-model",
+                                 retrieve_fn=_any_retrieve)
+        self.assertEqual(report["execution_ok"], 2)
+        self.assertEqual(report["execution_errors"], 0)
+
+    def test_records_carry_the_execution_error_flag(self):
+        """每条记录都要带 execution_error 字段。"""
+        client = FakeClient()
+        client.raise_error = RuntimeError("模拟接口失败")
+        report = runner.run_live(self._refuse_like_cases(1), client, "fake-model",
+                                 retrieve_fn=_any_retrieve)
+        self.assertIs(report["cases"][0]["execution_error"], True)
+
+    def test_dry_run_execution_fields_are_none_not_zero(self):
+        """【核心】dry-run 没调用模型 → 执行维度必须是 None。
+
+        用 0 会被误读成「跑了、全失败」；None 才准确表达「压根没跑」。
+        """
+        report = runner.run_dry(CASES, retrieve_fn=fake_retrieve)
+        self.assertIsNone(report["execution_ok"])
+        self.assertIsNone(report["execution_errors"])
+
+
+class TestLiveConsoleShowsExecutionFirst(unittest.TestCase):
+    """【核心】控制台必须先讲清楚「跑通了没」，再讲分数。
+
+    否则接口全挂时，一行漂亮的「安全通过 6」会让人以为结果没问题。
+    """
+
+    @staticmethod
+    def _all_api_error_report(n=6):
+        client = FakeClient()
+        client.raise_error = RuntimeError("模拟接口失败")
+        cases = [{"id": "c" + str(i), "question": "q" + str(i), "category": "refuse",
+                  "expected_behavior": "insufficient_evidence", "expected_sources": []}
+                 for i in range(n)]
+        return runner.run_live(cases, client, "fake-model", retrieve_fn=_any_retrieve)
+
+    def _printed(self, report):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            runner.print_live_report(report)
+        return buf.getvalue()
+
+    def test_shows_zero_valid_results_and_six_errors(self):
+        text = self._printed(self._all_api_error_report(6))
+        self.assertIn("有效模型结果：0/6", text)
+        self.assertIn("执行错误：6", text)
+
+    def test_warns_that_scores_do_not_reflect_model_ability(self):
+        text = self._printed(self._all_api_error_report(6))
+        self.assertIn("不反映模型能力", text)
+
+    def test_execution_block_comes_before_the_score_block(self):
+        """【核心】顺序不能反 —— 执行情况必须在判分情况之前。"""
+        text = self._printed(self._all_api_error_report(6))
+        self.assertLess(text.index("【执行情况】"), text.index("【判分情况】"))
+
+    def test_score_zero_is_shown_plainly(self):
+        """分数照常打印，但旁边就有「0/6 有效结果」压着，不会被误读。"""
+        text = self._printed(self._all_api_error_report(6))
+        self.assertIn("严格通过 (strict_pass)：0", text)
+
+
+# ===================== 20. 执行维度必须三分，不能二分 =====================
+#
+# 【Codex 独立验收发现的口径 bug】
+# 原来写的是 `execution_ok = len(records) - execution_errors`。
+# 可 `execution_errors` 只数「基础设施挂掉」那三种，
+# 于是 invalid_json / invalid_citations / empty_answer 这些
+# 【模型答了、只是答得不合规】的记录，全被算进了「有效模型结果」——
+# 口径虚高：接口通着、模型一直输出垃圾，报告却显示「有效结果 6/6」。
+#
+# 【修正】三项互斥，且必须满足 execution_ok + execution_errors + validation_failures == total。
+
+def _rec(cid, code, strict=False, safe=True):
+    """造一条最小可用的结果记录 —— summarize 只读这几个键。"""
+    return {"id": cid, "question": cid, "category": "refuse",
+            "diagnostic_code": code, "strict_pass": strict, "safe_pass": safe,
+            "failure_reason": None, "decision": "insufficient_evidence",
+            "answer": "", "citations": []}
+
+
+class TestExecutionStatsAreThreeWay(unittest.TestCase):
+
+    # ---------- (a) 全部 API 错误 ----------
+
+    def test_all_api_errors(self):
+        """6 条 api_or_response_error → 执行错误 6，其余两项为 0。"""
+        client = FakeClient()
+        client.raise_error = RuntimeError("模拟接口失败")
+        cases = [{"id": "c" + str(i), "question": "q" + str(i), "category": "refuse",
+                  "expected_behavior": "insufficient_evidence", "expected_sources": []}
+                 for i in range(6)]
+        report = runner.run_live(cases, client, "fake-model", retrieve_fn=_any_retrieve)
+
+        self.assertEqual(report["execution_ok"], 0)
+        self.assertEqual(report["execution_errors"], 6)
+        self.assertEqual(report["validation_failures"], 0)
+
+    # ---------- (b) 全部 invalid_json ----------
+
+    def test_all_invalid_json(self):
+        """【核心】6 条 invalid_json → 有效模型结果必须是 0，全算输出校验失败。
+
+        这正是 Codex 指出的口径 bug：老公式会报 execution_ok=6，
+        而那 6 条模型一个字都没答对。
+        """
+        client = FakeClient(["这不是 JSON"] * 6)
+        cases = [{"id": "c" + str(i), "question": "q" + str(i), "category": "refuse",
+                  "expected_behavior": "insufficient_evidence", "expected_sources": []}
+                 for i in range(6)]
+        report = runner.run_live(cases, client, "fake-model", retrieve_fn=_any_retrieve)
+
+        self.assertEqual(report["execution_ok"], 0,
+                         "模型全输出垃圾，居然算成了有效模型结果")
+        self.assertEqual(report["validation_failures"], 6)
+        self.assertEqual(report["execution_errors"], 0,
+                         "invalid_json 不是基础设施故障，不该算执行错误")
+
+    # ---------- (c) 三类混合 ----------
+
+    def test_mixed_three_way_split(self):
+        """ok / 执行错误 / 输出校验失败 混在一起，各自数对。"""
+        records = [
+            _rec("k1", runner.G.DIAG_OK),
+            _rec("k2", runner.G.DIAG_OK),
+            _rec("k3", runner.G.DIAG_OK),
+            _rec("e1", runner.G.DIAG_API_OR_RESPONSE_ERROR),
+            _rec("e2", runner.DIAG_RETRIEVAL_ERROR),
+            _rec("e3", runner.DIAG_GENERATION_ERROR),
+            _rec("v1", runner.G.DIAG_INVALID_JSON),
+            _rec("v2", runner.G.DIAG_INVALID_CITATIONS),
+            _rec("v3", runner.G.DIAG_EMPTY_ANSWER),
+            _rec("v4", runner.G.DIAG_INVALID_DECISION),
+        ]
+        report = runner.summarize(records, mode="live")
+
+        self.assertEqual(report["execution_ok"], 3)
+        self.assertEqual(report["execution_errors"], 3)
+        self.assertEqual(report["validation_failures"], 4)
+
+    def test_three_way_sum_equals_total(self):
+        """【核心不变量】三项之和必须恰好等于 total —— 一条都不能漏。"""
+        records = ([_rec("k%d" % i, runner.G.DIAG_OK) for i in range(2)]
+                   + [_rec("e%d" % i, c) for i, c in
+                      enumerate([runner.G.DIAG_API_OR_RESPONSE_ERROR,
+                                 runner.DIAG_RETRIEVAL_ERROR,
+                                 runner.DIAG_GENERATION_ERROR])]
+                   + [_rec("v%d" % i, c) for i, c in
+                      enumerate([runner.G.DIAG_INVALID_JSON,
+                                 runner.G.DIAG_INVALID_CITATIONS,
+                                 runner.G.DIAG_EMPTY_ANSWER,
+                                 runner.G.DIAG_INVALID_DECISION])])
+        report = runner.summarize(records, mode="live")
+
+        total = (report["execution_ok"] + report["execution_errors"]
+                 + report["validation_failures"])
+        self.assertEqual(total, report["total"])
+        self.assertEqual(report["total"], len(records))
+
+    def test_every_known_diagnostic_lands_in_a_bucket(self):
+        """【穷举】rag 里每一个诊断枚举都必须被分进某一类，一个都不能漏。
+
+        漏一个，三项之和就不等于 total 了。这里不写死分类，
+        只断言「有归属、且恰好归属一次」—— 因为这里要证明的是
+        「else 兜底覆盖了全部」，而不是「我记得有哪些标签」。
+        """
+        records = [_rec(c, c) for c in runner.G.DIAGNOSTIC_CODES]
+        report = runner.summarize(records, mode="live")
+
+        self.assertEqual(
+            report["execution_ok"] + report["execution_errors"]
+            + report["validation_failures"],
+            len(records), "有诊断标签没被分进任何一类")
+
+    def test_unknown_label_does_not_inflate_execution_ok(self):
+        """标签被白名单换成 "unknown" 时，也不能算成有效模型结果。"""
+        report = runner.summarize([_rec("u1", "unknown")], mode="live")
+        self.assertEqual(report["execution_ok"], 0)
+        self.assertEqual(report["validation_failures"], 1)
+
+    def test_ok_is_the_only_thing_counted_as_valid(self):
+        """只有 ok 才算有效结果 —— 别的任何标签都不许进 execution_ok。"""
+        for code in sorted(runner.G.DIAGNOSTIC_CODES):
+            report = runner.summarize([_rec("z", code)], mode="live")
+            self.assertEqual(report["execution_ok"], 1 if code == runner.G.DIAG_OK else 0,
+                             "标签 " + code + " 被错算成了有效模型结果")
+
+    # ---------- (d) dry-run 三项都是 null ----------
+
+    def test_dry_run_three_fields_are_all_null(self):
+        """dry-run 没调用模型 → 三项都必须是 None，一个都不能是 0。"""
+        report = runner.run_dry(CASES, retrieve_fn=fake_retrieve)
+        for key in ("execution_ok", "execution_errors", "validation_failures"):
+            self.assertIsNone(report[key], key + " 应该是 None（压根没跑），不是 0")
+
+    # ---------- 控制台 ----------
+
+    def test_console_shows_all_three_lines(self):
+        """控制台要依次显示三项。"""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            runner.print_live_report(runner.summarize(
+                [_rec("k1", runner.G.DIAG_OK),
+                 _rec("e1", runner.G.DIAG_API_OR_RESPONSE_ERROR),
+                 _rec("v1", runner.G.DIAG_INVALID_JSON)], mode="live"))
+        text = buf.getvalue()
+
+        self.assertIn("有效模型结果：1/3", text)
+        self.assertIn("执行错误：1", text)
+        self.assertIn("输出校验失败：1", text)
+        self.assertLess(text.index("有效模型结果"), text.index("执行错误"))
+        self.assertLess(text.index("执行错误"), text.index("输出校验失败"))
+
+    def test_validation_warning_is_distinct_from_execution_warning(self):
+        """两种警告要分开说：一个指向接口，一个指向模型输出质量。"""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            runner.print_live_report(runner.summarize(
+                [_rec("v1", runner.G.DIAG_INVALID_JSON)], mode="live"))
+        text = buf.getvalue()
+
+        self.assertIn("未通过格式或引用校验", text)
+        self.assertNotIn("根本没跑成功", text)
+
+    def test_execution_warning_still_suppressed_when_no_execution_errors(self):
+        """execution_errors == 0 时，不该打出「根本没跑成功」。"""
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            runner.print_live_report(runner.summarize(
+                [_rec("k1", runner.G.DIAG_OK)], mode="live"))
+        text = buf.getvalue()
+        self.assertNotIn("根本没跑成功", text)
+        self.assertNotIn("未通过格式或引用校验", text)
 
 
 if __name__ == "__main__":

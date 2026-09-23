@@ -10,7 +10,7 @@ import threading                                    # 用它的「锁」防止�
 from datetime import datetime, timedelta, timezone  # datetime 记录消息时间；timedelta 设置 cookie 有效期；timezone 算 UTC 日期
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify   # session 给每个浏览器发身份标记；jsonify 拼 JSON 响应
 from openai import OpenAI                           # 从 openai 库里导入 OpenAI 类（DeepSeek 兼容它的接口）
-from env_utils import load_dotenv                   # 共用同一份 .env 读取逻辑（实现和「为什么」都在 env_utils.py）
+from env_utils import load_dotenv, is_example_api_key, EXAMPLE_KEY_MESSAGE   # 共用 .env 读取；示例密钥检测也在那边
 import retriever                                     # 本地检索层：把问题变成「最相关的几段资料」
 import rag                                           # 生成与引用层：让模型照着资料回答，并校验它引用的来源
 
@@ -40,6 +40,13 @@ if not API_KEY:                                     # 如果没读到密钥
         "没有找到 DeepSeek 密钥。请先设置环境变量 DEEPSEEK_API_KEY，"
         "方法见 README.md 的「配置密钥」一节。"
     )
+
+# 【示例值要拦住】.env.example 是公开的模板文件，里面的示例值不可能管用。
+# 常见事故：复制成 .env 之后忘了改 —— 应用照常启动、照常发请求，只是每次都失败。
+# 与其跑完一整轮才发现，不如启动就明确报错。
+# 【只提示固定文字，绝不打印密钥的任何部分】
+if is_example_api_key(API_KEY):
+    raise RuntimeError(EXAMPLE_KEY_MESSAGE)
 
 # Flask 用这个密钥给浏览器 cookie 做签名，防止别人伪造 cookie 冒充成别的会话。
 # 它必须是一串够长、够随机的字符，而且每个人都不一样——所以绝不能在代码里写死一个默认值。
@@ -358,6 +365,12 @@ def reserve_api_call(limit, day=None):
 
 # ===================== 把 RAG 结果变成「能显示的一段文字」 =====================
 
+# 【general_answer 的标识文字】
+# 用户必须一眼看出「这段回答不是从项目资料里来的」。
+# 放在正文【前面】而不是后面 —— 免得用户读完了才发现它没有依据。
+GENERAL_ANSWER_MARKER = "AI 通用知识回答"
+
+
 def format_answer_with_sources(result):
     """把 rag.generate_answer() 的返回值，格式化成最终要显示、并存入数据库的文字。
 
@@ -366,20 +379,33 @@ def format_answer_with_sources(result):
     断言输出的文字对不对——不用起 Flask、不用连数据库、不用碰模型。
     这段格式化的逻辑是网页和"引用长什么样"之间的唯一约定，值得单独钉住。
 
-    【为什么只有 answer 才加「资料来源」】
-    refuse 和 insufficient_evidence 本来就没有给出回答，更没有出处可给。
-    给它们硬加一个来源列表，等于伪造依据——那正是整个 RAG 要防的事。
-    所以这里先看 decision，不是 answer 就直接返回原话。
+    【三种情况的显示规则】
+
+    | decision | 显示什么 |
+    | --- | --- |
+    | `answer` | 正文 + 「资料来源」 |
+    | `general_answer` | **「AI 通用知识回答」标识 + 正文**（【绝不】加资料来源） |
+    | `insufficient_evidence` / `refuse` | 只显示固定话术，**没有任何来源区** |
+
+    【为什么 general_answer 必须单独标出来】
+    它的依据是模型的通用知识，不是项目资料。
+    不标的话，用户会以为它和 answer 一样有资料支撑 —— 那是误导。
+    但反过来也【绝不能】给它加「资料来源」——那等于伪造依据，比不标更糟。
 
     【为什么用纯文本而不是 HTML】
     存进数据库的是文字，不是标签。模板那边会统一把 AI 的回复按 Markdown 渲染，
     这里只要给出清楚的分行结构就够了，不必也不该自己拼 HTML。
     """
     answer = (result.get("answer") or "").strip()      # 回答正文；缺了就当成空字符串，不让它变成 None
+    decision = result.get("decision")
     citations = result.get("citations") or []
 
-    # 【第一道判断】不是真的回答了，就没有「资料来源」这回事
-    if result.get("decision") != "answer" or not citations:
+    # 【情况一】general_answer：有回答，但没有资料依据 —— 必须标出来
+    if decision == "general_answer":
+        return "【" + GENERAL_ANSWER_MARKER + "】\n\n" + answer
+
+    # 【情况二】不是真的回答了，就没有「资料来源」这回事
+    if decision != "answer" or not citations:
         return answer
 
     entries = []                                       # 一行一条来源
@@ -517,7 +543,8 @@ def index():                                          # 用户每次打开页面
                 # 检索这一步自己炸了，属于程序缺陷，和「资料里确实没有」完全是两回事：
                 #   · 检索出错 → 我们并不知道资料里到底有没有答案，写一句「资料里没有」就是撒谎，
                 #                所以这里【不写数据库】，只给一句固定的抱歉提示；
-                #   · 检索正常但没找到 → 那是正常结果，交给 rag 拒答，并如实记进历史。
+                #   · 检索正常但没找到 → 那是正常结果，交给 rag 判断
+                #                （可能是 general_answer，也可能是 refuse），并如实记进历史。
                 try:
                     chunks = retriever.retrieve(question, top_k=RETRIEVE_TOP_K)
                 except Exception as exc:
@@ -525,23 +552,26 @@ def index():                                          # 用户每次打开页面
                     return _render(sid, question=question, error=SAFE_ERROR_MESSAGE)
 
                 # ---------- 第二步：占一次额度 ----------
-                # 【为什么放在这个位置，而不是一进来就占】
-                # 前面那几条路（空问题、太长、没检索到资料）都不该花钱，自然也不该占额度。
-                # 只有确定【马上要调用模型】了，才占这一次。
-                # 换句话说：额度记的是「真的要发出去的请求」，不是「用户点了发送」。
-                if chunks:
-                    allowed, used = reserve_api_call(DAILY_API_LIMIT)
-                    if not allowed:
-                        # 【额度用完】是正常业务情况，不是程序故障。
-                        # 不调用模型、不写库，只给一句固定提示，也不记问题正文。
-                        log_event("quota_rejected", limit=DAILY_API_LIMIT, used=used)
-                        return _render(sid, question=question, error=QUOTA_MESSAGE)
+                # 【为什么现在是无条件占】
+                # 以前是「没检索到资料就不调模型、不占额度」。
+                # 现在不行了 —— 检索为空也可能要调模型（去判断这是不是一个正常的英语问题），
+                # 所以【只要走到这一步，就一定会调用模型】，必须先占额度。
+                #
+                # 【哪些情况仍然不占】空输入、超长问题、检索异常 ——
+                # 它们在更早的地方就返回了，根本走不到这里，自然不占。
+                allowed, used = reserve_api_call(DAILY_API_LIMIT)
+                if not allowed:
+                    # 【额度用完】是正常业务情况，不是程序故障。
+                    # 不调用模型、不写库，只给一句固定提示，也不记问题正文。
+                    log_event("quota_rejected", limit=DAILY_API_LIMIT, used=used)
+                    return _render(sid, question=question, error=QUOTA_MESSAGE)
 
                 # ---------- 第三步：交给 RAG 生成，并校验它引用的来源 ----------
                 # rag.generate_answer 内部已经兜住了模型的所有异常和不合规输出：
                 # 坏 JSON、编造来源、空引用、接口报错……它一律安全降级成「不回答」。
+                # 它现在还能处理「资料没支持、但属于正常英语问题」的情况（general_answer）。
                 #
-                # 【额度什么时候算掉】只要走进了这一步（也就是 chunks 非空），就已经占过一次了。
+                # 【额度什么时候算掉】只要走进了这一步，就已经占过一次了。
                 # 哪怕模型调用失败、哪怕 rag 内部降级，这一次【照样计入】——
                 # 因为它已经真实地发出去过一次外部请求，风险已经产生了。
                 result = rag.generate_answer(question, chunks, client, MODEL)

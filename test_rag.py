@@ -103,28 +103,63 @@ class RagTestCase(unittest.TestCase):
 
 # ===================== 1. 没有检索结果时不调用模型 =====================
 
-class TestNoChunks(RagTestCase):
+class TestEmptyChunks(RagTestCase):
+    """【本轮最关键的行为变化】chunks 为空时【也要】调用模型。
 
-    def test_empty_chunks_returns_refuse(self):
-        """chunks 为空 → 拒答。"""
-        r = self.ask(chunks=[])
-        self.assertEqual(r["decision"], "refuse")
+    以前「没检索到资料」等于直接拒答、不花钱。现在不行了 ——
+    因为「检索不到」和「这是个正常的英语问题」完全是两回事：
+    用户问「this 和 that 有什么区别」，知识库里没有，但那是个完全正当的问题，
+    应该用通用知识回答（general_answer），而不是被拒答。
 
-    def test_empty_chunks_does_not_call_model(self):
-        """【核心】chunks 为空时，绝不能调用模型——没有资料就没什么可问的。"""
+    【这个类的旧名字叫 TestNoChunks，里面的测试断言「不调用模型」——
+      那些断言本轮已经全部作废，所以整个类重写了。】
+    """
+
+    def test_empty_chunks_still_calls_the_model(self):
+        """【核心】chunks 为空时，仍然要调用模型。"""
+        self.fake.reply = json.dumps(
+            {"decision": "general_answer", "answer": "通用回答", "citations": []},
+            ensure_ascii=False)
         self.ask(chunks=[])
-        self.assertEqual(len(self.fake.calls), 0, "没有资料却调用了模型")
+        self.assertEqual(len(self.fake.calls), 1, "chunks 为空时居然没调用模型")
 
-    def test_none_chunks_returns_refuse(self):
-        """chunks 传 None 也不能崩，同样拒答。"""
-        r = rag.generate_answer("随便问", None, self.fake, MODEL)
-        self.assertEqual(r["decision"], "refuse")
-        self.assertEqual(len(self.fake.calls), 0)
-
-    def test_empty_chunks_result_has_no_citations(self):
-        """拒答结果里不能有引用。"""
-        r = self.ask(chunks=[])
+    def test_empty_chunks_can_return_general_answer(self):
+        """【核心】chunks 为空时，可以返回 general_answer。"""
+        r = self.ask(chunks=[], reply={"decision": "general_answer",
+                                       "answer": "这是通用知识回答", "citations": []})
+        self.assertEqual(r["decision"], "general_answer")
+        self.assertIn("通用知识回答", r["answer"])
         self.assertEqual(r["citations"], [])
+
+    def test_empty_chunks_can_still_return_refuse(self):
+        """chunks 为空时也可以返回 refuse（比如问题超出英语学习范围）。"""
+        r = self.ask(chunks=[], reply={"decision": "refuse", "answer": "x", "citations": []})
+        self.assertEqual(r["decision"], "refuse")
+
+    def test_none_chunks_does_not_crash(self):
+        """chunks 传 None 也不能崩 —— 按空处理，照样调用模型。"""
+        self.fake.reply = json.dumps(
+            {"decision": "general_answer", "answer": "通用回答", "citations": []},
+            ensure_ascii=False)
+        r = rag.generate_answer("随便问", None, self.fake, MODEL)
+        self.assertEqual(r["decision"], "general_answer")
+        self.assertEqual(len(self.fake.calls), 1)
+
+    def test_empty_chunks_cannot_produce_answer(self):
+        """【核心】chunks 为空时不能返回 answer。
+
+        没有片段可引用，任何引用都必然不在白名单里 —— 会被安全降级。
+        这条保证「answer 一定有真实出处」这个承诺不会因为空检索而破掉。
+        """
+        r = self.ask(chunks=[], reply={
+            "decision": "answer", "answer": "x",
+            "citations": [{"source": "编的.md", "heading": "编的"}]})
+        self.assertEqual(r["decision"], "insufficient_evidence")
+
+    def test_empty_chunks_without_citations_is_refused(self):
+        """chunks 为空时，模型说 answer 却给不出引用 —— 同样降级。"""
+        r = self.ask(chunks=[], reply={"decision": "answer", "answer": "x", "citations": []})
+        self.assertEqual(r["decision"], "insufficient_evidence")
 
 
 # ===================== 2. 正常回答与合法引用 =====================
@@ -284,11 +319,70 @@ class TestRefuseAndInsufficient(RagTestCase):
         self.assertEqual(r["citations"], [])
 
     def test_unknown_decision_is_rejected(self):
-        """decision 是三个合法值之外的任意东西 → 拒绝。"""
+        """decision 是四个合法值之外的任意东西 → 拒绝。"""
         for bad in ["maybe", "ANSWER", "", None, 1, "answer "]:
             r = self.ask(reply={"decision": bad, "answer": "x", "citations": []})
             self.assertEqual(r["decision"], "insufficient_evidence",
                              "decision=" + repr(bad) + " 居然被放过了")
+
+
+# ===================== 5b. 提示词里 refuse / 证据不足 的边界 =====================
+#
+# 【为什么单开一组只测「提示词文字」】
+# trap-one-on-one-tutoring 翻车不是代码 bug，而是「话没说清楚」：
+# 资料讲了答疑机制、没讲一对一辅导，模型在 refuse 和 insufficient_evidence
+# 之间选错了。模型到底怎么判，只能靠真实评测（--live）去验；
+# 这里能守住的是——这段边界说明【真的发给模型了】，而且没被改回原来那句含糊的话。
+
+class TestDecisionBoundaryPrompt(RagTestCase):
+    """检查发给模型的 system 提示词里，两条规则的边界写清楚没有。"""
+
+    def system_prompt(self):
+        """跑一次，取回真正发给模型的 system 提示词。"""
+        self.ask()
+        first = self.fake.calls[0]["messages"][0]
+        self.assertEqual(first["role"], "system", "第一条消息必须是 system")
+        return first["content"]
+
+    def test_boundary_is_stated_from_both_sides(self):
+        """两条规则里都要写清分界线：资料提没提到相关的东西。"""
+        p = self.system_prompt()
+        self.assertIn("提到了与这个问题直接相关的服务、机制或相近事实", p)
+        self.assertIn("一个字都没有", p)
+
+    def test_one_on_one_tutoring_example_is_present(self):
+        """一对一辅导这个具体例子必须在提示词里 —— 它就是翻车的那道题。"""
+        p = self.system_prompt()
+        self.assertIn("一对一辅导", p)
+        self.assertIn("在学习群里提问", p)
+        self.assertIn("在下次答疑时集中处理", p)
+
+    def test_example_forbids_both_wrong_answers(self):
+        """例子要同时点明两个错法：答「有的」，和说成「完全无关」。"""
+        p = self.system_prompt()
+        self.assertIn("不能顺着问题回答「有的」", p)
+        self.assertIn("也不该说成「跟资料完全无关」", p)
+
+    def test_refuse_side_also_has_a_concrete_example(self):
+        """refuse 那一侧也要有例子，否则容易反向倒向「证据不足」。"""
+        p = self.system_prompt()
+        self.assertIn("这个课程多少钱", p)
+        self.assertIn("完全没有", p)
+
+    def test_disclaimer_line_does_not_count_as_mentioning(self):
+        """【防止误伤 refuse-price】免责声明里出现「价格」不算「提到」。
+
+        course_faq.md 顶部有一句「本文不包含价格、退费、证书信息」，
+        问价格时这句很可能被检索到。如果模型把「出现过这个词」当成「提到过」，
+        价格题就会从 refuse 翻成 insufficient_evidence。
+        """
+        p = self.system_prompt()
+        self.assertIn("本文不包含价格、退费、证书信息", p)
+        self.assertIn("那【不算】提到", p)
+
+    def test_old_ambiguous_wording_is_gone(self):
+        """原来那句「业务事实，而资料里没有记录」正是把这道题带偏的原因，不能留。"""
+        self.assertNotIn("询问课程的业务事实，而资料里没有记录", self.system_prompt())
 
 
 # ===================== 6. 安全降级 =====================
@@ -498,12 +592,32 @@ class TestDiagnostics(RagTestCase):
         self.assertEqual(code, rag.DIAG_OK)
         self.assertEqual(r["decision"], "refuse")
 
-    def test_no_chunks(self):
-        """没有检索结果 → 直接拒答，标签是 no_chunks，而且【不调用模型】。"""
+    def test_empty_chunks_now_uses_the_model(self):
+        """【本轮改动】chunks 为空不再是一条「不调模型」的捷径 —— 照样走模型。"""
+        self.fake.reply = json.dumps(
+            {"decision": "general_answer", "answer": "通用回答", "citations": []},
+            ensure_ascii=False)
         r, code = self.run_diag(chunks=[])
-        self.assertEqual(code, rag.DIAG_NO_CHUNKS)
-        self.assertEqual(r["decision"], "refuse")
-        self.assertEqual(len(self.fake.calls), 0)
+        self.assertEqual(code, rag.DIAG_OK)
+        self.assertEqual(r["decision"], "general_answer")
+        self.assertEqual(len(self.fake.calls), 1)
+
+    def test_clean_general_answer_is_ok(self):
+        """干净的 general_answer → 标签是 ok。"""
+        r, code = self.run_diag(reply={"decision": "general_answer",
+                                       "answer": "通用回答", "citations": []})
+        self.assertEqual(code, rag.DIAG_OK)
+        self.assertEqual(r["decision"], "general_answer")
+
+    def test_general_answer_with_citations_is_flagged(self):
+        """【核心】general_answer 却带了引用 → 有专门的诊断标签。"""
+        r, code = self.run_diag(reply={
+            "decision": "general_answer", "answer": "x",
+            "citations": [{"source": CHUNK_SINCE_FOR["source"],
+                           "heading": CHUNK_SINCE_FOR["heading"]}]})
+        self.assertEqual(code, rag.DIAG_CITATIONS_ON_GENERAL_ANSWER)
+        self.assertEqual(r["decision"], "insufficient_evidence")
+        self.assertEqual(r["citations"], [])
 
     def test_api_or_response_error(self):
         """模型直接抛异常 → api_or_response_error（不是别的标签）。"""
@@ -535,7 +649,7 @@ class TestDiagnostics(RagTestCase):
         self.assertEqual(code, rag.DIAG_RESPONSE_NOT_OBJECT)
 
     def test_invalid_decision(self):
-        """decision 不在三个合法值里。"""
+        """decision 不在四个合法值里。"""
         r, code = self.run_diag(reply={"decision": "maybe", "answer": "x", "citations": []})
         self.assertEqual(code, rag.DIAG_INVALID_DECISION)
 
