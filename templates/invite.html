@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<!-- 邀请码输入页。拿到邀请码的人在这里输进来，就拥有了自己的学习档案。 -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>输入邀请码 · AI 学习助手</title>
+
+  <style>
+    /* 这一页的样式和首页保持同一套语言：淡蓝渐变背景 + 白色圆角卡片 */
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: linear-gradient(135deg, #eef2ff 0%, #f8fafc 55%, #ecfeff 100%);
+      font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+      color: #1e293b;
+    }
+
+    .card {
+      width: 100%;
+      max-width: 460px;
+      background: #ffffff;
+      border-radius: 18px;
+      padding: 34px 30px 30px;
+      box-shadow: 0 12px 40px rgba(15, 23, 42, 0.10);
+      text-align: center;
+    }
+
+    h1 { margin: 0 0 10px; font-size: 21px; }
+
+    .lead {
+      margin: 0 0 22px;
+      font-size: 13px;
+      line-height: 1.7;
+      color: #64748b;
+    }
+
+    input[type=text] {
+      width: 100%;
+      padding: 14px 16px;
+      font-size: 16px;                 /* 16 像素：手机上点进来不会自动放大 */
+      font-family: inherit;
+      color: inherit;
+      text-align: center;
+      letter-spacing: 0.5px;
+      border: 2px solid #e2e8f0;
+      border-radius: 12px;
+      outline: none;
+    }
+
+    input[type=text]:focus {
+      border-color: #6366f1;
+      box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.13);
+    }
+
+    button {
+      width: 100%;
+      margin-top: 12px;
+      padding: 14px 28px;
+      font-size: 16px;
+      font-weight: 600;
+      font-family: inherit;
+      color: #ffffff;
+      background: #6366f1;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+    }
+
+    button:hover { background: #4f46e5; }
+    button:active { transform: scale(0.99); }
+
+    .error {
+      margin: 0 0 16px;
+      padding: 10px 14px;
+      font-size: 13px;
+      color: #b91c1c;
+      background: #fef2f2;
+      border-radius: 10px;
+      text-align: left;
+    }
+
+    .note {
+      margin-top: 20px;
+      font-size: 12px;
+      line-height: 1.7;
+      color: #94a3b8;
+      text-align: left;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="card">
+    <h1>🎟️ 输入邀请码</h1>
+    <p class="lead">
+      输入邀请码之后，你就可以设置自己的<b>学习档案</b>，
+      AI 会按你的水平和偏好来回答。
+    </p>
+
+    {% if error %}
+    <!-- 出错时显示这一条。文案是服务端给死的，不拼任何内部信息 -->
+    <div class="error">{{ error }}</div>
+    {% endif %}
+
+    <form method="POST" action="{{ url_for('invite') }}">
+      <!-- CSRF token：一个恶意页面猜不到的随机值。
+           没有它，别的网站可以诱导你的浏览器替我提交这个表单 -->
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+      <!-- 邀请码走 POST，不进 URL —— URL 会被浏览器历史和代理日志记下来 -->
+      <input type="text" name="invite_code" placeholder="粘贴你的邀请码"
+             autocomplete="off" autofocus>
+
+      <button type="submit">进入</button>
+    </form>
+
+    <p class="note">
+      没有邀请码？这一版需要邀请码才能使用学习档案和个性化回答。<br>
+      <b>请把这张码保存好</b>：库里只存了它的摘要，<b>丢了我们也没法帮你查回来</b>。
+      换个设备或清掉浏览器 cookie 之后，重新输入同一张码就能回到同一份档案 ——
+      所以它相当于你的密码，别转发给别人。
+    </p>
+
+    <p class="note">
+      <b>关于「这个浏览器已经有身份了」：</b>如果它已经绑定过一个学习档案，
+      就不能再用另一张码（会明确告诉你，那张码也不会被浪费）。
+      如果它上一个身份<b>已经失效</b>（比如邀请码被作废），系统会自动给它换一个新的会话 ——
+      那种情况下，<b>这个浏览器之前问过的内容不会再显示</b>，
+      但数据仍在服务器上，会跟着原来那个身份的「清空全部个人数据」一起被删除。
+    </p>
+  </div>
+</body>
+</html>

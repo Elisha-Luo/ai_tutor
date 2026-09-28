@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<!-- 学习档案页：查看并修改「AI 记得我什么」。 -->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>我的学习档案 · AI 学习助手</title>
+
+  <style>
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 32px 24px;
+      background: linear-gradient(135deg, #eef2ff 0%, #f8fafc 55%, #ecfeff 100%);
+      font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+      color: #1e293b;
+    }
+
+    .card {
+      width: 100%;
+      max-width: 560px;
+      background: #ffffff;
+      border-radius: 18px;
+      padding: 30px;
+      box-shadow: 0 12px 40px rgba(15, 23, 42, 0.10);
+    }
+
+    h1 { margin: 0 0 8px; font-size: 21px; }
+
+    .lead {
+      margin: 0 0 20px;
+      font-size: 13px;
+      line-height: 1.7;
+      color: #64748b;
+    }
+
+    .status {
+      margin: 0 0 20px;
+      padding: 10px 14px;
+      font-size: 13px;
+      line-height: 1.6;
+      border-radius: 10px;
+      background: #f1f5f9;
+      color: #475569;
+    }
+
+    .status.set { background: #eef2ff; color: #4338ca; }
+
+    .error {
+      margin: 0 0 20px;
+      padding: 10px 14px;
+      font-size: 13px;
+      color: #b91c1c;
+      background: #fef2f2;
+      border-radius: 10px;
+    }
+
+    .field { margin-bottom: 18px; }
+
+    label {
+      display: block;
+      margin-bottom: 6px;
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .hint {
+      display: block;
+      margin-top: 4px;
+      font-size: 12px;
+      color: #94a3b8;
+    }
+
+    select {
+      width: 100%;
+      padding: 12px 14px;
+      font-size: 15px;
+      font-family: inherit;
+      color: inherit;
+      background: #ffffff;
+      border: 2px solid #e2e8f0;
+      border-radius: 12px;
+      outline: none;
+    }
+
+    select:focus {
+      border-color: #6366f1;
+      box-shadow: 0 0 0 4px rgba(99, 102, 241, 0.13);
+    }
+
+    .check {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 8px;
+      font-size: 13px;
+      color: #475569;
+    }
+
+    .check input { width: 16px; height: 16px; }
+
+    button {
+      width: 100%;
+      margin-top: 8px;
+      padding: 14px 28px;
+      font-size: 16px;
+      font-weight: 600;
+      font-family: inherit;
+      color: #ffffff;
+      background: #6366f1;
+      border: none;
+      border-radius: 12px;
+      cursor: pointer;
+    }
+
+    button:hover { background: #4f46e5; }
+    button:active { transform: scale(0.99); }
+
+    .back {
+      display: block;
+      margin-top: 18px;
+      font-size: 13px;
+      color: #6366f1;
+      text-decoration: none;
+      text-align: center;
+    }
+
+    .privacy {
+      margin-top: 22px;
+      padding-top: 16px;
+      border-top: 1px solid #eef2f7;
+      font-size: 12px;
+      line-height: 1.8;
+      color: #94a3b8;
+    }
+
+    .privacy h2, .danger h2 {
+      margin: 0 0 10px;
+      font-size: 14px;
+      font-weight: 700;
+      color: #475569;
+    }
+
+    .privacy p { margin: 0 0 10px; }
+    .privacy p:last-child { margin-bottom: 0; }
+
+    /* ---------- 清空档案：刻意做成「危险操作」的样子 ---------- */
+    /* 用淡红底 + 红按钮，和上面的「保存」明确区分开。
+       用户扫一眼就知道这一块和别的不一样，不会误点。 */
+    .danger {
+      margin-top: 26px;
+      padding: 18px;
+      background: #fef2f2;
+      border: 1px solid #fecaca;
+      border-radius: 14px;
+    }
+
+    .danger h2 { color: #b91c1c; }
+
+    .danger-scope {
+      margin: 0 0 14px;
+      font-size: 12px;
+      line-height: 1.9;
+      color: #7f1d1d;
+    }
+
+    .danger-button {
+      margin-top: 10px;
+      background: #dc2626;
+    }
+
+    .danger-button:hover { background: #b91c1c; }
+
+    .danger-button:disabled {
+      background: #fca5a5;
+      cursor: not-allowed;
+      transform: none;
+    }
+
+    /* ---------- 清空全部个人数据：比上面那块更重 ---------- */
+    /* 用深红实框 + 更粗的标题，一眼就能和「只清空学习档案」区分开 */
+    .wipe {
+      margin-top: 26px;
+      padding: 18px;
+      background: #fff1f2;
+      border: 2px solid #dc2626;
+      border-radius: 14px;
+    }
+
+    .wipe h2 {
+      margin: 0 0 10px;
+      font-size: 15px;
+      font-weight: 700;
+      color: #b91c1c;
+    }
+
+    .wipe-scope {
+      margin: 0 0 10px;
+      font-size: 12px;
+      line-height: 1.9;
+      color: #7f1d1d;
+    }
+
+    .wipe-list {
+      margin: 0 0 12px;
+      padding-left: 20px;
+      font-size: 12px;
+      line-height: 1.9;
+      color: #7f1d1d;
+    }
+
+    .wipe-note {
+      padding: 10px 12px;
+      background: #ffffff;
+      border-radius: 8px;
+      color: #991b1b;
+    }
+
+    .wipe-button {
+      margin-top: 10px;
+      background: #b91c1c;
+    }
+
+    .wipe-button:hover { background: #991b1b; }
+
+    .wipe-button:disabled {
+      background: #fca5a5;
+      cursor: not-allowed;
+      transform: none;
+    }
+  </style>
+</head>
+
+<body>
+  <div class="card">
+    <h1>📒 我的学习档案</h1>
+    <p class="lead">
+      AI 会按这里的内容调整回答的难度、长度和用词。<b>随时可以改</b>，改完立刻生效。
+    </p>
+
+    <!-- 如实告诉用户「你填过没有」：没填过就说明下面是默认值，而不是他设过的 -->
+    {% if is_set %}
+    <div class="status set">你设置过档案，下面是当前生效的内容。</div>
+    {% else %}
+    <div class="status">
+      你还没有设置过档案。下面是<b>默认值</b> —— 保存之后就会按你的选择来回答。
+    </div>
+    {% endif %}
+
+    {% if error %}
+    <div class="error">{{ error }}</div>
+    {% endif %}
+
+    <form method="POST" action="{{ url_for('profile') }}">
+      <!-- CSRF token：改档案属于「会修改数据的操作」，必须带这个服务端校验的随机值 -->
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+      <div class="field">
+        <label for="level_code">英语水平</label>
+        <select id="level_code" name="level_code">
+          <!-- 每一项都是白名单里的代号：服务端只认这些值 -->
+          {% for code, label in level_options %}
+          <option value="{{ code }}" {% if current.level_code == code %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+        <label class="check">
+          <input type="checkbox" name="level_uncertain" value="1"
+                 {% if current.level_uncertain %}checked{% endif %}>
+          我不太确定自己的水平（按上面大致估的）
+        </label>
+      </div>
+
+      <div class="field">
+        <label for="goal_code">学习目标</label>
+        <select id="goal_code" name="goal_code">
+          <!-- 空值 = 不填。这一项可以跳过 -->
+          <option value="" {% if not current.goal_code %}selected{% endif %}>暂不填写</option>
+          {% for code, label in goal_options %}
+          <option value="{{ code }}" {% if current.goal_code == code %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="focus_code">重点想提升</label>
+        <select id="focus_code" name="focus_code">
+          <option value="" {% if not current.focus_code %}selected{% endif %}>暂不填写</option>
+          {% for code, label in focus_options %}
+          <option value="{{ code }}" {% if current.focus_code == code %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="length_mode">回答长度</label>
+        <select id="length_mode" name="length_mode">
+          {% for code, label in length_options %}
+          <option value="{{ code }}" {% if current.length_mode == code %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="language_mode">中英对照</label>
+        <select id="language_mode" name="language_mode">
+          {% for code, label in language_options %}
+          <option value="{{ code }}" {% if current.language_mode == code %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+        <span class="hint">需要中文解释时选「中英对照」；想练全英文就选全英文。</span>
+      </div>
+
+      <button type="submit">保存档案</button>
+    </form>
+
+    <a class="back" href="{{ url_for('index') }}">← 回到对话</a>
+
+    <div class="privacy">
+      <h2>关于这份档案</h2>
+
+      <p>
+        <b>存了什么：</b>只有你上面选的这五项偏好，都是固定的选项代号。
+        档案里<b>不存</b>任何身份信息 —— 没有姓名、学校、邮箱、联系方式，
+        也不记录你问过的具体内容。
+      </p>
+
+      <p>
+        <b>谁能看到：</b>只有拿着邀请码的人。这个浏览器是用邀请码认领的，
+        所以<b>换一台设备、或者清掉浏览器 cookie 之后，重新输入同一张有效邀请码，
+        就能回到同一份档案</b>。反过来说 —— 谁拿到这张码，谁就能访问这份档案，
+        请把它当成密码一样保管。
+      </p>
+
+      <p>
+        <b>关于训练：</b>本项目<b>不主动用你的内容训练自己的模型</b>。
+        但要生成回答，必须把必要的内容（你的问题、检索到的资料片段）发送给
+        <b>第三方模型服务商</b>；对方如何保存和使用这些数据，我们无权也无法替你保证，
+        请参考他们的隐私政策。
+      </p>
+    </div>
+
+    <!-- ===================== 清空全部个人数据 =====================
+         刻意和下面的「清空学习档案」分成两块，而且这块更重：
+         它删的是【这个人存在过的痕迹】，不是「重置一下设置」。
+         所以用更重的红框、把删除范围一条条列出来、确认框也要勾。 -->
+    <div class="wipe">
+      <h2>⚠️ 清空全部个人数据</h2>
+
+      <p class="wipe-scope">
+        这是<b>不可撤销</b>的。点了之后，本系统里和这个学习者有关的<b>全部</b>数据都会被删除：
+      </p>
+
+      <ul class="wipe-list">
+        <li><b>聊天记录</b> —— 你和 AI 的全部对话（包括这个账号下用过的每一台设备）</li>
+        <li><b>学习偏好</b> —— 上面那五项设置</li>
+        <li><b>学习者身份</b> —— 这个「学习者」本身也会被删掉</li>
+        <li><b>会话绑定</b> —— 目前认领着的浏览器会话全部解除</li>
+        <li><b>关联的邀请码全部作废</b> —— 旧码从此不能再用，也<b>没法找回</b></li>
+      </ul>
+
+      <p class="wipe-scope">
+        删除之后，这个浏览器会退回「未认领」状态，等于重新开始。
+      </p>
+
+      <p class="wipe-scope wipe-note">
+        <b>它删不掉的东西：</b>第三方模型服务商那边可能保留的记录（生成回答时内容发过去过，
+        对方怎么存我们管不了）；数据库文件里的历史页、以及任何备份或快照，
+        也不会因为这次删除而消失 —— 那些需要另外的彻底销毁流程。
+      </p>
+
+      <form method="POST" action="{{ url_for('profile_delete') }}"
+            onsubmit="return confirm('最后确认：这会删除你的全部聊天记录、学习偏好、学习者身份和会话绑定，并作废关联邀请码。确定吗？');">
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+        <!-- confirm 由复选框自己提交：没勾 → 浏览器不会带上这个字段 → 服务端拒绝。
+             （绝不能用一个值固定为 yes 的隐藏字段代替，那等于替用户做了确认。） -->
+        <label class="check">
+          <input type="checkbox" id="wipe-confirm" name="confirm" value="yes" required
+                 onchange="document.getElementById('wipe-button').disabled = !this.checked;">
+          我明白这是不可撤销的，确认删除我的全部个人数据
+        </label>
+
+        <button type="submit" id="wipe-button" class="wipe-button" disabled>
+          清空全部个人数据
+        </button>
+      </form>
+    </div>
+
+    {% if is_set %}
+    <!-- 清空入口。【为什么单独一个表单】它和「保存」是两件完全不同的事，
+         混在一个表单里迟早有人点错按钮。这里也刻意做成红色系的次要区域，
+         并且在服务端要求显式勾选确认。 -->
+    <div class="danger">
+      <h2>清空学习档案</h2>
+
+      <p class="danger-scope">
+        <b>会清掉的：</b>上面那五项偏好（水平和目标等）。清完之后这里会显示「未设置」，
+        之后的回答按默认方式生成，<b>不会再使用你原来填的偏好</b>。<br>
+        <b>不会动的：</b>你的学习者身份、这张邀请码、以及你和 AI 的<b>聊天记录</b> ——
+        都保留着，你还能用同一张码继续用。
+        <br>
+        <b>和上面那个「清空全部个人数据」区分开：</b>那一个会连<b>聊天记录、学习者身份和会话绑定</b>
+        一起删掉、并作废邀请码，而且<b>不可撤销</b>；这里只动偏好，随时可以重新填。
+      </p>
+
+      <form method="POST" action="{{ url_for('profile_clear') }}"
+            onsubmit="return confirm('确定要清空这五项偏好设置吗？清空后回答会按默认方式生成。');">
+        <!-- 同样要有 CSRF token：能清档案的请求，绝不能是别的网站伪造出来的 -->
+        <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+        <!-- 二次确认。【注意：confirm 必须由这个复选框自己提交】
+             以前这里另外写过一条隐藏的同名字段，值固定是 yes ——
+             那等于「不管用户勾没勾，浏览器总会替他说已确认」，
+             服务端那一关形同虚设，复选框只剩个视觉效果。
+             现在 name / value 直接写在这个复选框上：
+             勾了 → 表单里就有 confirm=yes；没勾 → 这个字段根本不会出现在提交里。 -->
+        <label class="check">
+          <input type="checkbox" id="clear-confirm" name="confirm" value="yes" required
+                 onchange="document.getElementById('clear-button').disabled = !this.checked;">
+          我确认要清空上面五项偏好设置
+        </label>
+
+        <button type="submit" id="clear-button" class="danger-button" disabled>
+          清空学习档案
+        </button>
+      </form>
+    </div>
+    {% endif %}
+  </div>
+</body>
+</html>

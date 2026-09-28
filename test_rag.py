@@ -18,6 +18,7 @@ import json        # 拼造假的模型回复
 import unittest    # Python 自带的测试框架
 
 import rag         # 被测对象
+import profile_store   # 代号表要和它交叉核对（第 5e 节）
 
 
 # ===================== 假的模型客户端 =====================
@@ -679,6 +680,184 @@ class TestContextInThePrompt(RagTestCase):
         self.assertEqual(result["decision"], "insufficient_evidence")
         self.assertEqual(code, rag.DIAG_INVALID_JSON,
                          "降级了却报成 ok —— 那日志就又看不出根因了")
+
+
+# ===================== 5d. 学习者档案进提示词 =====================
+#
+# 【为什么单开一组】档案和资料、上下文都不一样：
+# 它影响的是【怎么说】（难度、长度、用词），不是【说什么依据】。
+# 所以两条边界要钉死：
+#   1. 档案里的内容必须真的传给模型
+#   2. 档案【绝不能】变成引用来源 —— 白名单只认本次检索到的片段
+
+class TestProfileInThePrompt(RagTestCase):
+
+    PREFS = {
+        "level_code": "c1",
+        "level_uncertain": 0,
+        "language_mode": "en_advanced",
+        "length_mode": "brief",
+        "goal_code": "work",
+        "focus_code": "speaking",
+    }
+
+    def ask_with_profile(self, preferences, question="帮我改一下这句话", reply=None,
+                         chunks=None):
+        """走「带上下文 + 带档案」的入口，只回公开三键结果。
+
+        【注意它其实是二元组】这个入口会多回一个 diagnostic_code（给网页写日志用），
+        这里只取第一个元素 —— 顺便也验证了「公开结果仍然是那三个键」。
+        """
+        if reply is not None:
+            self.fake.reply = reply if isinstance(reply, str) else json.dumps(
+                reply, ensure_ascii=False)
+        if chunks is None:
+            chunks = [dict(c) for c in CHUNKS]
+
+        result, _diagnostic_code = rag.generate_answer_with_context_and_profile(
+            question, chunks, [self.msg("user", "上一轮的话")],
+            preferences, self.fake, MODEL)
+        return result
+
+    @staticmethod
+    def msg(role, text):
+        return {"role": role, "content": text}
+
+    def sent_user_text(self):
+        return self.fake.calls[0]["messages"][1]["content"]
+
+    # ---------- 传进去了 ----------
+
+    def test_every_profile_field_reaches_the_model(self):
+        """档案里填了的每一项，都要在发给模型的内容里有对应说法。"""
+        self.ask_with_profile(self.PREFS)
+
+        sent = self.sent_user_text()
+        self.assertIn("学习者档案", sent)
+        self.assertIn("C1（高级）", sent)
+        self.assertIn("全英文 + 高级表达", sent)
+        self.assertIn("精简", sent)
+        self.assertIn("工作 / 商务", sent)
+        self.assertIn("口语", sent)
+
+    def test_the_uncertain_level_is_flagged(self):
+        prefs = dict(self.PREFS, level_uncertain=1)
+        self.ask_with_profile(prefs)
+        self.assertIn("很可能不准", self.sent_user_text())
+
+    def test_a_confirmed_level_is_still_flagged_as_self_reported(self):
+        """即使用户确认过，也仍然要提醒模型「这是自己报的」—— 自估经常不准。"""
+        self.ask_with_profile(self.PREFS)
+        self.assertIn("用户自报", self.sent_user_text())
+
+    def test_unfilled_fields_are_simply_omitted(self):
+        """没填的项不要写「未填写」占一行 —— 不写更干净。"""
+        self.ask_with_profile({"level_code": "b1", "level_uncertain": 1,
+                               "language_mode": "zh_pair", "length_mode": "normal",
+                               "goal_code": None, "focus_code": None})
+
+        sent = self.sent_user_text()
+        self.assertIn("中英对照", sent)
+        self.assertNotIn("学习目标", sent)
+        self.assertNotIn("重点想提升", sent)
+
+    def test_no_profile_means_no_block_at_all(self):
+        """没有档案（None 或空字典）→ 提示词里不该多出这一段。"""
+        for empty in (None, {}):
+            with self.subTest(preferences=empty):
+                self.fake.calls.clear()
+                self.ask_with_profile(empty)
+                self.assertNotIn("学习者档案", self.sent_user_text())
+
+    def test_profile_comes_before_the_material(self):
+        """顺序：档案 → 上下文 → 资料 → 当前问题。"""
+        self.ask_with_profile(self.PREFS)
+
+        sent = self.sent_user_text()
+        self.assertLess(sent.index("学习者档案"), sent.index("资料片段"))
+        self.assertLess(sent.index("最近上下文"), sent.index("资料片段"))
+
+    # ---------- 一次调用、结构不变 ----------
+
+    def test_only_one_model_call(self):
+        self.ask_with_profile(self.PREFS)
+        self.assertEqual(len(self.fake.calls), 1)
+
+    def test_return_shape_is_still_exactly_three_keys(self):
+        result = self.ask_with_profile(self.PREFS)
+        self.assertEqual(set(result.keys()), {"decision", "answer", "citations"})
+
+    # ---------- 档案不能变成引用 ----------
+
+    def test_the_profile_cannot_produce_a_citation(self):
+        """【核心安全断言】档案不是资料。
+
+        本次检索【什么都没捞到】（白名单是空的），模型却引用了一个来源 →
+        必须被拦下、安全降级。档案里没有任何来源信息，模型也绝不该「顺着档案记得的东西」去引。
+        """
+        result = self.ask_with_profile(self.PREFS, chunks=[], reply={
+            "decision": "answer", "answer": "顺手引一个。",
+            "citations": [{"source": "grammar_present_perfect.md", "heading": "基本结构"}],
+        })
+
+        self.assertEqual(result["decision"], "insufficient_evidence")
+        self.assertEqual(result["citations"], [])
+
+    def test_the_diagnostics_entry_returns_a_pair(self):
+        """给网页用的那个入口回的是二元组：公开结果 + 诊断标签。"""
+        result, code = rag.generate_answer_with_context_and_profile(
+            "问题", [dict(c) for c in CHUNKS], [], self.PREFS, self.fake, MODEL)
+
+        self.assertEqual(set(result.keys()), {"decision", "answer", "citations"})
+        self.assertIn(code, rag.DIAGNOSTIC_CODES)
+
+
+# ===================== 5e. 代号表的交叉一致性 =====================
+#
+# 【为什么需要这一组】代号在三个地方出现：
+#   profile_store.VALID_*   —— 哪些代号是合法的（写库的闸）
+#   profile_store.*_OPTIONS —— 页面上给人看的中文名
+#   rag._*_LABELS           —— 给模型看的说明
+# 三处必须同步。加了新代号却忘了改另一处，是这类代码最典型的漂移 ——
+# 而且症状很隐蔽：库里能存、页面能选，只有提示词里悄悄少了一句。
+
+class TestProfileCodeTablesAgree(unittest.TestCase):
+
+    def test_rag_labels_cover_every_valid_code(self):
+        """每一个合法代号，rag 都必须有给模型的说法。"""
+        pairs = [
+            (profile_store.VALID_LEVELS, rag._LEVEL_LABELS, "level"),
+            (profile_store.VALID_LANGUAGE_MODES, rag._LANGUAGE_LABELS, "language_mode"),
+            (profile_store.VALID_LENGTH_MODES, rag._LENGTH_LABELS, "length_mode"),
+            (profile_store.VALID_GOALS, rag._GOAL_LABELS, "goal"),
+            (profile_store.VALID_FOCUS, rag._FOCUS_LABELS, "focus"),
+        ]
+        for valid, labels, name in pairs:
+            for code in valid:
+                with self.subTest(field=name, code=code):
+                    self.assertIn(code, labels, name + " 的代号 " + code + " 在 rag 里没有说法")
+
+    def test_page_options_cover_every_valid_code_and_nothing_else(self):
+        """页面的下拉框：合法代号一个不少，也不能多出白名单外的选项。"""
+        pairs = [
+            (profile_store.VALID_LEVELS, profile_store.LEVEL_OPTIONS, "level"),
+            (profile_store.VALID_LANGUAGE_MODES, profile_store.LANGUAGE_OPTIONS, "language_mode"),
+            (profile_store.VALID_LENGTH_MODES, profile_store.LENGTH_OPTIONS, "length_mode"),
+            (profile_store.VALID_GOALS, profile_store.GOAL_OPTIONS, "goal"),
+            (profile_store.VALID_FOCUS, profile_store.FOCUS_OPTIONS, "focus"),
+        ]
+        for valid, options, name in pairs:
+            with self.subTest(field=name):
+                self.assertEqual([code for code, _label in options], list(valid),
+                                 name + " 的选项表和白名单对不上")
+
+    def test_the_system_prompt_explains_the_profile_rules(self):
+        """system 提示词里必须写明：档案不是资料、不能引用。"""
+        prompt = rag.SYSTEM_PROMPT
+
+        self.assertIn("学习者档案", prompt)
+        self.assertIn("不是资料", prompt)
+        self.assertIn("用户自报", prompt)
 
 
 # ===================== 6. 安全降级 =====================

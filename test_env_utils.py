@@ -257,13 +257,21 @@ class TestProjectConventions(EnvUtilsTestCase):
                                  "env_utils.py 的代码里出现了 " + banned + "：" + line.strip())
 
     def test_app_and_eval_runner_share_the_same_loader(self):
-        """【结构性保证】两个入口都必须 import 同一个 load_dotenv，不许各写一份。"""
+        """【结构性保证】两个入口都必须 import 同一个 load_dotenv，不许各写一份。
+
+        【为什么用正则而不是查一整句字面量】
+        这行 import 可能写成单行，也可能因为名字变多而写成括号换行的形式 ——
+        两者都合法。原来查的是 `"from env_utils import load_dotenv"` 这句字面量，
+        一换成括号写法就会误报（本轮就撞上了）。
+        正则只要求「从 env_utils 导入的东西里有 load_dotenv」，不受排版影响，
+        该守的规矩一点没松：下面那条仍然禁止自己再实现一份。
+        """
         for filename in ["app.py", os.path.join("evals", "run_rag_eval.py")]:
             path = os.path.join(BASE, filename)
             with open(path, encoding="utf-8") as f:
                 source = f.read()
-            self.assertIn("from env_utils import load_dotenv", source,
-                          filename + " 没有使用共享的 .env 读取工具")
+            self.assertRegex(source, r"from\s+env_utils\s+import\s*\(?[^\n]*\bload_dotenv\b",
+                             filename + " 没有使用共享的 .env 读取工具")
             self.assertNotIn("def load_dotenv", source,
                              filename + " 里还留着自己那份 load_dotenv 实现")
 
@@ -464,6 +472,163 @@ class AppRefusesExampleKeyTest(unittest.TestCase):
         code, output = self._import_app(None)
         self.assertNotEqual(code, 0)
         self.assertIn("DEEPSEEK_API_KEY", output)
+
+
+# ===================== 另外两个密钥的示例值 =====================
+#
+# 【为什么单开一组】DEEPSEEK_API_KEY 一直有「拦住示例值」的检查，
+# 但 FLASK_SECRET_KEY 和 INVITE_CODE_PEPPER 只查了「非空」——
+# 而 .env.example 里那句 change-me-... 恰好也是非空的。
+# 于是复制模板忘了改的人，应用照常启动，只是：
+#   · cookie 签名密钥是公开的 → 谁都能伪造会话
+#   · 邀请码 pepper 是公开的   → 摘要可以被离线爆破
+#
+# 这一组把这三条路都钉住，并且用【子进程真的 import app】来证明程序确实会停，
+# 而不是只在源码里 grep 一个字符串。
+
+class ExampleSecretConstantsTest(unittest.TestCase):
+    """常量本身：对不对、会不会泄露、和模板是否一致。"""
+
+    def test_constants_are_not_empty(self):
+        self.assertTrue(env_utils.EXAMPLE_FLASK_KEY.strip())
+        self.assertTrue(env_utils.EXAMPLE_PEPPER.strip())
+
+    def test_the_two_secrets_use_different_placeholders_than_the_api_key(self):
+        """三个占位符不能互相混淆 —— 否则一个检查会误伤另一个变量。"""
+        self.assertNotEqual(env_utils.EXAMPLE_FLASK_KEY, env_utils.EXAMPLE_API_KEY)
+        self.assertNotEqual(env_utils.EXAMPLE_PEPPER, env_utils.EXAMPLE_API_KEY)
+
+    def test_the_message_does_not_contain_any_value(self):
+        """【安全】提示里只有变量名，没有值。"""
+        message = env_utils.example_secret_message("FLASK_SECRET_KEY")
+        self.assertIn("FLASK_SECRET_KEY", message)          # 变量名不是秘密
+        self.assertNotIn(env_utils.EXAMPLE_FLASK_KEY, message)
+        self.assertNotIn(env_utils.EXAMPLE_PEPPER, message)
+        self.assertNotIn(env_utils.EXAMPLE_API_KEY, message)
+
+    def test_the_constants_match_the_shipped_template(self):
+        """【核心】常量必须和 `.env.example` 里那几行完全一致 —— 防模板与代码漂移。
+
+        只读 `.env.example`（公开模板，提交进仓库的），【绝不读 .env】。
+        """
+        path = os.path.join(BASE, ".env.example")
+        if not os.path.exists(path):
+            self.skipTest("没有 .env.example，跳过")
+
+        with open(path, encoding="utf-8") as f:
+            values = {}
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, value = line.partition("=")
+                values[key.strip()] = value.strip().strip('"').strip("'")
+
+        for name, constant in (("DEEPSEEK_API_KEY", env_utils.EXAMPLE_API_KEY),
+                               ("FLASK_SECRET_KEY", env_utils.EXAMPLE_FLASK_KEY),
+                               ("INVITE_CODE_PEPPER", env_utils.EXAMPLE_PEPPER)):
+            with self.subTest(variable=name):
+                self.assertIn(name, values, ".env.example 里没有 " + name + " 这一行")
+                self.assertEqual(values[name], constant,
+                                 ".env.example 的示例值和 env_utils 里的常量对不上了")
+
+
+class ExampleSecretDetectionTest(unittest.TestCase):
+    """is_example_secret 的判断规则：精确相等，不做泛化限制。"""
+
+    def test_the_exact_example_value_is_detected(self):
+        self.assertTrue(env_utils.is_example_secret(
+            env_utils.EXAMPLE_FLASK_KEY, env_utils.EXAMPLE_FLASK_KEY))
+        self.assertTrue(env_utils.is_example_secret(
+            env_utils.EXAMPLE_PEPPER, env_utils.EXAMPLE_PEPPER))
+
+    def test_surrounding_whitespace_is_tolerated(self):
+        self.assertTrue(env_utils.is_example_secret(
+            "  " + env_utils.EXAMPLE_PEPPER + "  ", env_utils.EXAMPLE_PEPPER))
+
+    def test_real_looking_values_are_not_flagged(self):
+        """【核心】真实值绝不能被误伤 —— 尤其不能按长度/格式去猜。"""
+        for value in ("test-secret-not-a-real-key",          # 测试用假值
+                      "test-pepper-not-a-real-pepper",
+                      "a" * 64,                              # 很长的随机串
+                      "change-me",                           # 只是像，但不相等
+                      "change-me-run-the-command-above",     # 少了后半截
+                      env_utils.EXAMPLE_PEPPER + "x",        # 多了一个字符
+                      ""):
+            with self.subTest(value=value[:20]):
+                self.assertFalse(env_utils.is_example_secret(value, env_utils.EXAMPLE_PEPPER))
+
+    def test_none_is_not_an_example_value(self):
+        """没配（None）不是「示例值」—— 那是另一条错误提示的事，别混在一起。"""
+        self.assertFalse(env_utils.is_example_secret(None, env_utils.EXAMPLE_PEPPER))
+
+    def test_the_other_variables_placeholder_does_not_match(self):
+        """传错常量不该命中 —— 每个变量只认自己那一句占位符。"""
+        self.assertFalse(env_utils.is_example_secret(
+            env_utils.EXAMPLE_PEPPER, env_utils.EXAMPLE_API_KEY))
+
+
+class AppRefusesExampleSecretsTest(unittest.TestCase):
+    """【端到端】子进程里真的 import app，证明它会停下来。"""
+
+    def _import_app(self, **overrides):
+        """在子进程里 import app。返回 (退出码, 输出)。
+
+        基线给一套【能通过检查】的假值，再用 overrides 覆盖其中某一项。
+        值传 None 表示把这个变量删掉。
+        """
+        tmpdir = tempfile.mkdtemp(prefix="ai_tutor_envcheck_")
+        self.addCleanup(__import__("shutil").rmtree, tmpdir, ignore_errors=True)
+
+        env = dict(os.environ)
+        env["DEEPSEEK_API_KEY"] = "test-key-not-a-real-key"
+        env["FLASK_SECRET_KEY"] = "test-secret-not-a-real-key"
+        env["INVITE_CODE_PEPPER"] = "test-pepper-not-a-real-pepper"
+        env["CHAT_DB_PATH"] = os.path.join(tmpdir, "check.db")
+        env["PYTHONIOENCODING"] = "utf-8"
+        for key, value in overrides.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
+
+        proc = subprocess.run(
+            [sys.executable, "-c", "import app"],
+            cwd=BASE, env=env, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60)
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+    def test_the_baseline_fake_values_still_work(self):
+        """【核心】测试专用的假值必须照常可用 —— 别把检查做得太狠。
+
+        （整条测试套件都靠这两个假值跑起来，这条是它们的地基。）
+        """
+        code, output = self._import_app()
+        self.assertEqual(code, 0, "测试用的假值居然被拦住了：\n" + output[-500:])
+
+    def test_the_example_flask_key_is_refused(self):
+        """【核心】cookie 签名密钥是示例值 → 启动失败 + 固定提示。"""
+        code, output = self._import_app(FLASK_SECRET_KEY=env_utils.EXAMPLE_FLASK_KEY)
+
+        self.assertNotEqual(code, 0, "app.py 带着公开的示例签名密钥启动了")
+        self.assertIn("FLASK_SECRET_KEY", output)
+        self.assertIn("示例值", output)
+
+    def test_the_example_pepper_is_refused(self):
+        """【核心】邀请码 pepper 是示例值 → 启动失败 + 固定提示。"""
+        code, output = self._import_app(INVITE_CODE_PEPPER=env_utils.EXAMPLE_PEPPER)
+
+        self.assertNotEqual(code, 0, "app.py 带着公开的示例 pepper 启动了")
+        self.assertIn("INVITE_CODE_PEPPER", output)
+        self.assertIn("示例值", output)
+
+    def test_the_refusal_does_not_echo_the_value(self):
+        """【安全】失败输出里不能出现那个值本身。"""
+        for name, value in (("FLASK_SECRET_KEY", env_utils.EXAMPLE_FLASK_KEY),
+                            ("INVITE_CODE_PEPPER", env_utils.EXAMPLE_PEPPER)):
+            with self.subTest(variable=name):
+                _, output = self._import_app(**{name: value})
+                self.assertNotIn(value, output)
 
 
 if __name__ == "__main__":

@@ -51,6 +51,18 @@
       color: #64748b;                        /* 灰色 */
     }
 
+    .nav {                                   /* 副标题下面那个去档案页的链接 */
+      margin: 10px 0 0;
+      font-size: 13px;
+    }
+
+    .nav a {
+      color: #6366f1;                        /* 和按钮同一个紫色，一眼看得出能点 */
+      text-decoration: none;
+    }
+
+    .nav a:hover { text-decoration: underline; }
+
     .messages {                              /* 中间那块对话区 */
       flex: 1;                               /* 占满剩下的全部高度（标题和输入栏高度固定，剩下的都给它） */
       overflow-y: auto;                      /* 内容超出高度时自动出现滚动条 */
@@ -331,6 +343,15 @@
       <p class="subtitle">
         正常英语问题都会尽量回答：有资料依据时会显示「资料来源」，
         没有资料但属于正常英语问题时，会标明「AI 通用知识回答」
+      </p>
+      <!-- 【入口很小但很关键】绑过邀请码的人看到「我的学习档案」，
+           没绑的人看到「输入邀请码」。用户从这里进出档案页。 -->
+      <p class="nav">
+        {% if learner_id %}
+        <a href="{{ url_for('profile') }}">📒 我的学习档案</a>
+        {% else %}
+        <a href="{{ url_for('invite') }}">🎟️ 输入邀请码，启用学习档案</a>
+        {% endif %}
       </p>
     </header>
 

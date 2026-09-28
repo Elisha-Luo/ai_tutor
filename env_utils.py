@@ -154,3 +154,42 @@ def is_example_api_key(value):
     【安全】这个函数不打印、不返回密钥内容 —— 只回一个布尔值。
     """
     return (value or "").strip() == EXAMPLE_API_KEY
+
+
+# ===================== 另外两个密钥的示例值 =====================
+#
+# 【为什么这两个也要拦】
+# 一开始只有 DEEPSEEK_API_KEY 有这道检查，另外两个只查了「非空」。
+# 于是出现一个空子：把 .env.example 复制成 .env 之后忘了改，
+# 这两个值恰好都是模板里那句公开的 `change-me-...` —— 非空，所以检查通过，
+# 应用【照常启动】。后果各不相同，但都严重：
+#   · FLASK_SECRET_KEY 是公开的 → 谁都能伪造签名 cookie，冒充别人的会话
+#   · INVITE_CODE_PEPPER 是公开的 → 邀请码摘要可以被离线爆破，等于没有保护
+#
+# 【仍然只用「精确相等」】不做长度 / 格式的泛化限制 ——
+# 真实值长什么样由用户自己决定，定规则只会误伤。
+
+# 【必须和 .env.example 里的示例值完全一致】改模板时这里也要跟着改。
+# 现在两处占位符恰好是同一句话，但各自留一个常量 ——
+# 将来模板把它们改成不同的句子时，判断逻辑不用动。
+EXAMPLE_FLASK_KEY = "change-me-run-the-command-above-to-generate-your-own"
+EXAMPLE_PEPPER = "change-me-run-the-command-above-to-generate-your-own"
+
+
+def is_example_secret(value, example_value):
+    """这个值是不是 `.env.example` 里那个公开的占位符（精确相等）？
+
+    【安全】不打印、不返回任何值内容 —— 只回一个布尔值。
+    """
+    return (value or "").strip() == example_value
+
+
+def example_secret_message(name):
+    """给用户看的固定提示。只说「哪个变量是示例值、去哪看怎么生成」。
+
+    【为什么不写成一句写死的话】因为另外两个变量都需要同一句话，
+    只换变量名。写成函数，措辞就只有一份。
+    【不含任何密钥内容】—— 只有变量名（变量名不是秘密，模板里公开写着）。
+    """
+    return (name + " 仍是 .env.example 里的示例值，请换成你自己的随机值"
+            "（生成方法见 README.md 的「配置密钥」一节）。")

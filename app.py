@@ -4,15 +4,20 @@
 import os                                           # 读环境变量、拼路径
 import uuid                                         # 生成随机的「会话 ID」
 import time                                         # 给每个请求计时（日志里要记耗时）
+import hmac                                         # CSRF token 用常数时间比较，别用 == 比
+import secrets                                      # 生成 CSRF token 用的密码学安全随机源
 import sqlite3                                      # Python 自带的轻量数据库，不用额外安装任何东西
 import logging                                      # 打结构化日志
 import threading                                    # 用它的「锁」防止同一时间处理两个请求
 from datetime import datetime, timedelta, timezone  # datetime 记录消息时间；timedelta 设置 cookie 有效期；timezone 算 UTC 日期
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify   # session 给每个浏览器发身份标记；jsonify 拼 JSON 响应
 from openai import OpenAI                           # 从 openai 库里导入 OpenAI 类（DeepSeek 兼容它的接口）
-from env_utils import load_dotenv, is_example_api_key, EXAMPLE_KEY_MESSAGE   # 共用 .env 读取；示例密钥检测也在那边
+from env_utils import (load_dotenv, is_example_api_key, EXAMPLE_KEY_MESSAGE,   # 共用 .env 读取；示例值检测也在那边
+                       is_example_secret, example_secret_message,
+                       EXAMPLE_FLASK_KEY, EXAMPLE_PEPPER)
 import retriever                                     # 本地检索层：把问题变成「最相关的几段资料」
 import rag                                           # 生成与引用层：让模型照着资料回答，并校验它引用的来源
+import profile_store                                 # 学习档案存储层：邀请码、学习者、会话绑定、偏好
 
 
 # ===================== 读取 .env（如果存在）=====================
@@ -56,6 +61,32 @@ if not SECRET_KEY:
         "没有找到 FLASK_SECRET_KEY。请先设置环境变量 FLASK_SECRET_KEY，"
         "方法见 README.md 的「配置密钥」一节。"
     )
+
+# 【示例值同样要拦住】只查「非空」是不够的：.env.example 里那句 change-me-... 也是非空。
+# 而它是一个【公开】的值 —— 谁都能用它伪造签名 cookie、冒充别的会话。
+# 和上面那条一样：只看「是不是和公开模板长得一模一样」，不猜格式、不猜长度。
+if is_example_secret(SECRET_KEY, EXAMPLE_FLASK_KEY):
+    raise RuntimeError(example_secret_message("FLASK_SECRET_KEY"))
+
+# 【邀请码的 pepper】把邀请码算成摘要时用的服务端密钥。
+# 它决定了「数据库里那串摘要」能不能被反推出邀请码 —— 所以它和 API 密钥是同一级别的凭证：
+# 只从环境变量读，绝不进代码、绝不进数据库、绝不进日志。
+#
+# 【为什么没设置就直接启动失败，而不是「先跑起来再说」】
+# 如果真的允许空 pepper，那摘要就等于「没有密钥的 HMAC」—— 拿到数据库的人
+# 可以拿一个常见词表挨个试，摘要一比就出来了。那等于邀请码明文存储。
+# 宁可开不起来，也不要开着一个「看起来有保护、其实没有」的服务。
+INVITE_CODE_PEPPER = os.environ.get("INVITE_CODE_PEPPER", "")
+if not INVITE_CODE_PEPPER:
+    raise RuntimeError(
+        "没有找到 INVITE_CODE_PEPPER。请先设置环境变量 INVITE_CODE_PEPPER，"
+        "方法见 README.md 的「配置密钥」一节。"
+    )
+
+# 【示例值同样要拦住】公开的 pepper 等于没有 pepper：
+# 拿到数据库的人可以直接对摘要做离线爆破，把邀请码还原出来。
+if is_example_secret(INVITE_CODE_PEPPER, EXAMPLE_PEPPER):
+    raise RuntimeError(example_secret_message("INVITE_CODE_PEPPER"))
 
 BASE_URL = "https://api.deepseek.com"                 # DeepSeek 的接口地址
 MODEL = "deepseek-chat"                               # 要调用的模型名字
@@ -174,6 +205,20 @@ def _check_db_path(path):
 
 _check_db_path(DB_PATH)
 
+
+def _connect(timeout=5, isolation_level=""):
+    """开一个数据库连接，并【每一次】都把外键检查打开。
+
+    【为什么必须每次开】SQLite 出于历史原因，默认【不检查】外键 ——
+    也就是说 profile_store 里写的那些 ON DELETE CASCADE 和 REFERENCES，
+    不打开这个开关就只是一句注释：删掉一个学习者，他的偏好和会话绑定会留在库里，
+    变成谁也访问不到的孤儿数据。
+    PRAGMA 是【连接级】的，所以每个新连接都要设一次，不能只设一次了事。
+    """
+    conn = sqlite3.connect(DB_PATH, timeout=timeout, isolation_level=isolation_level)
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
 # ===================== 日志 =====================
 #
 # 【要记什么】应用启动、收到问题、RAG 决策、耗时、引用数、额度拒绝、内部错误。
@@ -201,6 +246,7 @@ _SAFE_LOG_FIELDS = frozenset({
     "question_length", "decision", "citation_count", "elapsed_ms",   # 每个问题的统计
     "diagnostic_code",                                # 固定诊断枚举：区分「模型主动判的」和「校验没过降级的」
     "context_messages", "context_chars",              # 上下文【只记条数和字符数】，绝不记正文
+    "deleted_sessions", "deleted_messages",           # 清空全部数据时【只记删了多少条】
     "limit", "used",                                  # 额度
     "error_type", "stage",                            # 内部错误（只记类型，不记内容）
 })
@@ -246,7 +292,7 @@ _lock = threading.Lock()
 
 def init_db():
     """建好数据库和表。可以重复调用——IF NOT EXISTS 保证「已经存在就什么都不做」。"""
-    conn = sqlite3.connect(DB_PATH)                   # 打开（或创建）数据库文件
+    conn = _connect()                                 # 打开（或创建）数据库文件，并打开外键检查
     try:
         with conn:                                    # with conn 是「事务」：中间没出错就自动提交，出错就自动撤销
             conn.execute(
@@ -274,13 +320,18 @@ def init_db():
                        used INTEGER NOT NULL DEFAULT 0
                    )"""
             )
+
+            # 【档案相关的四张表】交给 profile_store 建 —— 那些表的规则（邀请码摘要、
+            # 白名单、会话唯一绑定）都归它管，schema 和读写代码放在一起才不会漂。
+            # 这里只是「启动时确保它们存在」。
+            profile_store.ensure_schema(conn)
     finally:
         conn.close()                                  # 【必须显式关闭】with conn 只管事务，不管关连接
 
 
 def load_history(session_id):
     """读出某个会话的全部聊天记录，按时间先后返回。"""
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     try:
         # 【安全】用 ? 占位符，而不是把变量拼进 SQL 字符串里。
         # 拼接的话，别人只要在会话 ID 里塞一段 SQL 就能把你的数据库读光——这叫 SQL 注入。
@@ -321,7 +372,7 @@ def load_recent_messages(session_id, limit=None):
     if limit is None:
         limit = rag.RECENT_MESSAGE_LIMIT                 # 单一事实来源：rag 里的常量
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     try:
         rows = conn.execute(
             "SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
@@ -335,7 +386,7 @@ def load_recent_messages(session_id, limit=None):
 def save_exchange(session_id, question, answer):
     """把「一问一答」两条一起写进数据库。"""
     now = datetime.now().isoformat(timespec="seconds")   # 比如 2026-09-15T14:04:02
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     try:
         with conn:                                    # 用事务包住两条插入：要么都成功，要么都不写。
                                                       # 避免出现「只有问题没有回答」这种半截记录
@@ -376,7 +427,7 @@ def reserve_api_call(limit, day=None):
     if day is None:
         day = _utc_day()
 
-    conn = sqlite3.connect(DB_PATH, timeout=10, isolation_level=None)  # 自己管事务，关掉自动提交
+    conn = _connect(timeout=10, isolation_level=None)  # 自己管事务，关掉自动提交
     try:
         conn.execute("BEGIN IMMEDIATE")               # 立刻拿写锁，把并发请求串起来
         row = conn.execute("SELECT used FROM api_usage WHERE day = ?", (day,)).fetchone()
@@ -473,23 +524,257 @@ log_event("app_start", debug=DEBUG, db_file=DB_PATH)
 
 # ===================== 页面 =====================
 
+class SessionUnverifiable(Exception):
+    """【会话状态确认不了】读数据库失败时抛出，用来中断整个请求。
+
+    【为什么必须是「中断」而不是「照旧用」】
+    确认不了的意思就是：我们**不知道**手里这个 session_id 是不是已经失效了。
+    如果照旧用它，而它其实已经被作废，那么这次提问的消息会写进【别人的旧会话】下 ——
+    正是之前修掉的那个问题（以后清空那位学习者的数据时会误删这些无关消息）。
+    所以这种情况只能【宁可停下，也不猜】：不提问、不兑换邀请码、不写任何东西。
+
+    【为什么用异常】依赖会话身份的路由有六个（提问 / 邀请码 / 档案 / 清空 / 删除 / 413）。
+    在一个地方抛、在一个地方收（见下面的 errorhandler），比每处都写一遍判断更不容易漏。
+    """
+
+
+SESSION_RETRY_MESSAGE = "暂时无法确认这个浏览器的状态，请稍后再试一次。"
+
+
+@app.errorhandler(SessionUnverifiable)
+def _handle_session_unverifiable(_error):
+    """会话状态确认不了时的统一收尾。
+
+    【三条纪律】
+      · 只说一句固定的话，不含任何异常细节
+      · 【不碰数据库】—— 数据库这会儿正不正常还不知道，别再往上压请求
+        （所以这里直接把 history 传空、learner_id 传 None，而不是走 _render）
+      · 返回 503：这不是「正常响应」，而是「此刻没法服务」，让调用方知道可以重试
+    """
+    log_event("session_unverifiable")
+    return render_template("index.html", history=[], question="",
+                           error=SESSION_RETRY_MESSAGE, learner_id=None), 503
+
+
 def _ensure_session_id():
-    """拿到（必要时创建）本次请求所属的会话 ID。
+    """拿到本次请求应当使用的会话 ID（必要时创建，或者【轮换】）。
 
     【会话隔离的关键】第一次访问时，给这个浏览器发一个随机 ID，存在「签名过的 cookie」里。
     之后这个浏览器的每次请求都会带着它，我们就知道「这段对话是谁的」。
     为什么用 uuid4 随机数：别人猜不到，也就没法看别人的对话。
+
+    【会话轮换：手里的会话已经失效了，就换一个新的】
+    什么算「失效」？这个 session_id 曾经绑过某个学习者，后来那个码被作废了
+    （learner_sessions 那一行打了 revoked_at 标记）。此时必须换一个新的 session_id：
+
+      1. **不换的话，匿名提问会继续挂在这个旧 id 下。**
+         而旧 id 仍然关联着原来那个学习者 —— 将来他要求「清空全部个人数据」时，
+         我们会按 learner_sessions 找会话、连带删消息，于是【这些无关的匿名消息也会被删掉】。
+      2. **不换的话，输入一张新邀请码会撞上那条「已失效但仍属于别人」的绑定**，
+         绑定被拒绝，用户白白消耗掉一张码（这个坑在 profile_store.redeem_and_bind 里也堵了一道）。
+
+    【为什么不干脆把旧行删掉】那正是之前的 bug：删了行，「这个会话属于谁」也就丢了，
+    以后清空数据时找不到它名下的旧聊天记录。所以旧行【留着】，
+    只是这个浏览器以后不再用它 —— 新消息落在新 id 下，两者清清楚楚分开。
+
+    【查不出来时抛异常，不返回旧 sid】
+    会话状态确认不了，就等于「不知道这个 id 还能不能用」。
+    照旧用它有可能把消息写进别人已被作废的旧会话 —— 所以整个请求停在这里，
+    由 SessionUnverifiable 的 errorhandler 给一句重试提示。详见那个异常类的说明。
     """
     if "sid" not in session:
         session["sid"] = uuid.uuid4().hex             # 32 位十六进制随机串，重复概率可以忽略
         session.permanent = True                       # 让 cookie 活 30 天，关掉浏览器再打开历史还在
+
+    sid = session["sid"]
+
+    # 查一次：这个会话的绑定是不是已经失效了
+    try:
+        conn = _connect()
+        try:
+            revoked = profile_store.session_is_revoked(conn, sid)
+        finally:
+            conn.close()
+    except Exception as exc:
+        # 【查不出来就停下，绝不照旧用这个 sid】
+        # 早期版本这里是「当成没失效，返回旧 sid」—— 那是个真窟窿：
+        # 如果这个 sid 其实已经被作废，提问会照常成功，新消息就写进了别人的旧会话，
+        # 以后清空那位学习者的数据时会被一起删掉。
+        # 确认不了就什么都不能做：抛出去，由 errorhandler 统一给一句重试提示。
+        log_event("session_check_failed", error_type=type(exc).__name__)
+        raise SessionUnverifiable() from None
+
+    if not revoked:
+        return sid
+
+    # 失效了 → 换一个新的会话 ID（旧的留在库里，关联不动）
+    session["sid"] = uuid.uuid4().hex
+    session.permanent = True
+    log_event("session_rotated")
     return session["sid"]
 
 
 def _render(sid, question="", error="", status=200):
     """渲染首页。把「读历史 + 传参数」收在一处，几个分支共用。"""
     return render_template("index.html", history=load_history(sid),
-                           question=question, error=error), status
+                           question=question, error=error,
+                           learner_id=_learner_id_for(sid)), status
+
+
+# ===================== CSRF 保护 =====================
+#
+# 【要防的是什么】假设用户登录着我们的站点，同时又打开了一个恶意页面。
+# 那个页面可以偷偷向我们的地址提交一个表单 —— 浏览器会自动带上用户的 cookie，
+# 于是「这个请求是用户自己发的」看起来就成立了。
+# 这叫 CSRF（跨站请求伪造）。防御办法：让每个表单都带一个【恶意页面猜不到】的随机值。
+#
+# 【为什么 token 放在 Flask 的 session 里】
+# 这个 session 是「签名过的 cookie」—— 用户能看到它，但改不了它。
+# 恶意页面既读不到这个值（浏览器不允许跨站读 cookie），也伪造不出签名。
+# 所以它拿不出一个合法的 token，请求就被挡下了。
+#
+# 【为什么比较要用 hmac.compare_digest 而不是 ==】
+# 用 == 比较字符串时，Python 会在第一个不同的字符处提前返回 ——
+# 耗时随「猜对了几个前缀」而变化，理论上能被逐字节试出来。
+# compare_digest 无论内容如何都花同样的时间。
+
+def _csrf_token():
+    """拿到本次会话的 CSRF token；第一次用就生成一个。"""
+    if "csrf" not in session:
+        session["csrf"] = secrets.token_urlsafe(32)
+    return session["csrf"]
+
+
+def _csrf_ok(submitted):
+    """校验表单提交上来的 token。不通过一律拒绝。
+
+    【为什么两边都要 .encode()】这是个真实的坑：
+    hmac.compare_digest 对【字符串】只接受纯 ASCII ——
+    传进来的 token 里只要有一个中文字符，它会直接抛 TypeError，
+    于是「伪造的 token」变成了一次 500 错误（还顺带把堆栈暴露在日志里），
+    而不是一次干净的拒绝。转成 bytes 之后任何输入都能安全比较。
+    """
+    expected = session.get("csrf")
+    if not expected or not submitted:
+        return False
+    return hmac.compare_digest(str(expected).encode("utf-8"),
+                               str(submitted).encode("utf-8"))
+
+
+CSRF_MESSAGE = "页面可能已过期，请刷新后重试。"
+
+
+# ===================== 邀请码尝试限速 =====================
+#
+# 【为什么要限速】邀请码虽然很长（约 32 个字符），但如果可以无限次试，
+# 攻击者就能一直猜。限速让「猜」这件事在时间上变得不划算。
+#
+# 【为什么只数失败的尝试】成功的尝试不该把人锁在门外 ——
+# 正常用户输对一次就进去了，之后不该再受限。
+#
+# 【存在内存里意味着什么，要说清楚】
+#   · 重启进程就清零（和那把防重复的锁一样）
+#   · 多 worker 部署时各算各的
+# 所以它是「抬高尝试成本」的保险丝，不是生产级风控。
+# 真要对外提供服务，应该像每日额度那样落库（这里没做，因为本轮范围不包含它）。
+INVITE_MAX_FAILURES = 10           # 窗口内最多允许失败几次
+INVITE_WINDOW_SECONDS = 600        # 窗口长度：10 分钟
+_invite_failures = {}              # {ip: [失败时间戳, ...]}
+
+
+def _prune_invite_failures(ip, now=None):
+    """把窗口外的失败记录清掉，返回还留在窗口内的那些。"""
+    moment = now if now is not None else time.time()
+    kept = [t for t in _invite_failures.get(ip, []) if moment - t < INVITE_WINDOW_SECONDS]
+    if kept:
+        _invite_failures[ip] = kept
+    else:
+        _invite_failures.pop(ip, None)             # 空列表不留在字典里，免得越攒越多
+    return kept
+
+
+def _invite_rate_limited(ip):
+    """这个来源现在还能继续试吗？"""
+    return len(_prune_invite_failures(ip)) >= INVITE_MAX_FAILURES
+
+
+def _record_invite_failure(ip):
+    """记一次失败尝试。
+
+    【先剪枝再加】不先清掉过期的记录，窗口就变成了「从第一次失败起累计」，
+    失败十次之后即使过了一天也还是被锁着。
+    """
+    kept = _prune_invite_failures(ip)              # 先把这个来源过期的失败记录清掉
+    kept.append(time.time())                       # 再把这一次记上
+    _invite_failures[ip] = kept
+
+
+INVITE_INVALID_MESSAGE = "邀请码无效。"
+INVITE_REVOKED_MESSAGE = "这个邀请码已失效。"
+INVITE_EMPTY_MESSAGE = "请输入邀请码。"
+INVITE_RATE_MESSAGE = "尝试次数太多了，请过一会儿再试。"
+# 【为什么要有这句话】这个浏览器已经绑着一个学习档案了，不能再改用另一个人的码。
+# 说清楚「码本身没问题，是这个浏览器已经有身份了」，并且给出【真的做得到】的下一步。
+#
+# 【这段文案改过两轮，两个坑都记在这里】
+#   ❌ 第一版：「先在档案页清空当前档案」—— 那只清偏好，【不会解绑】，
+#      照着做一遍绑定还在，再输码还是被拒。
+#   ❌ 第二版：「或者做一次清空全部个人数据」—— 事实没错，但把它摆成「两条路之一」，
+#      等于【诱导用户为了换号去点一个不可撤销的删除】。换身份不需要摧毁自己的数据。
+#
+# 【现在的口径】
+#   · 先说实话：这个浏览器【不能无损换绑】—— 它已经属于某个学习者了
+#   · 想用另一张码：换一个**真的不共享 cookie** 的环境（无痕窗口 / 另一个浏览器）
+#   · 顺手堵掉「清空学习档案」这个错误猜测（它只清偏好，不解绑）
+#   · 全清只作为【另一件事】被提及，并如实写全它的代价 + 明确说不要为换号去点
+INVITE_BOUND_ELSEWHERE_MESSAGE = (
+    "这个浏览器已经绑定了一个学习档案，不能再绑另一张邀请码 —— "
+    "它也没法无损换成另一个身份。"
+    "如果你想用的是另一张邀请码，请换一个不共享 cookie 的浏览器环境"
+    "（比如无痕窗口，或者另一个浏览器）再输码。"
+    "（在档案页「清空学习档案」只清偏好，不能解除绑定。）"
+    "「清空全部个人数据」是另一回事：那是一次不可撤销的删除，"
+    "会连带删掉全部聊天记录、学习者身份和会话绑定，并作废已有邀请码 —— "
+    "不要为了换一个身份去点它。"
+)
+
+
+# ===================== 档案相关的读操作 =====================
+
+def _learner_id_for(sid):
+    """当前会话绑定的学习者编号；没有绑定返回 None（= 匿名访客）。"""
+    conn = _connect()
+    try:
+        return profile_store.learner_id_for_session(conn, sid)
+    finally:
+        conn.close()
+
+
+def _preferences_for_prompt(learner_id):
+    """取「要拼进提示词的那份偏好」。返回 None 表示【这次不带档案这段】。
+
+    【三种情况，行为故意不一样】
+      · 匿名访客（learner_id 是 None）→ 返回 None
+        提示词里【完全不会】多出「学习者档案」那一段 —— 对他而言，
+        行为和加这个功能之前一模一样，一个字符都没变。
+      · 绑定了但还没填档案 → 给一套默认值
+        他已经在用档案功能了，总得有个「按什么方式回答」的起点。
+      · 填过 → 用他填的
+
+    【和档案页显示用的那份不是一回事】
+    档案页要能说「你还没设置过」，所以那边用的是 profile_store.get_preferences()
+    的原样返回（没填过是 None）。这里要的是「给模型的输入」，
+    所以匿名 → None（不带这一段），已绑定未填 → 默认值。
+    """
+    if learner_id is None:
+        return None                                   # 匿名访客：不带档案
+
+    conn = _connect()
+    try:
+        stored = profile_store.get_preferences(conn, learner_id)
+    finally:
+        conn.close()
+    return dict(stored) if stored else dict(profile_store.DEFAULT_PREFERENCES)
 
 
 # ===================== 健康检查 =====================
@@ -514,7 +799,7 @@ def health():
       · 不返回数据库路径、异常原文等内部信息 —— 这个地址是公开的
     """
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=5)
+        conn = _connect(timeout=5)
         try:
             conn.execute("SELECT 1").fetchone()        # 真的查一下，证明数据库可访问
         finally:
@@ -547,6 +832,7 @@ def request_too_large(_error):
 @app.route("/", methods=["GET", "POST"])              # 绑定到网站根地址 "/"，允许 GET 和 POST
 def index():                                          # 用户每次打开页面或点发送都会执行它
     sid = _ensure_session_id()
+    learner_id = _learner_id_for(sid)                 # 这个浏览器有没有绑定学习档案（None = 匿名）
 
     question = ""                                     # 学生这次问的话
     error = ""                                        # 要显示给用户的错误提示
@@ -611,6 +897,15 @@ def index():                                          # 用户每次打开页面
                     log_event("history_load_failed", error_type=type(exc).__name__)
                     recent_messages = []
 
+                # ---------- 取这位学习者的【学习档案】（没档案就用默认的一套） ----------
+                # 和上下文一样，读失败不能让整个提问失败：档案只是「怎么说」的偏好，
+                # 读不到就按默认方式回答，用户照样得到答案。异常只记类型。
+                try:
+                    preferences = _preferences_for_prompt(learner_id)
+                except Exception as exc:
+                    log_event("preferences_load_failed", error_type=type(exc).__name__)
+                    preferences = None            # 读不到就当没有档案，绝不猜用户填了什么
+
                 # ---------- 第三步：占一次额度 ----------
                 # 【为什么现在是无条件占】
                 # 以前是「没检索到资料就不调模型、不占额度」。
@@ -637,13 +932,16 @@ def index():                                          # 用户每次打开页面
                 # 【额度什么时候算掉】只要走进了这一步，就已经占过一次了。
                 # 哪怕模型调用失败、哪怕 rag 内部降级，这一次【照样计入】——
                 # 因为它已经真实地发出去过一次外部请求，风险已经产生了。
-                # 【为什么用带诊断的那个入口】
-                # 日志里原来只有最终的 decision，看不出这个结论是模型主动给的，
-                # 还是某一关校验没过、被安全降级下来的 —— 两者排查方向完全相反。
-                # diagnostic_code 是一个【不含任何内容的固定短枚举】，
-                # 只写日志，【绝不】进页面、也不进数据库（result 仍然只有三个键）。
-                result, diagnostic_code = rag.generate_answer_with_context_and_diagnostics(
-                    question, chunks, recent_messages, client, MODEL)
+                # 【为什么用带档案 + 带诊断的那个入口】
+                # 档案：让模型按这位学习者的水平、长度、语言偏好来回答。
+                #      没有档案时会传入一套默认值（见 _preferences_for_prompt），
+                #      所以匿名访客照常能用，行为和不带档案时完全一致。
+                # 诊断：日志里原来只有最终的 decision，看不出这个结论是模型主动给的，
+                #      还是某一关校验没过、被安全降级下来的 —— 两者排查方向完全相反。
+                #      diagnostic_code 是【不含任何内容的固定短枚举】，只写日志，
+                #      【绝不】进页面、也不进数据库（result 仍然只有三个键）。
+                result, diagnostic_code = rag.generate_answer_with_context_and_profile(
+                    question, chunks, recent_messages, preferences, client, MODEL)
 
                 # ---------- 第五步：格式化 + 存库 ----------
                 # 只有真的回答了，才会在后面附上「资料来源」；
@@ -692,6 +990,272 @@ def index():                                          # 用户每次打开页面
 
     # 渲染页面。历史每次都从数据库读，所以重启程序也不会丢。
     return _render(sid, question=question, error=error)
+
+
+# ===================== 邀请码入口 =====================
+#
+# 【整个流程】用户拿到一个邀请码 → 在这里输进来 → 换到一个 learner_id →
+# 这个浏览器的 session 就绑在他身上了 → 之后他填的档案、问的话都记在这个 id 下。
+#
+# 【为什么码走 POST 而不是放在 URL 里】
+# URL 会被浏览器历史、代理日志、服务器访问日志记下来。
+# 邀请码等于访问某个用户全部学习数据的凭证，绝不能出现在 URL 里。
+
+@app.route("/invite", methods=["GET", "POST"])
+def invite():
+    sid = _ensure_session_id()
+
+    if request.method == "GET":
+        return _render_invite(sid)
+
+    # ---------- 第一道关：CSRF ----------
+    if not _csrf_ok(request.form.get("csrf_token")):
+        log_event("csrf_rejected", stage="invite")
+        return _render_invite(sid, error=CSRF_MESSAGE)
+
+    # ---------- 第二道关：限速（防暴力枚举） ----------
+    ip = request.remote_addr or "unknown"
+    if _invite_rate_limited(ip):
+        log_event("invite_rate_limited", limit=INVITE_MAX_FAILURES)
+        return _render_invite(sid, error=INVITE_RATE_MESSAGE)
+
+    code = (request.form.get("invite_code") or "").strip()
+    if not code:
+        return _render_invite(sid, error=INVITE_EMPTY_MESSAGE)
+
+    # ---------- 第三道关：兑换 + 绑定（同一事务，要么都成要么都不做） ----------
+    # 【为什么不再分两步调用】旧写法是 redeem_invite() 先提交、再 link_session()。
+    # 第二步可能失败（比如这个浏览器已经绑着别人了），而第一步已经落库 ——
+    # 结果是：码被白白消耗、建出一个谁都进不去的孤儿学习者、网页还报「成功」。
+    # 现在交给 redeem_and_bind：绑定失败就整体回滚，码仍然可用。
+    conn = _connect()
+    try:
+        outcome, learner_id = profile_store.redeem_and_bind(
+            conn, code, INVITE_CODE_PEPPER, sid)
+    finally:
+        conn.close()
+
+    if outcome in (profile_store.REDEEM_INVALID, profile_store.REDEEM_REVOKED,
+                   profile_store.REDEEM_BIND_REFUSED):
+        _record_invite_failure(ip)
+        # 【日志里绝不能出现邀请码，摘要也不行】只记「失败」和是哪一类失败。
+        log_event("invite_rejected", stage=outcome)
+        if outcome == profile_store.REDEEM_INVALID:
+            return _render_invite(sid, error=INVITE_INVALID_MESSAGE)
+        if outcome == profile_store.REDEEM_REVOKED:
+            return _render_invite(sid, error=INVITE_REVOKED_MESSAGE)
+        return _render_invite(sid, error=INVITE_BOUND_ELSEWHERE_MESSAGE)
+
+    # 【只有真的绑上了才记「接受」】上面那条分支里的兑换已经被回滚，码没有消耗。
+    log_event("invite_accepted", stage=outcome)
+    return redirect(url_for("index"))                 # PRG：避免刷新时重复提交邀请码
+
+
+def _render_invite(sid, error="", status=200):
+    """渲染邀请码输入页。"""
+    return render_template("invite.html", error=error,
+                           csrf_token=_csrf_token()), status
+
+
+# ===================== 学习档案页 =====================
+
+def _form_choice(form, name):
+    """从表单里取一个可选项。空字符串 → None（= 用户没选）。
+
+    【为什么不在这里校验白名单】非法值要原样交给存储层，
+    让它拒绝并返回 False —— 那样用户会看到一句「选项不合法」，
+    而不是被悄悄改成默认值还以为设置成功了。
+    """
+    value = (form.get(name) or "").strip()
+    return value or None
+
+
+@app.route("/profile", methods=["GET", "POST"])
+def profile():
+    sid = _ensure_session_id()
+    learner_id = _learner_id_for(sid)
+
+    # 【第一道门：没绑定学习档案的人，档案页不对他开放】
+    # 档案属于某个学习者，匿名访客没有可看的东西 —— 直接引导去输邀请码。
+    if learner_id is None:
+        log_event("profile_denied", stage="anonymous")
+        return redirect(url_for("invite"))
+
+    if request.method == "GET":
+        return _render_profile(sid, learner_id)
+
+    # 【第二道门：CSRF】改档案是「会修改数据的操作」，必须带 token
+    if not _csrf_ok(request.form.get("csrf_token")):
+        log_event("csrf_rejected", stage="profile")
+        return _render_profile(sid, learner_id, error=CSRF_MESSAGE)
+
+    conn = _connect()
+    try:
+        saved = profile_store.save_preferences(
+            conn, learner_id,
+            level_code=_form_choice(request.form, "level_code"),
+            # 「不确定」是个单独的勾选项。用户没确认过水平时，模型那边会被提醒别太当真
+            level_uncertain=(request.form.get("level_uncertain") == "1"),
+            language_mode=_form_choice(request.form, "language_mode"),
+            length_mode=_form_choice(request.form, "length_mode"),
+            goal_code=_form_choice(request.form, "goal_code"),
+            focus_code=_form_choice(request.form, "focus_code"),
+        )
+    finally:
+        conn.close()
+
+    if not saved:
+        log_event("profile_rejected", stage="invalid")
+        return _render_profile(sid, learner_id, error=PROFILE_INVALID_MESSAGE)
+
+    log_event("profile_saved")                        # 只记「存了」，不记存了什么
+    return redirect(url_for("profile"))               # PRG：F5 不会重复提交
+
+
+PROFILE_INVALID_MESSAGE = "选项不合法，档案没有保存，请重新选择。"
+CLEAR_CONFIRM_MESSAGE = "请先勾选上面的确认框，再点清空。"
+
+
+@app.route("/profile/clear", methods=["POST"])
+def profile_clear():
+    """清空【这位学习者自己】的偏好。
+
+    【它清什么、不清什么，见 profile_store.clear_preferences 的说明】
+    简单说：只清偏好那五个选项；不动学习者身份、不动邀请码、不动聊天记录。
+    所以清完之后他还能用同一张码继续用，只是从「未设置」重新开始。
+    """
+    sid = _ensure_session_id()
+    learner_id = _learner_id_for(sid)
+
+    # 【第一道门：没有绑定的人不能清】和档案页一样
+    if learner_id is None:
+        log_event("profile_denied", stage="anonymous")
+        return redirect(url_for("invite"))
+
+    # 【第二道门：CSRF】清空是「会修改数据的操作」，而且不可撤销，必须有 token
+    if not _csrf_ok(request.form.get("csrf_token")):
+        log_event("csrf_rejected", stage="profile_clear")
+        return _render_profile(sid, learner_id, error=CSRF_MESSAGE)
+
+    # 【第三道门：二次确认】必须显式勾选。
+    # 前端还有一个 confirm() 弹窗，但那只是体验；真正说了算的是这一行 ——
+    # 前端可以被绕过（禁用 JS、直接发请求），服务端这一关不能。
+    if request.form.get("confirm") != "yes":
+        log_event("profile_clear_rejected", stage="no-confirm")
+        return _render_profile(sid, learner_id, error=CLEAR_CONFIRM_MESSAGE)
+
+    conn = _connect()
+    try:
+        profile_store.clear_preferences(conn, learner_id)
+    finally:
+        conn.close()
+
+    # 【日志只记「清过了」】不记清掉了哪几项、更不记清之前的值
+    log_event("profile_cleared")
+    return redirect(url_for("profile"))               # PRG：F5 不会重复提交
+
+
+DELETE_CONFIRM_MESSAGE = "请先勾选上面的确认框，再点删除。"
+DELETE_BUSY_MESSAGE = "有提问正在处理中，请等它结束之后再删除。"
+
+# 等那把锁最多等多久（秒）。
+# 【为什么要等，而不是直接拒绝】删除是不可逆的，用户是认真按下的；
+# 「正在回答另一个问题，稍后再试」会让人以为没成功、反复按。
+# 等它做完再删更符合直觉：反正那次提问写进去的消息，紧接着也会被删掉。
+# 上限是为了不出「一直转圈」：模型调用本身有超时，正常几秒内就会释放。
+DELETE_LOCK_TIMEOUT = 10
+
+
+@app.route("/profile/delete", methods=["POST"])
+def profile_delete():
+    """清空这位学习者在本系统里的全部个人数据。**不可撤销。**
+
+    【四道关，一道都不能少】
+      ① 必须是已绑定的学习者（匿名访客没有东西可删，也不该能触发删除）
+      ② CSRF token 必须对（删除请求不能是别的网站伪造出来的）
+      ③ 必须收到用户【真的勾选】提交上来的 confirm=yes
+      ④ 必须拿到那把处理提问的锁 —— 见下面那段
+    """
+    sid = _ensure_session_id()
+    learner_id = _learner_id_for(sid)
+
+    if learner_id is None:
+        log_event("profile_denied", stage="anonymous")
+        return redirect(url_for("invite"))
+
+    if not _csrf_ok(request.form.get("csrf_token")):
+        log_event("csrf_rejected", stage="profile_delete")
+        return _render_profile(sid, learner_id, error=CSRF_MESSAGE)
+
+    # 【为什么必须是表单里真的带上来的值】页面上这个 confirm 由复选框自己提交：
+    # 没勾选时浏览器根本不会带上这个字段。所以这里收到的 yes，就是用户真的勾了。
+    if request.form.get("confirm") != "yes":
+        log_event("profile_delete_rejected", stage="no-confirm")
+        return _render_profile(sid, learner_id, error=DELETE_CONFIRM_MESSAGE)
+
+    # 【必须和提问共用同一把锁 —— 这是防「删完又冒出来」的关键】
+    # 一个提问的处理过程是：检索 → 调模型 → 格式化 → 写库。
+    # 如果不加这道锁，就可能出现：这边正在调模型，那边把数据全删了，
+    # 然后模型返回、那个请求把消息【又写回数据库】—— 用户以为删干净了，其实没有。
+    # 提问路径从头到尾都持有这把锁（写在 finally 里释放），所以：
+    #   · 删除会等正在进行的提问彻底结束（连同它的写库）才开始
+    #   · 删除期间的新提问拿不到锁，会被挡成「上一个问题还在处理中」
+    # 等到删除提交时，不可能再有旧请求往回写。
+    if not _lock.acquire(timeout=DELETE_LOCK_TIMEOUT):
+        log_event("profile_delete_blocked", stage="busy")
+        return _render_profile(sid, learner_id, error=DELETE_BUSY_MESSAGE)
+
+    try:
+        conn = _connect()
+        try:
+            stats = profile_store.clear_all_data(conn, learner_id)
+        finally:
+            conn.close()
+    except Exception as exc:
+        # 事务里任何一步失败都会整体回滚，所以这里什么都不用修补。
+        # 只记异常类型 —— 原文可能带路径等信息。
+        log_event("profile_delete_failed", error_type=type(exc).__name__)
+        return _render_profile(sid, learner_id, error=SAFE_ERROR_MESSAGE)
+    finally:
+        _lock.release()
+
+    # 【只记数量，不记内容】删掉了多少条记录属于统计量；聊了什么都不记。
+    log_event("profile_deleted",
+              deleted_sessions=stats["sessions"],
+              deleted_messages=stats["messages"])
+
+    # 这个浏览器现在已经不是那位学习者了（绑定被删），回首页就是匿名状态。
+    return redirect(url_for("index"))
+
+
+def _render_profile(sid, learner_id, error="", status=200):
+    """渲染档案页。
+
+    【传两份东西给模板】
+      · stored —— 数据库里【真正存着】的偏好；None 表示用户还没设置过
+      · current —— 表单要预选的那份；没设置过就先用默认值填上
+    这样页面既能如实说「你还没设置过」，又能让表单有个合理的起点。
+    """
+    conn = _connect()
+    try:
+        stored = profile_store.get_preferences(conn, learner_id)
+    finally:
+        conn.close()
+
+    return render_template(
+        "profile.html",
+        preferences=stored,                            # None = 还没设置过
+        current=stored or dict(profile_store.DEFAULT_PREFERENCES),
+        is_set=stored is not None,
+        learner_id=learner_id,
+        error=error,
+        csrf_token=_csrf_token(),
+        level_options=profile_store.LEVEL_OPTIONS,
+        language_options=profile_store.LANGUAGE_OPTIONS,
+        length_options=profile_store.LENGTH_OPTIONS,
+        goal_options=profile_store.GOAL_OPTIONS,
+        focus_options=profile_store.FOCUS_OPTIONS,
+    ), status
 
 
 if __name__ == "__main__":

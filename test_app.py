@@ -48,6 +48,7 @@ atexit.register(shutil.rmtree, _IMPORT_TMPDIR, ignore_errors=True)      # 程序
 os.environ["CHAT_DB_PATH"] = os.path.join(_IMPORT_TMPDIR, "import_time.db")   # 导入时的建表动作也走临时文件
 os.environ["DEEPSEEK_API_KEY"] = "test-key-not-a-real-key"                    # 假的密钥，绝不可能调通真实服务
 os.environ["FLASK_SECRET_KEY"] = "test-secret-not-a-real-key"                 # 假的 cookie 签名密钥
+os.environ["INVITE_CODE_PEPPER"] = "test-pepper-not-a-real-pepper"            # 假的 invitation pepper，只用于测试
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # 保证能找到同文件夹下的 app.py
 import app as tutor                                             # 导入被测对象
@@ -181,6 +182,144 @@ class ChatTestCase(unittest.TestCase):
     def ask(self, client, question="随便问一句"):
         """模拟一次完整的提问，返回响应对象。"""
         return client.post("/", data={"question": question})
+
+    # ---------- 学习档案相关的小工具 ----------
+
+    def make_invite(self, code="test-invite-code", status=None):
+        """登记一张邀请码（走产品代码里的 create_invite，不自己拼 SQL）。"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            self.assertTrue(tutor.profile_store.create_invite(
+                conn, code, tutor.INVITE_CODE_PEPPER))
+            if status is not None and status != tutor.profile_store.INVITE_ACTIVE:
+                with conn:
+                    conn.execute("UPDATE invites SET status = ?", (status,))
+        finally:
+            conn.close()
+
+    def csrf_token(self, client, path="/invite"):
+        """从页面里把 CSRF token 抠出来（模拟浏览器随表单一起提交）。
+
+        【为什么要从页面里抠，而不是直接读 session】
+        读 session 能绕过「页面到底有没有真的把它渲染出来」这件事。
+        从 HTML 里抠，顺带证明了模板里确实带上了这个隐藏字段。
+        """
+        html = client.get(path).get_data(as_text=True)
+        marker = 'name="csrf_token" value="'
+        start = html.index(marker) + len(marker)
+        return html[start:html.index('"', start)]
+
+    def enter_invite(self, client, code):
+        """走一遍「输邀请码」的完整流程。"""
+        return client.post("/invite", data={
+            "invite_code": code,
+            "csrf_token": self.csrf_token(client, "/invite"),
+        })
+
+    def save_profile(self, client, **fields):
+        """提交档案表单。没指定的字段用一组合法的默认值。"""
+        data = {
+            "csrf_token": self.csrf_token(client, "/profile"),
+            "level_code": "b1",
+            "language_mode": "zh_pair",
+            "length_mode": "normal",
+        }
+        data.update(fields)
+        return client.post("/profile", data=data)
+
+    def learner_id_of(self, client):
+        """查出这个测试浏览器【当前有效】地属于哪个 learner（从数据库反查）。
+
+        【为什么必须带 revoked_at IS NULL】这和 app.py 的 _learner_id_for 是同一条规则：
+        作废之后绑定那一行还在（关联要留着），但访问权已经没了。
+        少了这个条件，「作废后设备失去访问权」的测试就会误报通过。
+        """
+        sid = self.session_id_of(client)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT learner_id FROM learner_sessions "
+                "WHERE session_id = ? AND revoked_at IS NULL", (sid,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return row[0] if row else None
+
+    def session_row(self, client):
+        """把这个浏览器的会话绑定行原样取出来：(learner_id, revoked_at)。
+
+        【和 learner_id_of 的区别】那个回答「现在归谁」，这个回答「库里那一行长什么样」——
+        测「作废只打标记、不删行」时需要看原始状态。
+        """
+        sid = self.session_id_of(client)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute(
+                "SELECT learner_id, revoked_at FROM learner_sessions WHERE session_id = ?",
+                (sid,)
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def messages_for_session(self, client):
+        """这个浏览器【当前】会话的聊天记录条数（直接查库，不经过页面）。"""
+        return self.messages_for_session_id(self.session_id_of(client))
+
+    def messages_for_session_id(self, sid):
+        """指定 session_id 的聊天记录条数。
+
+        【为什么要单独一个】会话轮换之后，浏览器手里的 id 和旧数据的 id 不一样了 ——
+        要验证「旧数据还在库里」，就得能按【旧的】id 去查。
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE session_id = ?", (sid,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+    def table_count(self, table):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
+        finally:
+            conn.close()
+
+    def profile_row(self, learner_id):
+        """直接查库，看档案到底存了什么。"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute(
+                "SELECT level_code, level_uncertain, language_mode, length_mode, "
+                "goal_code, focus_code FROM learner_preferences WHERE learner_id = ?",
+                (learner_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+
+    def connect(self):
+        """开一个到测试库的连接（外键打开，和 app 里一致）。"""
+        conn = sqlite3.connect(self.db_path, timeout=10)
+        conn.execute("PRAGMA foreign_keys = ON")
+        return conn
+
+    def revoke(self, code):
+        """作废一张邀请码（走产品代码，不自己拼 SQL）。"""
+        conn = self.connect()
+        try:
+            return tutor.profile_store.revoke_invite(conn, code, tutor.INVITE_CODE_PEPPER)
+        finally:
+            conn.close()
+
+    def reissue(self, learner_id):
+        """给一个学习者补发新码。"""
+        conn = self.connect()
+        try:
+            return tutor.profile_store.issue_replacement_invite(
+                conn, learner_id, tutor.INVITE_CODE_PEPPER)
+        finally:
+            conn.close()
 
     def use_empty_retrieval(self):
         """把检索换成「永远找不到资料」，用来测拒答路径。
@@ -1000,6 +1139,1676 @@ class TestContextDiagnostics(ChatTestCase):
             self.assertNotIn(marker, blob, "日志里出现了不该有的内容")
 
 
+# ===================== 5f. 邀请码进入 =====================
+#
+# 【这一组守什么】邀请码 = 访问某个学习者全部数据的凭证，和密钥同级。
+# 所以四件事必须钉死：
+#   1. 正确的码能进；错的码绝不能进（更不能「先建个号再说」）
+#   2. 码永远不出现在 URL、页面或日志里
+#   3. 尝试要限速（防暴力枚举）
+#   4. 输码这个动作要有 CSRF 保护
+
+class TestInviteEntry(ChatTestCase):
+
+    def test_correct_invite_lets_the_user_in(self):
+        """【核心】正确的邀请码 → 跳回首页，并且这个浏览器已经绑上学习者。"""
+        self.make_invite("good-code")
+        c = tutor.app.test_client()
+
+        r = self.enter_invite(c, "good-code")
+
+        self.assertEqual(r.status_code, 302)                     # PRG
+        self.assertIsNotNone(self.learner_id_of(c), "输对了码却没有绑定学习者")
+        self.assertEqual(self.table_count("learners"), 1)
+        self.assertEqual(self.table_count("learner_sessions"), 1)
+
+    def test_wrong_invite_creates_nothing(self):
+        """【核心安全断言】错误的邀请码：不建学习者、不绑会话、只给一句提示。"""
+        c = tutor.app.test_client()
+        r = self.enter_invite(c, "我瞎编的码")
+
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(tutor.INVITE_INVALID_MESSAGE, r.get_data(as_text=True))
+        self.assertEqual(self.table_count("learners"), 0, "错误的码建出了学习者")
+        self.assertEqual(self.table_count("learner_sessions"), 0)
+        self.assertIsNone(self.learner_id_of(c))
+
+    def test_revoked_invite_is_refused_with_its_own_message(self):
+        """被作废的码要给一句不同的话（用户才知道该找管理员换一个）。"""
+        self.make_invite("dead", status=tutor.profile_store.INVITE_REVOKED)
+        c = tutor.app.test_client()
+        r = self.enter_invite(c, "dead")
+
+        self.assertIn(tutor.INVITE_REVOKED_MESSAGE, r.get_data(as_text=True))
+        self.assertEqual(self.table_count("learners"), 0)
+
+    def test_the_code_never_appears_in_the_page_or_the_url(self):
+        """【核心安全断言】邀请码不进 URL，也不回显到页面上。
+
+        URL 会被浏览器历史、代理和服务器访问日志记下来。
+        """
+        code = "secret-code-4f2a"
+        self.make_invite(code)
+        c = tutor.app.test_client()
+
+        r = self.enter_invite(c, code)
+        self.assertNotIn(code, r.headers.get("Location", ""), "邀请码出现在跳转地址里")
+
+        html = c.get("/").get_data(as_text=True)
+        self.assertNotIn(code, html)
+
+        wrong = self.enter_invite(c, "另一个瞎编的码")
+        self.assertNotIn("另一个瞎编的码", wrong.get_data(as_text=True), "输入框回显了邀请码")
+
+    def test_neither_the_code_nor_its_digest_nor_the_pepper_reach_the_logs(self):
+        """【核心安全断言】明文码、摘要、pepper，一个都不许进日志。"""
+        code = "log-secret-code-7b1c"
+        self.make_invite(code)
+        c = tutor.app.test_client()
+
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            self.enter_invite(c, code)                    # 成功那条路径
+            self.enter_invite(c, "不存在的码")             # 失败那条路径
+        blob = "\n".join(captured.output)
+
+        digest = tutor.profile_store.digest_invite_code(code, tutor.INVITE_CODE_PEPPER)
+        self.assertNotIn(code, blob, "邀请码明文进了日志")
+        self.assertNotIn(digest, blob, "邀请码摘要进了日志")
+        self.assertNotIn(tutor.INVITE_CODE_PEPPER, blob, "pepper 进了日志")
+
+        # 该记的还是要记，否则「没记」和「没泄露」分不清
+        self.assertIn("invite_accepted", blob)
+        self.assertIn("invite_rejected", blob)
+
+    def test_invite_attempts_are_rate_limited(self):
+        """【核心】连续输错到上限后 → 被挡住，而且始终没有创建任何学习者。"""
+        c = tutor.app.test_client()
+
+        for i in range(tutor.INVITE_MAX_FAILURES):
+            r = self.enter_invite(c, "错的码" + str(i))
+            self.assertIn(tutor.INVITE_INVALID_MESSAGE, r.get_data(as_text=True),
+                          "第 " + str(i + 1) + " 次就不给「无效」提示了？")
+
+        blocked = self.enter_invite(c, "再试一次")
+        self.assertIn(tutor.INVITE_RATE_MESSAGE, blocked.get_data(as_text=True))
+
+        # 限速期间就算输对了也不放行 —— 否则限速形同虚设
+        self.make_invite("good-code")
+        still_blocked = self.enter_invite(c, "good-code")
+        self.assertIn(tutor.INVITE_RATE_MESSAGE, still_blocked.get_data(as_text=True))
+        self.assertEqual(self.table_count("learners"), 0)
+
+    def test_a_successful_entry_is_not_counted_as_a_failure(self):
+        """输对的人不该被自己之前的失败次数连累到「锁死」——
+        这里验证的是：成功的路径不写失败记录。"""
+        self.make_invite("good-code")
+        c = tutor.app.test_client()
+        self.enter_invite(c, "good-code")
+
+        self.assertEqual(tutor._invite_failures, {}, "成功的尝试被记成了失败")
+
+    def test_invite_requires_a_csrf_token(self):
+        """【核心】没有 token（或 token 不对）→ 拒绝，且什么也不建。"""
+        self.make_invite("good-code")
+        c = tutor.app.test_client()
+        c.get("/invite")                                   # 先建立会话，但【不】取 token
+
+        for data in ({"invite_code": "good-code"},                     # 完全没有 token
+                     {"invite_code": "good-code", "csrf_token": "伪造的"}):   # 伪造的 token
+            r = c.post("/invite", data=data)
+            with self.subTest(data=data):
+                self.assertIn(tutor.CSRF_MESSAGE, r.get_data(as_text=True))
+
+        self.assertEqual(self.table_count("learners"), 0, "CSRF 没拦住，居然建了学习者")
+
+
+# ===================== 5g. 档案页与用户隔离 =====================
+
+class TestProfilePage(ChatTestCase):
+
+    def bind(self, code="c1"):
+        """建一张邀请码，并让这个浏览器绑上去。返回测试客户端。"""
+        self.make_invite(code)
+        c = tutor.app.test_client()
+        self.enter_invite(c, code)
+        return c
+
+    # ---------- 访问控制 ----------
+
+    def test_an_anonymous_visitor_cannot_open_the_profile_page(self):
+        """【核心安全断言】没绑定学习档案的人，档案页不对他开放。"""
+        c = tutor.app.test_client()
+        r = c.get("/profile")
+
+        self.assertEqual(r.status_code, 302)
+        self.assertIn("/invite", r.headers["Location"], "应该被引导去输邀请码")
+        self.assertNotIn("我的学习档案", r.get_data(as_text=True))
+
+    def test_a_bound_user_can_open_the_profile_page(self):
+        c = self.bind()
+        r = c.get("/profile")
+
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("我的学习档案", r.get_data(as_text=True))
+
+    def test_the_page_says_so_when_nothing_is_set_yet(self):
+        """还没填过 → 页面必须如实说「你还没有设置过」，而不是假装这是用户设的。"""
+        c = self.bind()
+        html = c.get("/profile").get_data(as_text=True)
+
+        self.assertIn("还没有设置过", html)
+
+    # ---------- 填 / 改 ----------
+
+    def test_a_user_can_save_their_profile(self):
+        c = self.bind()
+        r = self.save_profile(c, level_code="b2", language_mode="en_only",
+                              length_mode="brief", goal_code="exam", focus_code="writing")
+
+        self.assertEqual(r.status_code, 302)               # PRG
+        row = self.profile_row(self.learner_id_of(c))
+        self.assertEqual(row, ("b2", 0, "en_only", "brief", "exam", "writing"))
+
+    def test_a_user_can_modify_their_profile(self):
+        """【核心】改档案是覆盖同一行，不是又插一行。"""
+        c = self.bind()
+        self.save_profile(c, level_code="a2", language_mode="zh_pair", length_mode="normal")
+        self.save_profile(c, level_code="c1", language_mode="en_advanced", length_mode="detailed")
+
+        learner = self.learner_id_of(c)
+        self.assertEqual(self.table_count("learner_preferences"), 1, "改档案时插出了第二行")
+        row = self.profile_row(learner)
+        self.assertEqual(row[0], "c1")
+        self.assertEqual(row[2], "en_advanced")
+        self.assertEqual(row[3], "detailed")
+
+        html = c.get("/profile").get_data(as_text=True)
+        self.assertIn('value="c1" selected', html, "页面没有回显改后的水平")
+
+    def test_the_uncertain_flag_is_stored(self):
+        c = self.bind()
+        self.save_profile(c, level_uncertain="1")
+        self.assertEqual(self.profile_row(self.learner_id_of(c))[1], 1)
+
+        self.save_profile(c)                               # 不勾 = 0
+        self.assertEqual(self.profile_row(self.learner_id_of(c))[1], 0)
+
+    def test_an_invalid_option_is_rejected_without_writing_anything(self):
+        """【核心安全断言】用户自己造一个选项值 → 拒绝，什么都不写。"""
+        c = self.bind()
+        r = self.save_profile(c, level_code="z9")
+
+        self.assertIn(tutor.PROFILE_INVALID_MESSAGE, r.get_data(as_text=True))
+        self.assertEqual(self.table_count("learner_preferences"), 0, "非法选项被写库了")
+
+    def test_saving_the_profile_requires_a_csrf_token(self):
+        """【核心】没有 token → 拒绝，档案一个字都没改。"""
+        c = self.bind()
+        self.save_profile(c, level_code="b2")              # 先存一版
+
+        r = c.post("/profile", data={"level_code": "c1", "language_mode": "en_only",
+                                     "length_mode": "detailed"})     # 不带 token
+
+        self.assertIn(tutor.CSRF_MESSAGE, r.get_data(as_text=True))
+        self.assertEqual(self.profile_row(self.learner_id_of(c))[0], "b2", "档案被改了")
+
+    # ---------- 用户之间严格隔离 ----------
+
+    def test_two_users_profiles_are_isolated(self):
+        """【核心安全断言】A 看不到 B 的档案，也改不了 B 的档案。"""
+        a = self.bind("code-a")
+        b = self.bind("code-b")
+
+        self.save_profile(a, level_code="a1", language_mode="zh_pair",
+                          length_mode="brief", goal_code="exam", focus_code="writing")
+        self.save_profile(b, level_code="c1", language_mode="en_advanced",
+                          length_mode="detailed", goal_code="work", focus_code="speaking")
+
+        learner_a = self.learner_id_of(a)
+        learner_b = self.learner_id_of(b)
+        self.assertNotEqual(learner_a, learner_b, "两个浏览器拿到了同一个 learner_id")
+
+        # 数据库层面：各写各的行
+        self.assertEqual(self.profile_row(learner_a),
+                         ("a1", 0, "zh_pair", "brief", "exam", "writing"))
+        self.assertEqual(self.profile_row(learner_b),
+                         ("c1", 0, "en_advanced", "detailed", "work", "speaking"))
+
+        # 页面层面：A 的档案页里不能出现 B 的选择
+        html_a = a.get("/profile").get_data(as_text=True)
+        self.assertIn('value="a1" selected', html_a)
+        self.assertNotIn('value="c1" selected', html_a, "A 的页面里出现了 B 的水平")
+        self.assertNotIn('value="en_advanced" selected', html_a, "A 的页面里出现了 B 的语言偏好")
+
+        html_b = b.get("/profile").get_data(as_text=True)
+        self.assertIn('value="c1" selected', html_b)
+        self.assertNotIn('value="a1" selected', html_b)
+
+    def test_a_cannot_touch_bs_profile_even_with_the_right_csrf_token(self):
+        """【核心安全断言】CSRF token 只能证明「这个表单是我自己提交的」，
+        **绝不能**证明「我有权改这个 learner」。
+
+        这里的机制是：路由压根不接受「改哪个 learner」这个参数 ——
+        learner_id 只从服务端会话反查。所以 A 拿着自己的合法 token，
+        也只能改到自己那一行。
+        """
+        a = self.bind("code-a")
+        b = self.bind("code-b")
+        self.save_profile(b, level_code="c1", language_mode="en_only", length_mode="detailed")
+
+        # A 用【自己的】合法 token 提交，并试图在表单里塞一个 learner_id
+        a.post("/profile", data={
+            "csrf_token": self.csrf_token(a, "/profile"),
+            "learner_id": str(self.learner_id_of(b)),      # 试图指向 B
+            "level_code": "a1", "language_mode": "zh_pair", "length_mode": "brief",
+        })
+
+        self.assertEqual(self.profile_row(self.learner_id_of(b)),
+                         ("c1", 0, "en_only", "detailed", None, None),
+                         "B 的档案被 A 改掉了")
+
+    def test_an_invite_holder_cannot_take_over_an_existing_session(self):
+        """【核心安全断言】已经绑过 A 的浏览器，再输一次 B 的邀请码也不能改绑。
+
+        否则 B 只要拿到自己的邀请码，就能把 A 的浏览器会话抢过来。
+        """
+        self.make_invite("code-a")
+        self.make_invite("code-b")
+        c = tutor.app.test_client()
+        self.enter_invite(c, "code-a")
+        learner_a = self.learner_id_of(c)
+
+        self.enter_invite(c, "code-b")                     # 同一个浏览器再输一张码
+
+        self.assertEqual(self.learner_id_of(c), learner_a, "会话被改绑到另一个学习者了")
+        self.assertEqual(self.table_count("learner_sessions"), 1)
+
+    # ---------- 重启后仍在 ----------
+
+    def test_the_profile_survives_an_app_restart(self):
+        """【核心】重启应用后，同一个 cookie 仍能读到自己的档案。"""
+        global tutor
+        c = self.bind("code-a")
+        self.save_profile(c, level_code="b2", language_mode="en_advanced",
+                          length_mode="brief", goal_code="work", focus_code="listening")
+        cookie = c.get_cookie("session")
+        self.assertIsNotNone(cookie)
+
+        # ---- 模拟重启 ----
+        tutor = importlib.reload(tutor)
+        tutor.client = FakeClient()
+        tutor.retriever.retrieve = fake_retrieve
+
+        c2 = tutor.app.test_client()
+        c2.set_cookie("session", cookie.value)             # 同一个浏览器
+
+        html = c2.get("/profile").get_data(as_text=True)
+        self.assertIn('value="b2" selected', html)
+        self.assertIn('value="en_advanced" selected', html)
+        self.assertIn('value="brief" selected', html)
+        self.assertIn('value="listening" selected', html)
+        self.assertIn("你设置过档案", html)
+
+
+# ===================== 5h. 档案真的进了提示词 =====================
+
+class TestProfileReachesTheModel(ChatTestCase):
+
+    def prompt_text(self, index=-1):
+        """取出发给模型的 user 消息正文。"""
+        return self.fake.calls[index]["messages"][1]["content"]
+
+    def bind(self, code="c1"):
+        self.make_invite(code)
+        c = tutor.app.test_client()
+        self.enter_invite(c, code)
+        return c
+
+    def test_the_profile_is_sent_to_the_model(self):
+        """【核心】档案里的每一项，都要能在发给模型的内容里找到对应的说法。"""
+        c = self.bind()
+        self.save_profile(c, level_code="c1", language_mode="en_advanced",
+                          length_mode="brief", goal_code="work", focus_code="speaking")
+
+        self.ask(c, "帮我改一下这句话")
+
+        sent = self.prompt_text()
+        self.assertIn("学习者档案", sent)
+        self.assertIn("C1（高级）", sent)
+        self.assertIn("全英文 + 高级表达", sent)
+        self.assertIn("精简", sent)
+        self.assertIn("工作 / 商务", sent)
+        self.assertIn("口语", sent)
+
+    def test_the_uncertain_level_is_flagged_to_the_model(self):
+        """用户勾了「不确定」→ 提示词里要提醒模型「这个水平很可能不准」。"""
+        c = self.bind()
+        self.save_profile(c, level_code="c1", level_uncertain="1")
+        self.ask(c, "随便问一句")
+
+        self.assertIn("很可能不准", self.prompt_text())
+
+    def test_an_anonymous_visitor_gets_no_profile_block_at_all(self):
+        """【核心】匿名访客的提示词里【不该】出现档案那一段 ——
+        他的体验和加这个功能之前完全一样。"""
+        c = tutor.app.test_client()
+        self.ask(c, "随便问一句")
+
+        sent = self.prompt_text()
+        self.assertNotIn("学习者档案", sent)
+        self.assertIn("随便问一句", sent)
+
+    def test_an_anonymous_visitor_still_gets_answers(self):
+        """【核心】没有档案照样能正常回答：302、存库、照样检索、照样调模型。"""
+        c = tutor.app.test_client()
+        r = self.ask(c, "现在完成时的句子结构是怎样的？")
+
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(len(self.all_rows()), 2)
+        self.assertEqual(len(RETRIEVAL_CALLS), 1)
+        self.assertEqual(len(self.fake.calls), 1)
+
+    def test_a_user_without_a_saved_profile_gets_the_defaults(self):
+        """绑定了但还没填 → 用默认值回答（不能报错，也不能空着不谈）。"""
+        c = self.bind()
+        r = self.ask(c, "随便问一句")
+
+        self.assertEqual(r.status_code, 302)
+        self.assertIn("学习者档案", self.prompt_text())
+        self.assertIn("中英对照", self.prompt_text())      # 默认语言模式
+
+    def test_the_profile_cannot_become_a_citation_source(self):
+        """【核心安全断言】档案**不是资料**。
+
+        模型如果顺着档案里提到的来源去引用，仍然会被白名单拦下 ——
+        白名单只从本次检索到的片段建。
+        """
+        c = self.bind()
+        self.save_profile(c, focus_code="writing")
+
+        # 本次检索什么都没捞到（白名单是空的），模型却引用了一个来源
+        self.use_empty_retrieval()
+        self.fake.reply = rag_reply(answer="顺手引一个。", citations=[
+            {"source": "grammar_present_perfect.md", "heading": "基本结构"}])
+        self.ask(c, "帮我改一下这句话")
+
+        rows = self.all_rows()
+        self.assertEqual(rows[1][2], tutor.rag.INSUFFICIENT_TEXT)
+        self.assertNotIn("资料来源", rows[1][2])
+
+    def test_profile_values_never_leak_into_the_logs(self):
+        """档案的内容也不该进日志 —— 日志只记统计量。"""
+        c = self.bind()
+        self.save_profile(c, goal_code="exam", focus_code="vocabulary")
+
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            self.ask(c, "随便问一句")
+        blob = "\n".join(captured.output)
+
+        self.assertIn("diagnostic_code=", blob)            # 该记的还在
+        self.assertNotIn("考试 / 升学", blob)                # 档案的中文说法不该出现
+        self.assertNotIn("vocabulary", blob)
+
+    def test_only_one_model_call_with_profile_and_context(self):
+        """档案 + 上下文一起带上时，依然是一次提问 = 一次模型调用。"""
+        c = self.bind()
+        self.save_profile(c, level_code="b2")
+        self.ask(c, "第一轮的问题")
+        self.ask(c, "再给一个例子")
+
+        self.assertEqual(len(self.fake.calls), 2)
+        sent = self.prompt_text()
+        self.assertIn("学习者档案", sent)
+        self.assertIn("最近上下文", sent)
+
+
+# ===================== 5i. 清空学习档案（只清偏好）=====================
+#
+# 【它和「清空全部个人数据」不是一回事】只清那五项偏好。
+# 学习身份、邀请码、聊天记录、会话绑定都不动 —— 清完还能用同一张码继续用。
+
+class TestClearProfile(ChatTestCase):
+
+    def bind_with_profile(self, code="c1"):
+        """建码 → 绑定 → 存一份偏好，返回测试客户端。"""
+        self.make_invite(code)
+        c = tutor.app.test_client()
+        self.enter_invite(c, code)
+        self.save_profile(c, level_code="c1", language_mode="en_advanced",
+                          length_mode="brief", goal_code="work", focus_code="speaking")
+        return c
+
+    def clear(self, client, confirm="yes", csrf=None):
+        """提交清空表单。默认带齐 token 和确认勾选。"""
+        if csrf is None:
+            csrf = self.csrf_token(client, "/profile")
+        data = {"csrf_token": csrf}
+        if confirm is not None:
+            data["confirm"] = confirm
+        return client.post("/profile/clear", data=data)
+
+    # ---------- 正常路径 ----------
+
+    def test_a_user_can_clear_their_own_profile(self):
+        """【核心】清空之后：偏好没了，身份和邀请码还在。"""
+        c = self.bind_with_profile()
+        learner = self.learner_id_of(c)
+
+        r = self.clear(c)
+
+        self.assertEqual(r.status_code, 302)               # PRG
+        self.assertIsNone(self.profile_row(learner), "偏好没清掉")
+        self.assertEqual(self.table_count("learners"), 1, "学习者被删了")
+        self.assertEqual(self.table_count("invites"), 1, "邀请码被牵连了")
+        self.assertEqual(self.table_count("learner_sessions"), 1, "会话绑定被牵连了")
+        self.assertIsNotNone(self.learner_id_of(c), "清空之后自己反而进不去了")
+
+    def test_the_page_says_not_set_after_clearing(self):
+        """清完之后页面必须回到「还没有设置过」。"""
+        c = self.bind_with_profile()
+        self.assertIn("你设置过档案", c.get("/profile").get_data(as_text=True))
+
+        self.clear(c)
+
+        html = c.get("/profile").get_data(as_text=True)
+        self.assertIn("还没有设置过", html)
+        self.assertNotIn("你设置过档案", html)
+
+    def test_the_next_answer_uses_the_defaults_not_the_old_profile(self):
+        """【核心】清空之后，模型【绝不能】再收到旧偏好。"""
+        c = self.bind_with_profile()
+        self.clear(c)
+
+        self.ask(c, "帮我改一下这句话")
+
+        sent = self.fake.calls[-1]["messages"][1]["content"]
+        self.assertIn("中英对照", sent, "没有退回默认的语言偏好")
+        self.assertNotIn("en_advanced", sent)
+        self.assertNotIn("全英文 + 高级表达", sent, "旧偏好还在提示词里")
+        self.assertNotIn("工作 / 商务", sent, "旧的学习目标还在提示词里")
+        self.assertNotIn("口语", sent, "旧的重点方向还在提示词里")
+
+    def test_the_user_can_save_a_profile_again_after_clearing(self):
+        c = self.bind_with_profile()
+        self.clear(c)
+
+        self.save_profile(c, level_code="a2", language_mode="zh_pair", length_mode="detailed")
+
+        row = self.profile_row(self.learner_id_of(c))
+        self.assertEqual(row[:4], ("a2", 0, "zh_pair", "detailed"))
+        self.assertIsNone(row[4], "旧的目标残留了")
+        self.assertIsNone(row[5], "旧的重点方向残留了")
+
+    # ---------- 表单结构：确认必须由用户真的勾出来 ----------
+
+    def test_the_checkbox_itself_carries_the_confirm_field(self):
+        """【核心】confirm 必须挂在复选框上，不能是一个隐藏字段。
+
+        隐藏字段的坑：`<input type="hidden" name="confirm" value="yes">` 会让浏览器
+        **不管用户勾没勾都自动提交 confirm=yes** ——
+        服务端那一关就永远通过，复选框只剩视觉效果，等于没有二次确认。
+        """
+        c = self.bind_with_profile()
+        html = c.get("/profile").get_data(as_text=True)
+
+        self.assertNotIn('type="hidden" name="confirm"', html,
+                         "又出现了隐藏的 confirm 字段 —— 二次确认会被绕过")
+        self.assertIn('name="confirm" value="yes"', html, "复选框没有带上 confirm 字段")
+
+    def test_not_checking_the_box_is_really_submitted_as_absent(self):
+        """模拟一次真实的浏览器提交：没勾复选框 → 表单里压根没有 confirm 这个键。
+
+        上面的结构测试证明「字段挂在复选框上」；这条证明**服务端确实会因此拒绝**。
+        """
+        c = self.bind_with_profile()
+        learner = self.learner_id_of(c)
+
+        # 浏览器在复选框未勾选时，不会提交这个字段 —— 只带 csrf_token
+        r = c.post("/profile/clear",
+                   data={"csrf_token": self.csrf_token(c, "/profile")})
+
+        self.assertIn(tutor.CLEAR_CONFIRM_MESSAGE, r.get_data(as_text=True))
+        self.assertIsNotNone(self.profile_row(learner), "没勾确认也把档案清了")
+
+    def test_checking_the_box_with_a_valid_token_clears_it(self):
+        """勾了 + CSRF 有效 → 清空成功（正向路径，和上面那条配成一对）。"""
+        c = self.bind_with_profile()
+        learner = self.learner_id_of(c)
+
+        r = c.post("/profile/clear", data={
+            "csrf_token": self.csrf_token(c, "/profile"),
+            "confirm": "yes",                       # 复选框勾上时浏览器会带上这个
+        })
+
+        self.assertEqual(r.status_code, 302)
+        self.assertIsNone(self.profile_row(learner))
+
+    # ---------- 两道闸门 ----------
+
+    def test_clearing_needs_the_confirmation_checkbox(self):
+        """【核心】没有勾确认 → 拒绝，档案一个字都没动。"""
+        c = self.bind_with_profile()
+        learner = self.learner_id_of(c)
+
+        r = self.clear(c, confirm=None)
+
+        self.assertIn(tutor.CLEAR_CONFIRM_MESSAGE, r.get_data(as_text=True))
+        self.assertIsNotNone(self.profile_row(learner), "没勾确认也把档案清了")
+
+    def test_a_forged_confirmation_value_is_not_enough_without_csrf(self):
+        """confirm=yes 谁都能写，真正管用的是 CSRF token。"""
+        c = self.bind_with_profile()
+        learner = self.learner_id_of(c)
+
+        r = c.post("/profile/clear", data={"confirm": "yes"})     # 有确认、没 token
+
+        self.assertIn(tutor.CSRF_MESSAGE, r.get_data(as_text=True))
+        self.assertIsNotNone(self.profile_row(learner), "没有 CSRF 也把档案清了")
+
+    def test_an_anonymous_visitor_cannot_clear_anything(self):
+        """没绑定的人连清空入口都到不了。"""
+        c = tutor.app.test_client()
+        c.get("/profile")                                  # 建立会话
+
+        r = c.post("/profile/clear", data={"confirm": "yes"})
+
+        self.assertEqual(r.status_code, 302)
+        self.assertIn("/invite", r.headers["Location"])
+
+    def test_a_cannot_clear_bs_profile(self):
+        """【核心隔离断言】A 清空自己的档案，B 的档案一个字都不能变。"""
+        a = self.bind_with_profile("code-a")
+        b = self.bind_with_profile("code-b")
+        learner_b = self.learner_id_of(b)
+        b_before = self.profile_row(learner_b)
+
+        # A 用【自己的】合法 token 提交，并在表单里塞上 B 的编号，试图指向 B
+        a.post("/profile/clear", data={
+            "csrf_token": self.csrf_token(a, "/profile"),
+            "confirm": "yes",
+            "learner_id": str(learner_b),
+        })
+
+        self.assertEqual(self.profile_row(learner_b), b_before, "B 的档案被 A 清掉了")
+
+    def test_the_error_message_does_not_leak_internals(self):
+        c = self.bind_with_profile()
+        r = self.clear(c, confirm=None, csrf="伪造的 token")
+
+        body = r.get_data(as_text=True)
+        for leak in ("Traceback", "sqlite", "learner_id", tutor.INVITE_CODE_PEPPER):
+            self.assertNotIn(leak, body)
+
+
+# ===================== 5j. 作废邀请码之后的实际访问行为 =====================
+#
+# 【为什么必须有这一组】「作废」如果只是把状态字段改一下，
+# 那它是**假的作废**：已经进来的设备照样能一直看档案。
+# 这里从网页这一侧证明：作废之后，那台设备真的失去访问权；
+# 而补发新码之后，本人真的能拿回原来那份档案。
+
+class TestRevokedInviteAccess(ChatTestCase):
+
+    def test_a_revoked_invite_cuts_off_the_bound_browser(self):
+        """【核心】作废 → 已绑定的浏览器访问档案页时被引导回输码页。"""
+        self.make_invite("c1")
+        c = tutor.app.test_client()
+        self.enter_invite(c, "c1")
+        self.save_profile(c, level_code="c1", language_mode="en_only", length_mode="detailed")
+        self.assertEqual(c.get("/profile").status_code, 200)     # 作废前：进得去
+
+        result = self.revoke("c1")
+
+        self.assertEqual(result["sessions_dropped"], 1)
+        r = c.get("/profile")
+        self.assertEqual(r.status_code, 302, "作废之后设备仍然能进档案页")
+        self.assertIn("/invite", r.headers["Location"])
+        self.assertIsNone(self.learner_id_of(c), "会话绑定没有被断开")
+
+    def test_revoking_does_not_delete_the_profile_or_the_chat(self):
+        """【核心】断开通道 ≠ 销毁数据：偏好和聊天记录都还在。"""
+        self.make_invite("c1")
+        c = tutor.app.test_client()
+        self.enter_invite(c, "c1")
+        self.save_profile(c, level_code="c1", language_mode="en_only", length_mode="detailed")
+        learner = self.learner_id_of(c)
+        self.ask(c, "作废之前问过的话")
+        before = self.profile_row(learner)
+
+        self.revoke("c1")
+
+        self.assertEqual(self.profile_row(learner), before, "偏好被删了")
+        self.assertEqual(self.table_count("messages"), 2, "聊天记录被删了")
+        self.assertEqual(self.table_count("learners"), 1, "学习者被删了")
+
+    def test_the_revoked_browser_no_longer_shows_its_old_history(self):
+        """【行为变化，如实钉住】作废之后，那台浏览器连自己的旧聊天记录也不再显示。
+
+        【为什么变了】作废会让它的会话失效，而失效的会话会被【轮换】成一个全新的
+        session_id（见 app.py 的 _ensure_session_id）。新 id 下面什么都没有，
+        所以页面显示「还没有对话」。
+
+        【数据丢了吗 —— 没有，这一点很重要】
+        旧消息仍然挂在【旧】session_id 下，而那一行 learner_sessions 还在
+        （revoked_at 有值、learner_id 仍然指着他），所以以后「清空全部个人数据」
+        时照样找得到、删得掉。页面看不见 ≠ 库里没有。
+        """
+        self.make_invite("c1")
+        c = tutor.app.test_client()
+        self.enter_invite(c, "c1")
+        old_sid = self.session_id_of(c)
+        self.ask(c, "作废之前问过的话")
+
+        self.revoke("c1")
+
+        html = c.get("/").get_data(as_text=True)
+        self.assertNotIn("作废之前问过的话", html, "旧历史还在显示")
+        self.assertIn("还没有对话", html)
+
+        self.assertNotEqual(self.session_id_of(c), old_sid, "会话没有被轮换")
+        self.assertEqual(self.messages_for_session_id(old_sid), 2,
+                         "旧消息不该被删掉 —— 它们还要留给「清空全部数据」去删")
+
+    def test_a_revoked_code_cannot_be_used_again(self):
+        self.make_invite("c1")
+        c = tutor.app.test_client()
+        self.enter_invite(c, "c1")
+        self.revoke("c1")
+
+        fresh = tutor.app.test_client()
+        r = self.enter_invite(fresh, "c1")
+
+        self.assertIn(tutor.INVITE_REVOKED_MESSAGE, r.get_data(as_text=True))
+        self.assertIsNone(self.learner_id_of(fresh))
+
+    def test_the_user_gets_the_same_profile_back_with_a_replacement_invite(self):
+        """【核心】恢复流程：作废 → 补发 → 在另一台设备输新码 → 档案回来了。"""
+        self.make_invite("c1")
+        c = tutor.app.test_client()
+        self.enter_invite(c, "c1")
+        self.save_profile(c, level_code="b2", language_mode="en_advanced",
+                          length_mode="brief", goal_code="exam", focus_code="listening")
+        learner = self.learner_id_of(c)
+
+        self.revoke("c1")                                  # 码泄露了，先止血
+        new_code = self.reissue(learner)                   # 补发一张给他
+        self.assertIsNotNone(new_code)
+
+        other_device = tutor.app.test_client()             # 另一台设备
+        r = self.enter_invite(other_device, new_code)
+
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(self.learner_id_of(other_device), learner, "没有回到原来那个学习者")
+        self.assertEqual(self.table_count("learners"), 1, "补发时又建了一个学习者")
+
+        html = other_device.get("/profile").get_data(as_text=True)
+        self.assertIn('value="b2" selected', html)
+        self.assertIn('value="en_advanced" selected', html)
+        self.assertIn('value="listening" selected', html)
+
+    def test_a_replacement_invite_is_never_shown_on_the_page(self):
+        """补发的码同样不能回显到页面上。"""
+        self.make_invite("c1")
+        c = tutor.app.test_client()
+        self.enter_invite(c, "c1")
+        learner = self.learner_id_of(c)
+
+        new_code = self.reissue(learner)
+        html = c.get("/").get_data(as_text=True)
+
+        self.assertNotIn(new_code, html)
+
+
+# ===================== 5k. 文案的诚实性（防回归）=====================
+#
+# 【为什么文案也要有测试】这几句话是**对用户的承诺**。
+# 说过头了，用户会基于一个假前提交出自己的数据；说少了，用户不知道自己在冒什么风险。
+# 设计文档第 11 节把「不用于训练」该怎么说、不该怎么说写得很死，这里把那条线钉住 ——
+# 免得以后有人好心把它「改得更好听一点」，又改回一句绝对承诺。
+
+class TestPrivacyCopy(ChatTestCase):
+
+    def bound_client(self):
+        self.make_invite("c1")
+        c = tutor.app.test_client()
+        self.enter_invite(c, "c1")
+        return c
+
+    # ---------- 档案页 ----------
+
+    def test_the_profile_page_does_not_promise_absolute_no_training(self):
+        """【核心】不能绝对承诺「不用于训练」—— 生成回答要经过第三方。"""
+        html = self.bound_client().get("/profile").get_data(as_text=True)
+
+        self.assertNotIn("不用于训练", html, "又出现了那句绝对承诺")
+        self.assertNotIn("绝不会被用于训练", html)
+        self.assertNotIn("绝不用于训练", html)
+
+    def test_the_profile_page_states_the_third_party_provider_honestly(self):
+        """必须说清两件事：我们自己不拿来训练；但必要内容会发给第三方。"""
+        html = self.bound_client().get("/profile").get_data(as_text=True)
+
+        self.assertIn("不主动用你的内容训练自己的模型", html)
+        self.assertIn("第三方模型服务商", html)
+        self.assertIn("隐私政策", html, "没有把「对方怎么用我们管不了」说清楚")
+
+    def test_the_profile_page_does_not_claim_it_is_tied_to_one_browser_session(self):
+        """【核心】不能说「只和这一个浏览器会话绑定」——
+        换设备后重新输同一张有效邀请码，是能回到同一份档案的。"""
+        html = self.bound_client().get("/profile").get_data(as_text=True)
+
+        self.assertNotIn("只和这一个浏览器会话绑定", html)
+        self.assertIn("重新输入同一张有效邀请码", html)
+        self.assertIn("回到同一份档案", html)
+
+    def test_the_profile_page_says_the_code_is_a_credential(self):
+        """谁拿到码谁就能看档案 —— 这一点必须说出来。"""
+        html = self.bound_client().get("/profile").get_data(as_text=True)
+
+        self.assertIn("谁拿到这张码，谁就能访问这份档案", html)
+
+    def test_the_clear_section_explains_what_is_deleted_and_what_is_kept(self):
+        """【核心】清空按钮必须写清删除范围，而且要把它和「清空全部个人数据」区分开。
+
+        注意：这一块只在「已经设置过档案」时才渲染，所以这里要先存一份。
+        """
+        c = self.bound_client()
+        self.save_profile(c)
+        html = c.get("/profile").get_data(as_text=True)
+
+        self.assertIn("会清掉的", html)
+        self.assertIn("不会动的", html)
+        self.assertIn("聊天记录", html, "没说明聊天记录会保留")
+        # 【区分两者】这一段必须把「全清」删什么、不可撤销说清楚，
+        # 而且【不能】再出现「那个功能还没有做」那类过期说法（它早就做完了）。
+        self.assertIn("和上面那个「清空全部个人数据」区分开", html)
+        self.assertIn("不可撤销", html)
+        self.assertNotIn("那个功能还没有做", html, "又出现了「全清还没做」这句过期的话")
+
+    def test_the_clear_section_is_only_shown_when_there_is_something_to_clear(self):
+        """没设置过的人不该看到「清空学习档案」那个表单 —— 那只会让人困惑。
+
+        【为什么查表单的 action 而不是查那句话】页面别的注释里也会提到「清空学习档案」这几个字，
+        查字符串会误判。表单的 action="/profile/clear" 是它真的在页面上出现的证据。
+        """
+        c = self.bound_client()
+        self.assertNotIn('action="/profile/clear"', c.get("/profile").get_data(as_text=True))
+
+        self.save_profile(c)
+        self.assertIn('action="/profile/clear"', c.get("/profile").get_data(as_text=True))
+
+    # ---------- 邀请码页 ----------
+
+    def test_the_invite_page_tells_the_user_to_keep_the_code(self):
+        """发码时就要说清楚：这码是唯一凭证，丢了找不回来。"""
+        html = tutor.app.test_client().get("/invite").get_data(as_text=True)
+
+        self.assertIn("请把这张码保存好", html)
+        self.assertIn("丢了我们也没法帮你查回来", html)
+
+    def test_the_invite_page_does_not_claim_the_code_is_entered_only_once(self):
+        """旧文案说「只输一次、之后靠会话记住你」—— 换设备时那句是误导。"""
+        html = tutor.app.test_client().get("/invite").get_data(as_text=True)
+
+        self.assertNotIn("只在这里输入一次", html)
+        self.assertIn("重新输入同一张码", html)
+
+    def test_the_invite_page_explains_the_revoked_session_behaviour(self):
+        """【核心】会话失效/轮换的后果必须写在这个页面上，不能只写在代码注释里。
+
+        用户会遇到两种情况：已经有身份了却输新码；上一个身份失效后历史不见了。
+        两种都要提前说清楚，不能让人对着一个空白的对话区猜。
+        """
+        html = tutor.app.test_client().get("/invite").get_data(as_text=True)
+
+        self.assertIn("已经绑定过一个学习档案", html, "没说清「已有身份」会怎样")
+        self.assertIn("不会再显示", html, "没说清失效之后旧历史会不见")
+        self.assertIn("数据仍在服务器上", html, "没说明数据其实还在")
+
+    # ---------- 首页入口 ----------
+
+    def test_the_index_page_offers_the_right_entry(self):
+        """没绑定 → 引导去输码；已绑定 → 引导去档案页。"""
+        fresh = tutor.app.test_client().get("/").get_data(as_text=True)
+        self.assertIn("输入邀请码", fresh)
+
+        bound = self.bound_client().get("/").get_data(as_text=True)
+        self.assertIn("我的学习档案", bound)
+
+
+# ===================== 5m. 会话边界：失效会话与新邀请码 =====================
+#
+# 【这一组修的是什么】两个真实复现出来的问题：
+#   ① 已失效的会话输入一张【新】邀请码 → 兑换提交了、绑定却被拒 → 浏览器还是匿名，
+#      但那张码已经被消耗、还多出一个谁都进不去的孤儿学习者。
+#   ② 已失效的会话继续匿名提问 → 新消息仍挂在旧 session_id 下，
+#      而旧 id 仍然关联着原来那个学习者 → 以后清空他的数据时会把无关消息一起删掉。
+#
+# 两条的根都在同一处：**失效的会话必须被轮换成新的 session_id**。
+
+class TestSessionRotation(ChatTestCase):
+
+    def bind(self, code="code-a"):
+        self.make_invite(code)
+        c = tutor.app.test_client()
+        self.enter_invite(c, code)
+        return c
+
+    def invite_error(self, response):
+        """把响应里的提示文字取出来（判断是哪种拒绝）。"""
+        html = response.get_data(as_text=True)
+        for message in (tutor.INVITE_BOUND_ELSEWHERE_MESSAGE, tutor.INVITE_REVOKED_MESSAGE,
+                        tutor.INVITE_INVALID_MESSAGE):
+            if message in html:
+                return message
+        return ""
+
+    # ---------- 场景 1：有效会话 + 别人的码 ----------
+
+    def test_a_valid_session_cannot_take_over_another_invite(self):
+        """【核心】已经绑着 A 的浏览器，输一张全新的 B 码 →
+
+        A 的绑定不变、**B 的码没有被消耗**、**不会多出孤儿学习者**，
+        而且要给用户一句明确的话。
+        """
+        a = self.bind("code-a")
+        learner_a = self.learner_id_of(a)
+        self.make_invite("code-b")
+        learners_before = self.table_count("learners")
+
+        r = self.enter_invite(a, "code-b")
+
+        self.assertEqual(r.status_code, 200, "被拒绝时不该 302（那看起来像成功了）")
+        self.assertEqual(self.invite_error(r), tutor.INVITE_BOUND_ELSEWHERE_MESSAGE)
+
+        # A 那边什么都没变
+        self.assertEqual(self.learner_id_of(a), learner_a)
+
+        # B 的码还是可用的（没有被消耗）
+        conn = sqlite3.connect(self.db_path)
+        try:
+            status, linked = conn.execute(
+                "SELECT status, learner_id FROM invites WHERE code_digest = ?",
+                (tutor.profile_store.digest_invite_code("code-b", tutor.INVITE_CODE_PEPPER),)
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(status, tutor.profile_store.INVITE_ACTIVE, "B 的码被白白消耗了")
+        self.assertIsNone(linked, "B 的码被绑到了一个没人能进的孤儿学习者上")
+
+        # 没有多出学习者
+        self.assertEqual(self.table_count("learners"), learners_before)
+
+        # B 的码换一个干净的浏览器仍然能用
+        fresh = tutor.app.test_client()
+        self.assertEqual(self.enter_invite(fresh, "code-b").status_code, 302)
+        self.assertIsNotNone(self.learner_id_of(fresh))
+
+    # ---------- 被拒绝时给出的指引必须真的可行 ----------
+
+    def test_the_bound_elsewhere_message_does_not_give_wrong_advice(self):
+        """【核心】这条提示改过两轮，原来给的三条路全是错的，都不能再出现。
+
+        ❌ 「清空当前档案」—— 那只清偏好，**不会解绑**，照着做一遍还是被拒。
+        ❌ 「换一个浏览器窗口」—— 同一个浏览器的新窗口**共享 cookie**，等于没换。
+        ❌ 「做一次清空全部个人数据来换号」—— 那是在诱导用户为了换号去毁掉全部数据。
+        """
+        message = tutor.INVITE_BOUND_ELSEWHERE_MESSAGE
+
+        for wrong in ("清空当前档案", "换一个浏览器窗口", "新窗口",
+                      "两条路", "或者做一次清空全部个人数据"):
+            with self.subTest(wrong=wrong):
+                self.assertNotIn(wrong, message, "又出现了那条做不到 / 不该给的建议：" + wrong)
+
+        # 【注意】「清空学习档案」这几个字是【允许】出现的 ——
+        # 但只能以「它不能解除绑定」的形式出现（下面那条测试钉住了这一点）。
+
+    def test_the_bound_elsewhere_message_says_it_cannot_be_switched_losslessly(self):
+        """【核心】先把实话说在前面：这个浏览器不能无损换绑。
+
+        指引只有一条真正可行的路 —— **换一个不共享 cookie 的环境**。
+        （「清空全部个人数据」也能走到新身份，但那要毁掉全部数据，
+         是删除决定，不是换号手段，见下一条。）
+        """
+        message = tutor.INVITE_BOUND_ELSEWHERE_MESSAGE
+
+        self.assertIn("没法无损换成另一个身份", message)
+        self.assertIn("不共享 cookie", message)
+        self.assertIn("无痕", message, "没有给出一个具体可操作的例子")
+        self.assertIn("不能解除绑定", message, "没堵掉「清空学习档案能换绑」这个误解")
+
+    def test_the_message_never_advertises_the_full_wipe_as_a_way_to_switch(self):
+        """【核心】全清只能被描述成一次不可撤销的删除，而且必须明确劝阻。
+
+        这是上一版的问题：把「做一次清空全部个人数据」摆成换身份的两条路之一，
+        等于诱导用户为了换号去毁掉自己的聊天记录。
+        """
+        message = tutor.INVITE_BOUND_ELSEWHERE_MESSAGE
+
+        # 提到它就必须写全代价：删什么 + 作废邀请码 + 不可撤销
+        self.assertIn("清空全部个人数据", message)
+        self.assertIn("聊天记录", message, "没说明它会删掉聊天记录")
+        self.assertIn("作废已有邀请码", message, "没说明它会作废邀请码")
+        self.assertIn("不可撤销", message)
+        self.assertIn("是另一回事", message, "没把它和「换身份」区分开")
+        self.assertIn("不要为了换一个身份去点它", message, "没有明确劝阻")
+
+    def test_the_advertised_route_actually_works(self):
+        """【核心】照着提示做（换一个不共享 cookie 的环境），真的能换到新身份。
+
+        用两个 test_client 模拟「两个不共享 cookie 的浏览器环境」：
+        第一个已经绑了 A（被拒），第二个是干净的 → 同一张 B 的码立刻就通了。
+        """
+        a = self.bind("code-a")
+        self.make_invite("code-b")
+
+        # 第一个环境：被拒
+        r = self.enter_invite(a, "code-b")
+        self.assertEqual(self.invite_error(r), tutor.INVITE_BOUND_ELSEWHERE_MESSAGE)
+
+        # 第二个环境（独立 cookie）—— 提示里推荐的那条路
+        other = tutor.app.test_client()
+        r = self.enter_invite(other, "code-b")
+
+        self.assertEqual(r.status_code, 302, "按提示换了环境却还是进不去")
+        self.assertIsNotNone(self.learner_id_of(other))
+        # 而原来那个环境不受影响，仍然属于 A
+        self.assertIsNotNone(self.learner_id_of(a))
+        self.assertNotEqual(self.learner_id_of(a), self.learner_id_of(other))
+
+    def test_a_full_wipe_does_unbind_but_is_not_the_advertised_route(self):
+        """【核心】锁定事实：全清确实会解绑（所以它"能用"）——
+        但提示里**不推荐**它，这条测试只记录事实，不代表那是建议的做法。
+        """
+        a = self.bind("code-a")
+        self.make_invite("code-b")
+
+        self.delete(a)                                   # 不可撤销：删掉全部数据
+
+        self.assertIsNone(self.learner_id_of(a), "清空全部数据之后居然还绑着")
+        self.assertEqual(self.table_count("messages"), 0)
+        # 解绑之后，同一张码在这个环境里确实能用了
+        self.assertEqual(self.enter_invite(a, "code-b").status_code, 302)
+
+    # ---------- 场景 2：失效会话 + 全新的码 ----------
+
+    def test_a_revoked_session_gets_a_new_id_and_can_use_a_new_invite(self):
+        """【核心】已失效的会话输 B 码 → 先轮换出新 session_id，再成功绑到 B。"""
+        a = self.bind("code-a")
+        old_sid = self.session_id_of(a)
+        self.ask(a, "A 那时候问的话")
+        self.revoke("code-a")                          # A 的会话失效
+        self.assertIsNone(self.learner_id_of(a))
+
+        self.make_invite("code-b")
+        learners_before = self.table_count("learners")
+        r = self.enter_invite(a, "code-b")
+
+        self.assertEqual(r.status_code, 302, "应当成功进入")
+        self.assertNotEqual(self.session_id_of(a), old_sid, "失效会话没有被轮换")
+        self.assertIsNotNone(self.learner_id_of(a), "没有绑到 B")
+        self.assertEqual(self.table_count("learners"), learners_before + 1)
+
+        # 【A 的旧关联必须还留在库里】—— 以后清空 A 的数据要靠它
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT learner_id, revoked_at FROM learner_sessions WHERE session_id = ?",
+                (old_sid,)).fetchone()
+        finally:
+            conn.close()
+        self.assertIsNotNone(row, "A 的旧关联行被删了")
+        self.assertIsNotNone(row[1], "A 的旧关联不该被恢复成有效")
+
+        # 新身份在 A 的旧消息里看不到任何东西
+        self.assertNotIn("A 那时候问的话", a.get("/").get_data(as_text=True))
+
+    def test_a_revoked_session_can_still_take_its_own_learners_new_code(self):
+        """失效会话 + 【同一个学习者】的新码（补发场景）→ 恢复，不是轮换。
+
+        这条是刻意的例外：轮换是为了「不再属于原来那个人」，
+        而这里来的正是原来那个人的新码，所以应该恢复原来的档案。
+        """
+        a = self.bind("code-a")
+        self.ask(a, "恢复之前问的话")
+        learner = self.learner_id_of(a)
+        self.revoke("code-a")
+
+        new_code = self.reissue(learner)               # 补发（产品里没有入口，测试直接调原语）
+        r = self.enter_invite(a, new_code)
+
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(self.learner_id_of(a), learner, "没有回到原来的学习者")
+
+    # ---------- 场景 3：失效会话继续匿名提问 ----------
+
+    def test_questions_after_revocation_use_a_brand_new_session_id(self):
+        """【核心】作废之后匿名提问 → 消息落在【新】session_id 下，不再算到 A 头上。"""
+        a = self.bind("code-a")
+        old_sid = self.session_id_of(a)
+        self.ask(a, "A 那时候问的话")
+        self.revoke("code-a")
+
+        self.ask(a, "作废之后匿名问的话")               # 现在它是匿名访客
+
+        new_sid = self.session_id_of(a)
+        self.assertNotEqual(new_sid, old_sid)
+        self.assertEqual(self.messages_for_session_id(new_sid), 2, "新消息没有落在新会话下")
+        self.assertEqual(self.messages_for_session_id(old_sid), 2, "旧会话的消息被动过")
+
+    def test_clearing_learner_a_keeps_the_new_anonymous_messages(self):
+        """【核心】之后清空 A 的全部数据 → 只删 A 的旧消息，新的匿名消息留着。
+
+        【注意顺序】作废会把这位学习者【所有】会话都置为失效（不只当前这台）。
+        所以「还能执行清空」的那台设备，必须在作废【之后】才拿到新码进来 ——
+        这也正是现实中的顺序：旧设备被踢下线 → 用户在另一台设备上用补发码回来
+        → 而那台旧设备还在被当成匿名浏览器用着。
+        """
+        a = self.bind("code-a")
+        old_sid = self.session_id_of(a)
+        self.ask(a, "A 那时候问的话")
+        learner = self.learner_id_of(a)
+
+        self.revoke("code-a")                          # a 失效（A 名下所有会话一起失效）
+
+        new_code = self.reissue(learner)                # 补发一张，绑回同一个学习者
+        device2 = tutor.app.test_client()
+        self.enter_invite(device2, new_code)            # 这台设备现在是有效的
+        self.assertEqual(self.learner_id_of(device2), learner)
+
+        self.ask(a, "作废之后匿名问的话")                # a 已轮换 → 匿名访客
+
+        self.delete(device2)                            # 从 device2 清空 A 的全部数据
+
+        # A 的旧消息（在旧 session_id 下）必须删掉
+        self.assertEqual(self.messages_for_session_id(old_sid), 0, "A 的旧消息没删掉")
+        # 但 a 在作废之后匿名问的那条必须留着 —— 它已经不是 A 的话了
+        self.assertEqual(self.messages_for_session_id(self.session_id_of(a)), 2,
+                         "把无关的匿名消息也删了")
+        self.assertIn("作废之后匿名问的话", a.get("/").get_data(as_text=True))
+
+    def delete(self, client, confirm="yes", csrf=None):
+        """提交「清空全部个人数据」表单（和 TestDeleteAllData 里那个同款）。"""
+        if csrf is None:
+            csrf = self.csrf_token(client, "/profile")
+        data = {"csrf_token": csrf}
+        if confirm is not None:
+            data["confirm"] = confirm
+        return client.post("/profile/delete", data=data)
+
+    # ---------- 轮换本身 ----------
+
+    def test_a_healthy_session_is_never_rotated(self):
+        """正常会话不该被换掉 —— 换了就等于把用户的历史弄丢了。"""
+        a = self.bind("code-a")
+        sid = self.session_id_of(a)
+
+        self.ask(a, "随便问一句")
+        self.assertEqual(self.session_id_of(a), sid)
+
+    def test_an_anonymous_session_is_never_rotated(self):
+        """匿名访客（从来没绑过）也不该被换。"""
+        c = tutor.app.test_client()
+        self.ask(c, "匿名问一句")
+        sid = self.session_id_of(c)
+
+        self.ask(c, "再问一句")
+        self.assertEqual(self.session_id_of(c), sid)
+
+    def test_the_old_binding_row_is_never_deleted(self):
+        """轮换只是换 id，绝不去删旧行 —— 删了就找不到旧聊天记录了。"""
+        a = self.bind("code-a")
+        old_sid = self.session_id_of(a)
+        self.ask(a, "一句话")
+        self.revoke("code-a")
+
+        self.ask(a, "触发轮换")
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            count = conn.execute(
+                "SELECT COUNT(*) FROM learner_sessions WHERE session_id = ?", (old_sid,)
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(count, 1, "旧绑定行被删了")
+
+
+# ===================== 5n. 会话状态确认不了时：必须停下 =====================
+#
+# 【这一组修的是什么】会话失效检查（session_is_revoked）读库失败时，
+# 早期版本会选择「当成没失效、继续用这个 sid」。那是个真窟窿：
+# 如果这个 sid 其实已经被作废，提问会照常成功，新消息就写进了别人（已作废）的旧会话下，
+# 以后清空那位学习者的数据时，这些无关消息会被一起删掉。
+#
+# 正确做法是【宁可停下，也不猜】：不提问、不兑换、不写任何东西，只给一句重试提示。
+
+class TestSessionCheckFailure(ChatTestCase):
+
+    BOOM = "内部细节-会话检查炸了-4f7c"
+
+    def bind(self, code="code-a"):
+        self.make_invite(code)
+        c = tutor.app.test_client()
+        self.enter_invite(c, code)
+        return c
+
+    def setUp(self):
+        super().setUp()
+        # 记下真的那个函数，并保证每个测试结束都还原。
+        # 【为什么必须还原】ChatTestCase 每次 setUp 都会 reload app，但 profile_store
+        # 是同一个模块对象 —— 改过的属性会留到后面的测试里，变成难查的连锁失败。
+        self._real_session_is_revoked = tutor.profile_store.session_is_revoked
+        self.addCleanup(setattr, tutor.profile_store, "session_is_revoked",
+                        self._real_session_is_revoked)
+
+    def break_the_session_check(self):
+        """让 session_is_revoked() 抛异常，模拟数据库读不了。"""
+        def boom(conn, session_id):
+            raise sqlite3.OperationalError(self.BOOM)
+
+        tutor.profile_store.session_is_revoked = boom
+
+    def restore_the_session_check(self):
+        """手动恢复正常（用来测「恢复之后还能用」）。"""
+        tutor.profile_store.session_is_revoked = self._real_session_is_revoked
+
+    def learner_sessions_for(self, client):
+        """这个浏览器的会话绑定行（原样）。"""
+        return self.session_row(client)
+
+    # ---------- 提问 ----------
+
+    def test_a_question_is_not_processed_when_the_session_cannot_be_verified(self):
+        """【核心】确认不了会话状态 → 不调模型、不写库，只给一句重试提示。"""
+        c = self.bind()
+        self.ask(c, "之前正常问的一句")
+        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(self.table_count("messages"), 2)
+
+        self.break_the_session_check()
+        r = self.ask(c, "这次不该被处理")
+
+        self.assertNotEqual(r.status_code, 302, "居然当成成功处理了")
+        self.assertEqual(r.status_code, 503)
+        self.assertIn(tutor.SESSION_RETRY_MESSAGE, r.get_data(as_text=True))
+
+        self.assertEqual(len(self.fake.calls), 1, "会话没确认还去调模型了")
+        self.assertEqual(self.table_count("messages"), 2, "会话没确认还写了消息")
+
+    def test_nothing_is_written_under_the_old_session_id(self):
+        """【核心】不能把消息写进那个【未经确认】的旧 sid 下 —— 这正是原来的窟窿。"""
+        c = self.bind()
+        sid = self.session_id_of(c)
+        self.ask(c, "之前正常问的一句")
+
+        self.break_the_session_check()
+        self.ask(c, "这次不该被处理")
+
+        self.assertEqual(self.messages_for_session_id(sid), 2, "旧会话下多出了消息")
+
+    # ---------- 邀请码 ----------
+
+    def test_an_invite_is_not_redeemed_when_the_session_cannot_be_verified(self):
+        """【核心】确认不了会话状态 → 邀请码不兑换：不消耗、不建学习者。"""
+        c = self.bind("code-a")
+        self.make_invite("code-b")
+        learners_before = self.table_count("learners")
+
+        # 【token 要在弄坏之前拿】GET /invite 自己也会走会话检查，
+        # 坏了之后再取就只会拿到那张 503 提示页，取不到 token。
+        csrf = self.csrf_token(c, "/invite")
+
+        self.break_the_session_check()
+        r = c.post("/invite", data={"invite_code": "code-b", "csrf_token": csrf})
+
+        self.assertEqual(r.status_code, 503)
+        self.assertIn(tutor.SESSION_RETRY_MESSAGE, r.get_data(as_text=True))
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            status, linked = conn.execute(
+                "SELECT status, learner_id FROM invites WHERE code_digest = ?",
+                (tutor.profile_store.digest_invite_code("code-b", tutor.INVITE_CODE_PEPPER),)
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(status, tutor.profile_store.INVITE_ACTIVE, "码被消耗了")
+        self.assertIsNone(linked)
+        self.assertEqual(self.table_count("learners"), learners_before, "建出了学习者")
+        self.assertEqual(self.table_count("learner_sessions"), 1, "会话绑定被动了")
+
+    # ---------- 其它依赖会话身份的操作 ----------
+
+    def test_the_profile_pages_stop_too(self):
+        """档案页、清空、删除都依赖会话身份 —— 一样要停，而且什么都不改。"""
+        c = self.bind()
+        self.save_profile(c, level_code="b2")
+
+        self.break_the_session_check()
+
+        for path, data in (("/profile", {}),
+                           ("/profile/clear", {"confirm": "yes"}),
+                           ("/profile/delete", {"confirm": "yes"})):
+            r = c.post(path, data=data) if data else c.get(path)
+            with self.subTest(path=path):
+                self.assertEqual(r.status_code, 503)
+                self.assertIn(tutor.SESSION_RETRY_MESSAGE, r.get_data(as_text=True))
+
+        # 偏好还在（清空没执行）
+        self.assertIsNotNone(self.profile_row(self.learner_id_of(c)))
+
+    # ---------- 不泄露 ----------
+
+    def test_the_retry_page_leaks_nothing(self):
+        """提示页里不能出现异常原文、堆栈、数据库细节或密钥。"""
+        c = self.bind()
+        self.break_the_session_check()
+
+        body = self.ask(c, "随便问一句").get_data(as_text=True)
+
+        for leak in (self.BOOM, "Traceback", "OperationalError", "sqlite",
+                     tutor.API_KEY, tutor.INVITE_CODE_PEPPER):
+            self.assertNotIn(leak, body, "提示页里泄露了：" + leak[:12])
+
+    def test_the_failure_is_logged_without_content(self):
+        """日志要记「发生了」，但只记异常类型，不记原文。"""
+        c = self.bind()
+        self.break_the_session_check()
+
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            self.ask(c, "随便问一句")
+        blob = "\n".join(captured.output)
+
+        self.assertIn("session_check_failed", blob)
+        self.assertIn("error_type=OperationalError", blob)      # 类型可以记
+        self.assertIn("session_unverifiable", blob, "统一收尾那一处没有记日志")
+        self.assertNotIn(self.BOOM, blob, "异常原文进了日志")
+
+    # ---------- 恢复正常 ----------
+
+    def test_it_works_again_once_the_check_recovers(self):
+        """恢复之后一切照旧：能提问、能轮换。"""
+        c = self.bind()
+        self.break_the_session_check()
+        self.assertEqual(self.ask(c, "这次失败").status_code, 503)
+
+        self.restore_the_session_check()             # 手动恢复
+
+        # 提问恢复正常
+        r = self.ask(c, "恢复之后问的一句")
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(self.table_count("messages"), 2)
+        self.assertEqual(len(self.fake.calls), 1)
+
+    def test_rotation_still_works_after_recovery(self):
+        """【核心】恢复之后，作废 → 轮换这条链路仍然正常。"""
+        c = self.bind("code-a")
+        old_sid = self.session_id_of(c)
+        self.ask(c, "作废之前问的话")
+
+        self.break_the_session_check()
+        self.assertEqual(self.ask(c, "失败的一次").status_code, 503)
+        self.restore_the_session_check()
+
+        self.revoke("code-a")                       # 现在真的作废
+        self.ask(c, "触发轮换")
+
+        self.assertNotEqual(self.session_id_of(c), old_sid, "恢复之后轮换不工作了")
+        self.assertIsNone(self.learner_id_of(c))
+        self.assertEqual(self.messages_for_session_id(old_sid), 2, "旧会话的消息被动过")
+
+    # ---------- 健康检查不受影响 ----------
+
+    def test_health_is_unaffected(self):
+        """【核心】/health 不依赖会话身份，所以它不该被这个故障带下水。"""
+        self.break_the_session_check()
+        c = tutor.app.test_client()
+        r = c.get("/health")
+
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json(), {"status": "ok"})
+
+
+# ===================== 5l. 清空全部个人数据 =====================
+#
+# 【它和「清空学习档案」的区别】
+#   清空学习档案 —— 只清偏好，人还在，聊天记录还在
+#   清空全部数据 —— 把人删掉：聊天记录 + 偏好 + 会话绑定 + 学习者身份，并作废邀请码
+#
+# 【这一组要证明什么】
+#   ① 该删的删干净（多设备、以及被作废过的旧会话）
+#   ② 不该碰的不动（别的学习者、匿名访客、全站额度）
+#   ③ 门要关严（CSRF + 真的勾了确认 + 匿名不能删）
+#   ④ 删完之后旧身份和旧数据都回不来（包括并发提问也写不回来）
+
+class TestDeleteAllData(ChatTestCase):
+
+    def bind(self, code="c1"):
+        self.make_invite(code)
+        c = tutor.app.test_client()
+        self.enter_invite(c, code)
+        return c
+
+    def bind_with_profile(self, code="c1"):
+        c = self.bind(code)
+        self.save_profile(c, level_code="c1", language_mode="en_only",
+                          length_mode="brief", goal_code="work", focus_code="speaking")
+        return c
+
+    def delete(self, client, confirm="yes", csrf=None):
+        """提交「清空全部个人数据」表单。"""
+        if csrf is None:
+            csrf = self.csrf_token(client, "/profile")
+        data = {"csrf_token": csrf}
+        if confirm is not None:
+            data["confirm"] = confirm
+        return client.post("/profile/delete", data=data)
+
+    # ---------- 入口本身 ----------
+
+    def test_the_page_has_a_prominent_wipe_entry(self):
+        """【核心】档案页要有这个入口，而且要把删除范围一条条写出来。"""
+        html = self.bind_with_profile().get("/profile").get_data(as_text=True)
+
+        self.assertIn('action="/profile/delete"', html)
+        for phrase in ("聊天记录", "学习偏好", "学习者身份", "会话绑定", "邀请码"):
+            self.assertIn(phrase, html, "没有说明会删除：" + phrase)
+
+    def test_the_page_says_what_it_cannot_delete(self):
+        """【核心】不能承诺「物理擦除」——要写清第三方那边和备份不管用。"""
+        html = self.bind_with_profile().get("/profile").get_data(as_text=True)
+
+        self.assertIn("第三方模型服务商", html)
+        self.assertIn("备份", html)
+
+    def test_the_wipe_confirm_is_the_checkbox_not_a_hidden_field(self):
+        """【核心】和清空档案同一条规矩：confirm 必须由复选框自己提交。"""
+        html = self.bind_with_profile().get("/profile").get_data(as_text=True)
+
+        self.assertNotIn('type="hidden" name="confirm"', html)
+        self.assertIn('name="confirm" value="yes"', html)
+
+    def test_the_two_destructive_actions_are_visually_distinct(self):
+        """两个危险操作要用不同的容器，别让人分不清删的是哪一档。"""
+        html = self.bind_with_profile().get("/profile").get_data(as_text=True)
+
+        self.assertIn('class="wipe"', html)              # 清空全部个人数据
+        self.assertIn('class="danger"', html)            # 只清空学习档案
+
+    # ---------- 三道门 ----------
+
+    def test_an_anonymous_visitor_cannot_delete_anything(self):
+        """【核心】没绑定的人连删除入口都到不了，数据也不受影响。"""
+        c = tutor.app.test_client()
+        c.get("/profile")
+
+        r = c.post("/profile/delete", data={"confirm": "yes"})
+
+        self.assertEqual(r.status_code, 302)
+        self.assertIn("/invite", r.headers["Location"])
+
+    def test_deleting_requires_a_csrf_token(self):
+        """【核心】没有 token（或 token 不对）→ 拒绝，什么都不能删。"""
+        c = self.bind_with_profile()
+        learner = self.learner_id_of(c)
+
+        for data in ({"confirm": "yes"},                                   # 完全没有 token
+                     {"confirm": "yes", "csrf_token": "伪造的"}):            # 伪造的 token
+            r = c.post("/profile/delete", data=data)
+            with self.subTest(data=data):
+                self.assertIn(tutor.CSRF_MESSAGE, r.get_data(as_text=True))
+
+        self.assertIsNotNone(self.profile_row(learner), "CSRF 没拦住，数据被删了")
+
+    def test_deleting_requires_the_user_to_really_check_the_box(self):
+        """【核心】没勾确认 → 拒绝（模拟真实浏览器：那个字段压根不会提交）。"""
+        c = self.bind_with_profile()
+        learner = self.learner_id_of(c)
+
+        r = self.delete(c, confirm=None)
+
+        self.assertIn(tutor.DELETE_CONFIRM_MESSAGE, r.get_data(as_text=True))
+        self.assertIsNotNone(self.profile_row(learner), "没勾确认也把数据删了")
+
+    # ---------- 删得干净 ----------
+
+    def test_deleting_removes_everything_and_logs_the_browser_out(self):
+        """【核心】删完之后：数据没了、这个浏览器退回未认领状态。"""
+        c = self.bind_with_profile()
+        learner = self.learner_id_of(c)
+        self.ask(c, "删除之前问过的话")
+        self.assertEqual(self.table_count("messages"), 2)
+
+        r = self.delete(c)
+
+        self.assertEqual(r.status_code, 302)                       # PRG
+        self.assertEqual(self.table_count("messages"), 0, "聊天记录没删干净")
+        self.assertEqual(self.table_count("learner_preferences"), 0)
+        self.assertEqual(self.table_count("learner_sessions"), 0)
+        self.assertEqual(self.table_count("learners"), 0)
+        self.assertEqual(
+            self.db_fetchone("SELECT status FROM invites"), tutor.profile_store.INVITE_REVOKED)
+
+        # 旧身份没了：档案页把人引导去输邀请码
+        self.assertIsNone(self.learner_id_of(c))
+        self.assertEqual(c.get("/profile").status_code, 302)
+        self.assertIn("/invite", c.get("/profile").headers["Location"])
+
+    def test_the_old_page_no_longer_shows_the_deleted_conversation(self):
+        c = self.bind_with_profile()
+        self.ask(c, "删除之前问过的话")
+
+        self.delete(c)
+
+        html = c.get("/").get_data(as_text=True)
+        self.assertNotIn("删除之前问过的话", html, "页面上还能看到已删除的对话")
+
+    def test_the_model_context_no_longer_contains_the_deleted_conversation(self):
+        """【核心】删完之后再提问，旧内容不能作为上下文出现在提示词里。"""
+        c = self.bind_with_profile()
+        self.ask(c, "删除之前问过的话")
+        self.delete(c)
+
+        self.ask(c, "删除之后问的话")
+
+        sent = self.fake.calls[-1]["messages"][1]["content"]
+        self.assertNotIn("删除之前问过的话", sent, "已删除的对话又进了模型上下文")
+        self.assertNotIn("学习者档案", sent, "档案已经被删了，不该再带上")
+
+    def test_every_device_of_that_learner_loses_access(self):
+        """【核心】同一个学习者在多台设备上 → 全部失效，全部聊天记录都删。"""
+        a = self.bind_with_profile("code-a")
+        b = tutor.app.test_client()
+        self.enter_invite(b, "code-a")                 # 同一个码，另一台设备
+        self.assertEqual(self.learner_id_of(b), self.learner_id_of(a))
+        self.ask(a, "A 设备问的话")
+        self.ask(b, "B 设备问的话")
+        self.assertEqual(self.table_count("messages"), 4)
+        self.assertEqual(self.table_count("learner_sessions"), 2)
+
+        self.delete(a)
+
+        self.assertEqual(self.table_count("messages"), 0, "有一台设备的记录漏掉了")
+        self.assertEqual(self.table_count("learner_sessions"), 0)
+        self.assertIsNone(self.learner_id_of(a))
+        self.assertIsNone(self.learner_id_of(b), "另一台设备还留着旧身份")
+        self.assertEqual(b.get("/profile").status_code, 302)
+
+    def test_conversations_from_revoked_devices_are_deleted_too(self):
+        """【核心】被作废过的旧设备的聊天记录，也不能漏。
+
+        先作废（旧设备失去访问权），再在别的设备上清空全部数据 ——
+        旧设备那些消息必须一起删掉。这依赖「作废只打标记、不删关联」那条修正。
+        """
+        a = self.bind_with_profile("code-a")
+        self.ask(a, "作废之前问过的话")
+        self.revoke("code-a")                          # a 失去访问权，但关联还在
+        self.assertIsNone(self.learner_id_of(a))
+
+        b = tutor.app.test_client()                    # 补发一张码，绑到同一个学习者
+        learner = self.db_fetchone("SELECT learner_id FROM invites WHERE learner_id IS NOT NULL")
+        new_code = self.reissue(learner)
+        self.enter_invite(b, new_code)
+        self.assertEqual(self.learner_id_of(b), learner)
+        self.ask(b, "新设备问的话")
+        self.assertEqual(self.table_count("messages"), 4)
+
+        self.delete(b)                                 # 从新设备清空全部数据
+
+        self.assertEqual(self.table_count("messages"), 0, "被作废设备的聊天记录漏掉了")
+
+    def test_the_old_invite_code_can_never_be_used_again(self):
+        """【核心】删除之后旧码不能再用 —— 没有重新进入的通道。"""
+        c = self.bind_with_profile("code-a")
+        self.delete(c)
+
+        fresh = tutor.app.test_client()
+        r = self.enter_invite(fresh, "code-a")
+
+        self.assertIn(tutor.INVITE_REVOKED_MESSAGE, r.get_data(as_text=True))
+        self.assertIsNone(self.learner_id_of(fresh))
+
+    # ---------- 不该碰的不动 ----------
+
+    def test_another_learner_is_untouched(self):
+        """【核心隔离断言】删 A 的全部数据，B 的档案、聊天、身份全都在。"""
+        a = self.bind_with_profile("code-a")
+        b = self.bind_with_profile("code-b")
+        learner_b = self.learner_id_of(b)
+        self.ask(a, "A 问的话")
+        self.ask(b, "B 问的话")
+
+        self.delete(a)
+
+        self.assertIsNotNone(self.profile_row(learner_b), "B 的档案被删了")
+        self.assertEqual(self.learner_id_of(b), learner_b, "B 的身份被动了")
+        self.assertEqual(b.get("/profile").status_code, 200)
+        self.assertIn("B 问的话", b.get("/").get_data(as_text=True))
+        self.assertEqual(self.table_count("messages"), 2, "把 B 的聊天记录也删了")
+
+    def test_an_anonymous_visitors_history_is_untouched(self):
+        """匿名访客的聊天记录没有主人，删某个学习者时不能顺手带走。"""
+        c = self.bind_with_profile()
+        visitor = tutor.app.test_client()
+        self.ask(visitor, "匿名访客问的话")
+
+        self.delete(c)
+
+        self.assertIn("匿名访客问的话", visitor.get("/").get_data(as_text=True))
+        self.assertEqual(self.table_count("messages"), 2)
+
+    def test_the_global_quota_is_not_cleared(self):
+        """【核心】全站每日额度是全站共用的，不属于任何个人，绝不能清。"""
+        c = self.bind_with_profile()
+        self.ask(c, "消耗一次额度")
+        self.assertEqual(self.used_today(), 1)
+
+        self.delete(c)
+
+        self.assertEqual(self.used_today(), 1, "全站额度被清空了")
+
+    def used_today(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute("SELECT used FROM api_usage WHERE day = ?",
+                               (tutor._utc_day(),)).fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
+    def db_fetchone(self, sql):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute(sql).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
+
+    # ---------- 和正在进行的提问抢跑 ----------
+
+    def test_deleting_while_a_question_is_being_processed_is_refused_not_raced(self):
+        """【核心】有提问正在处理时，删除会被挡下（而不是和它抢着写）。"""
+        c = self.bind_with_profile()
+        learner = self.learner_id_of(c)
+        tutor.DELETE_LOCK_TIMEOUT = 0.2                # 别真等 10 秒
+
+        tutor._lock.acquire()                          # 假装「有个提问正在处理」
+        try:
+            r = self.delete(c)
+        finally:
+            tutor._lock.release()
+
+        self.assertIn(tutor.DELETE_BUSY_MESSAGE, r.get_data(as_text=True))
+        self.assertIsNotNone(self.profile_row(learner), "被拒绝的删除居然动了数据")
+
+    def test_an_in_flight_question_cannot_resurrect_deleted_data(self):
+        """【核心】删除必须等正在进行的提问彻底结束，旧请求不能把消息写回来。
+
+        【要防的是什么】一个提问的处理是「检索 → 调模型 → 写库」。
+        如果删除能插在「正在调模型」和「写库」之间，那么删除提交之后，
+        那个旧请求会把消息【又写回数据库】—— 用户以为删干净了，其实没有。
+
+        这里用一个会卡住的假客户端把时序钉死：
+          ① 线程 1 提问 → 卡在「调模型」那一步（锁在它手里）
+          ② 主线程发起删除 → 应该被锁挡住，还没提交
+          ③ 放开那个卡住的调用 → 线程 1 走完并写库、释放锁
+          ④ 删除这才拿到锁、把数据（连同刚写进来的那条）一起删掉
+        """
+        c = self.bind_with_profile()
+
+        entered = threading.Event()          # 假客户端「我开始调模型了」
+        release = threading.Event()          # 主线程说「你可以返回了」
+
+        def slow_create(model, messages, **kwargs):
+            entered.set()
+            release.wait(timeout=5)
+            return FakeResponse(rag_reply())
+
+        self.fake.chat.completions.create = slow_create
+
+        # 【CSRF token 要提前取】GET /profile 不拿那把锁，但在别的线程里发请求更难排查
+        csrf = self.csrf_token(c, "/profile")
+
+        chat_result, delete_result = {}, {}
+
+        def run_chat():
+            chat_result["r"] = c.post("/", data={"question": "删除前问的话"})
+
+        def run_delete():
+            delete_result["r"] = c.post("/profile/delete",
+                                        data={"csrf_token": csrf, "confirm": "yes"})
+
+        chat = threading.Thread(target=run_chat)
+        chat.start()
+        self.assertTrue(entered.wait(timeout=5), "假客户端没被调用，测试前提不成立")
+
+        remover = threading.Thread(target=run_delete)
+        remover.start()
+
+        # 此刻：提问卡在模型调用里，删除应该还在等锁 ——
+        # 它不可能已经提交（它要先拿到锁，而锁在提问手里）。
+        self.assertTrue(remover.is_alive(), "删除没有等锁，直接跑完了")
+        self.assertIsNotNone(self.profile_row(self.learner_id_of(c)),
+                             "删除在提问结束之前就提交了")
+
+        # 放开：提问走完 → 写库 → 释放锁 → 删除才拿到锁
+        release.set()
+        chat.join(timeout=5)
+        remover.join(timeout=5)
+
+        self.assertFalse(chat.is_alive())
+        self.assertFalse(remover.is_alive())
+        self.assertEqual(chat_result["r"].status_code, 302, "提问本身应该正常完成")
+        self.assertEqual(delete_result["r"].status_code, 302)
+
+        # 【核心断言】提问确实写了库，但那些记录随后被删除带走了 ——
+        # 说明删除是在它之后提交的，没有「删完又被写回来」。
+        self.assertEqual(self.table_count("messages"), 0, "已删除的数据被旧请求写回来了")
+        self.assertEqual(self.table_count("learners"), 0)
+        self.assertEqual(self.table_count("learner_sessions"), 0)
+
+
 # ===================== 6. 纯函数：格式化成显示文本 =====================
 
 class TestFormatAnswerWithSources(unittest.TestCase):
@@ -1147,12 +2956,22 @@ class TestConfigParsing(unittest.TestCase):
     def setUp(self):
         self._saved = {}                                # 备份要动的环境变量，测完还原
 
+        # 【为什么这个类也要有自己的临时库】
+        # 它会 importlib.reload(app)，而 app 在导入时会检查 CHAT_DB_PATH 的目录存不存在。
+        # 如果沿用上一个测试类留下的路径，而那个临时目录已经在它的 tearDown 里被删掉，
+        # reload 就会直接抛「数据库所在目录不存在」——
+        # 这属于测试之间的隐式依赖（一个类的成败取决于谁排在它前面），必须切断。
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self._saved["CHAT_DB_PATH"] = os.environ.get("CHAT_DB_PATH")
+        os.environ["CHAT_DB_PATH"] = os.path.join(self.tmpdir.name, "config_test.db")
+
     def tearDown(self):
         for key, value in self._saved.items():
             if value is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+        self.tmpdir.cleanup()
 
     def read(self, name, raw):
         self._saved.setdefault(name, os.environ.get(name))
@@ -1619,9 +3438,28 @@ class TestDeploymentArtifacts(unittest.TestCase):
 
     def test_deployment_doc_lists_the_env_vars(self):
         doc = self.read("DEPLOYMENT.md")
-        for name in ("DEEPSEEK_API_KEY", "FLASK_SECRET_KEY", "CHAT_DB_PATH",
-                     "MAX_QUESTION_LENGTH", "DAILY_API_LIMIT"):
+        for name in ("DEEPSEEK_API_KEY", "FLASK_SECRET_KEY", "INVITE_CODE_PEPPER",
+                     "CHAT_DB_PATH", "MAX_QUESTION_LENGTH", "DAILY_API_LIMIT"):
             self.assertIn(name, doc, "部署文档漏了环境变量 " + name)
+
+    def test_doc_does_not_promise_that_pepper_can_be_rotated_losslessly(self):
+        """【防回归】换 pepper 的说明不能暗示「重新发码就能恢复」。
+
+        这一版没有无损轮换的流程：`new-invite` 会创建【全新学习者】，
+        能接回旧档案的 `reissue` 已停用 —— 所以「给所有人重新发码」是个做不到的承诺。
+        """
+        doc = self.read("DEPLOYMENT.md")
+
+        self.assertIn("「无损轮换 pepper」的流程", doc, "没写明本版本做不到无损轮换")
+        self.assertIn("身份核验方案", doc, "没指向「先停下制定身份核验方案」")
+        self.assertIn("不能恢复任何人的访问权", doc, "把导出留档说成了恢复办法")
+        self.assertNotIn("给所有人重新发码", doc, "又出现了那句做不到的承诺")
+
+        # 【统计留档不能被说成「对账」】只留 status 和时间字段，
+        # 那就只能看分布 —— 既对不上人，也对不上具体哪张码。这句承诺必须是这个口径。
+        self.assertIn("状态与时间的分布", doc, "没写明留档到底能看到什么")
+        self.assertIn("不要把它当成恢复方案", doc, "没把「留档 ≠ 恢复」这条边界写死")
+        self.assertNotIn("谁、什么时候、哪张码被用过", doc, "又出现了那句做不到的对账承诺")
 
     def test_readme_links_to_the_deployment_doc(self):
         self.assertIn("DEPLOYMENT.md", self.read("README.md"))

@@ -213,6 +213,14 @@ SYSTEM_PROMPT = """你是一名 AI 英语学习助手。用户的问题属于下
    · citations 必须是空数组 []
    · 【绝对不要】用你自己的知识去编造课程的业务事实 —— 这是最严重的一类错误
 
+【学习者档案（如果这次有的话）】
+
+- 它只用来调整你回答的【难度、长度、用词和表达方式】—— 影响「怎么说」，不影响「说什么依据」
+- 它【不是资料】。绝不能因为它提到什么就给出 citation
+- 档案里的英语水平是【用户自报的】，可能不准。不确定时按中性处理，别刻意堆难词或过度简化
+- 调整表达方式【不等于放宽规则】：四分类判断和引用规则一条都不能因为档案而改变
+- 【红线】绝不根据档案声称用户能考多少分，也不保证「照着做就能达到目标」
+
 【最近的对话上下文（如果这次有的话）】
 
 - 它只用来理解用户在指代什么，比如「刚才那句话」「再给一个例子」「为什么这样改」
@@ -318,18 +326,126 @@ def _format_recent_context(recent_context):
     )
 
 
-def _build_user_prompt(question, chunks, recent_context=None):
-    """把【历史上下文】+【资料片段】+【用户问题】拼成这一次要发给模型的内容。
+# ===================== 学习者档案 → 提示词 =====================
+#
+# 【档案和上下文、资料的区别，必须分清】
+#   资料（chunks）   —— 本次检索到的片段，是【唯一】可以引用的东西
+#   最近上下文       —— 用来理解「刚才那句」指什么
+#   学习者档案       —— 用来调整【回答的难度、长度、用词和表达方式】
+#
+# 档案影响的是「怎么说」，不是「说什么依据」。它一样【不能】变成引用来源。
+#
+# 【为什么代号到中文的对照写在这里，而不是写在 profile_store 里】
+# profile_store 管「哪些代号是合法的」（数据完整性）；
+# 这里管「这些代号要跟模型怎么说」（提示词措辞）。两件事分开，
+# 改措辞不用动存储层。
+# 代价是两处可能漂移 —— 所以有一条测试专门核对：
+# profile_store 里每一个合法代号，这里都必须有对应的说法（见 test_rag.py）。
 
-    【三块的顺序是刻意的】
-    上下文在最前，资料居中，当前问题在最后 —— 越靠近末尾的内容，模型越当回事。
-    「当前问题」必须紧贴着指令，不能被一大段历史和资料埋在中间。
+_LEVEL_LABELS = {
+    "a1": "A1（入门）",
+    "a2": "A2（基础）",
+    "b1": "B1（中级）",
+    "b2": "B2（中高级）",
+    "c1": "C1（高级）",
+}
+
+_LANGUAGE_LABELS = {
+    "zh_pair": "中英对照：英文在前，中文解释紧随其后",
+    "en_only": "全英文：只用英文，用词按上面的水平控制",
+    "en_advanced": "全英文 + 高级表达：只用英文，并主动给出更地道的说法",
+}
+
+_LENGTH_LABELS = {
+    "brief": "精简：只给结果和最关键的一句解释",
+    "normal": "标准：结果 + 解释 + 可选说法",
+    "detailed": "详细：可以展开讲原理、多给例子",
+}
+
+_GOAL_LABELS = {
+    "exam": "考试 / 升学",
+    "academic": "学业写作（作业、论文、报告）",
+    "daily": "日常交流",
+    "work": "工作 / 商务",
+    "interest": "兴趣 / 自我提升",
+}
+
+_FOCUS_LABELS = {
+    "writing": "写作",
+    "speaking": "口语",
+    "listening": "听力",
+    "reading": "阅读",
+    "grammar": "语法",
+    "vocabulary": "词汇",
+}
+
+
+def _format_preferences(preferences):
+    """把档案拼成提示词里那一段。没有档案就返回空字符串。
+
+    【为什么没填的项直接不写，而不是写「未填写」】
+    写「未填写」等于占了一行、还提醒模型「这里缺东西」。
+    不写更干净 —— 缺什么模型就不会去管什么。
+
+    【为什么水平那一行要专门标注「用户自报、可能不准」】
+    用户自己估的水平经常偏高或偏低。不提醒的话，模型会把它当成事实，
+    一个把自己报成 C1 的初学者会拿到一堆看不懂的回答。
+    """
+    if not preferences:
+        return ""
+
+    lines = []
+
+    level = _LEVEL_LABELS.get(preferences.get("level_code"))
+    if level:
+        # level_uncertain=1 表示用户选了「不确定 / 先按默认来」
+        if preferences.get("level_uncertain"):
+            lines.append("- 英语水平：用户没确认过，暂按 " + level + " 参考（很可能不准，别当成事实）")
+        else:
+            lines.append("- 英语水平：" + level + "（用户自报，可能不准，别当成事实）")
+
+    goal = _GOAL_LABELS.get(preferences.get("goal_code"))
+    if goal:
+        lines.append("- 学习目标：" + goal)
+
+    focus = _FOCUS_LABELS.get(preferences.get("focus_code"))
+    if focus:
+        lines.append("- 重点想提升：" + focus)
+
+    length = _LENGTH_LABELS.get(preferences.get("length_mode"))
+    if length:
+        lines.append("- 回答长度：" + length)
+
+    language = _LANGUAGE_LABELS.get(preferences.get("language_mode"))
+    if language:
+        lines.append("- 语言：" + language)
+
+    if not lines:
+        return ""
+
+    return (
+        "下面是这位学习者自己填的【学习档案】。"
+        "它用来调整你回答的难度、长度、用词和表达方式；它【不是资料】，不能引用：\n"
+        "======== 学习者档案开始 ========\n"
+        + "\n".join(lines) +
+        "\n======== 学习者档案结束 ========\n\n"
+    )
+
+
+def _build_user_prompt(question, chunks, recent_context=None, preferences=None):
+    """把【学习者档案】+【历史上下文】+【资料片段】+【用户问题】拼成这次要发给模型的内容。
+
+    【四块的顺序是刻意的】
+    档案（最稳定）→ 上下文 → 资料 → 当前问题（最要紧）。
+    越靠近末尾的内容，模型越当回事，所以「当前问题」必须紧贴着最后那句指令，
+    不能被档案、历史或资料埋在中间。
 
     【为什么用字符串拼接，不用 .format()】
     这段提示词里含有 JSON 的 { }。一旦用 .format()，Python 会把花括号当成
     占位符，直接抛 KeyError。evaluate.py 里是靠把 { 写成 {{ 才躲过去的，
     写法很丑而且容易改错。所以这里一律用 + 拼接，绝不对含 JSON 的提示词 format()。
     """
+    preference_section = _format_preferences(preferences)
     context_section = _format_recent_context(recent_context)
 
     if chunks:
@@ -361,7 +477,8 @@ def _build_user_prompt(question, chunks, recent_context=None):
         )
 
     return (
-        context_section
+        preference_section
+        + context_section
         + material_section
         + "用户的问题：\n" + str(question) + "\n\n"
         "请严格按照 system 里的规则判断 decision，并只输出那一个 JSON 对象。"
@@ -461,6 +578,7 @@ def _degrade(diagnostic_code):
 #   generate_answer_with_context(question, chunks, recent_messages, ...)    ← 网页用，带短期上下文
 #   generate_answer_with_diagnostics(question, chunks, client, model)       ← 评测器用，多回一个诊断码
 #   generate_answer_with_context_and_diagnostics(...)                       ← 网页用，带上下文 + 诊断码
+#   generate_answer_with_context_and_profile(...)                           ← 网页用，再加学习者档案
 #
 # 【最后一个为什么存在】网页要把「模型主动判的」和「校验没过降级来的」区分开，
 # 否则日志里两种情况长得一模一样。它只多回一个固定枚举，仍只给安全日志用。
@@ -534,6 +652,29 @@ def generate_answer_with_context_and_diagnostics(question, chunks, recent_messag
     return _generate(question, chunks, recent_context, client, model)
 
 
+def generate_answer_with_context_and_profile(question, chunks, recent_messages,
+                                             preferences, client, model):
+    """网页专用：带短期上下文 + 学习者档案，同时回一个诊断标签。
+
+    返回 (公开三键结果, diagnostic_code)，和上面那个网页入口的形状一模一样 ——
+    所以 app.py 那边除了多传一个 preferences，别的都不用改。
+
+    参数：
+        preferences —— 该学习者的档案（profile_store.get_preferences 的返回值，
+                       或者 None = 没档案，那就按默认方式回答）
+
+    【一次提问 = 一次模型调用】
+    档案、上下文、资料全部拼进【同一次】请求。这一点和设计文档第 12 节一致：
+    不为档案单独调一次模型，也不为它多花一分钱。
+
+    【档案为什么不会污染引用】
+    白名单仍然只从本次 chunks 建（见 _generate）。档案里哪怕写着
+    「我最喜欢 grammar_present_perfect.md」，模型引了也一样会被拦下并安全降级。
+    """
+    recent_context = build_recent_context(recent_messages)
+    return _generate(question, chunks, recent_context, client, model, preferences)
+
+
 def generate_answer_with_diagnostics(question, chunks, client, model):
     """和 generate_answer 做同样的事，但额外多回一个诊断标签。**只给评测器用。**
 
@@ -545,7 +686,7 @@ def generate_answer_with_diagnostics(question, chunks, client, model):
     return _generate(question, chunks, None, client, model)
 
 
-def _generate(question, chunks, recent_context, client, model):
+def _generate(question, chunks, recent_context, client, model, preferences=None):
     """四个对外入口共用的实现。**不要直接调用它**，走上面那四个入口之一。
 
     返回一个二元组：
@@ -610,7 +751,8 @@ def _generate(question, chunks, recent_context, client, model):
             model=model,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": _build_user_prompt(question, chunks, recent_context)},
+                {"role": "user", "content": _build_user_prompt(question, chunks, recent_context,
+                                                              preferences)},
             ],
         )
         raw = response.choices[0].message.content
