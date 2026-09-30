@@ -35,13 +35,14 @@ pip install -r requirements.txt
 
 ### 2. 配置密钥
 
-需要**三个**密钥，都是**从环境变量读取，不写死在代码里**（写死的话推到 GitHub 会被瞬间抓走）。
+需要**三个**密钥（必填），都是**从环境变量读取，不写死在代码里**（写死的话推到 GitHub 会被瞬间抓走）。
 
 | 名字 | 干嘛的 |
 | --- | --- |
 | `DEEPSEEK_API_KEY` | 调用 DeepSeek 用，在 https://platform.deepseek.com 申请 |
 | `FLASK_SECRET_KEY` | Flask 用它给浏览器 cookie 签名，防止别人伪造 cookie 冒充成别的会话 |
 | `INVITE_CODE_PEPPER` | 把邀请码算成摘要用的服务端密钥。数据库里只存摘要，没有它就反推不出邀请码 |
+| `ADMIN_MINT_TOKEN`（**可选**） | 给「线上发码 / 撤销」的管理入口用。**不配 = 入口关闭**，应用照常运行；配成模板里的示例值同样等于关闭 |
 
 > ⚠️ **`INVITE_CODE_PEPPER` 是后加的。** 如果你的 `.env` 是很早以前建的，
 > 里面没有这一项，应用会**直接启动失败**并明确告诉你缺什么 —— 这是故意的：
@@ -184,8 +185,10 @@ Press CTRL+C to quit
 | `env_utils.py` | 读 `.env`。网页和评测器共用同一份实现，避免两边配置规则不一致 |
 | `knowledge_base/` | 资料库（3 份 Markdown 教学资料）。里面的 `README.md` 是说明文档，**不会被索引** |
 | `templates/index.html` | 界面：HTML 结构、CSS 样式、以及界面上的交互脚本 |
-| `test_app.py` | 网页的自动化测试（217 项）。**全程打桩，绝不调用真实 API** |
-| `test_profile_store.py` | 档案存储层的测试（84 项）：邀请码摘要、并发兑换、会话不改绑、白名单、级联删除 |
+| `admin_invite.py` | **本地管理脚本**：线上发码 / 撤销。码在本机生成，服务端只登记摘要；令牌走隐藏输入，不落盘 |
+| `test_app.py` | 网页的自动化测试（246 项）。**全程打桩，绝不调用真实 API** |
+| `test_profile_store.py` | 档案存储层的测试（91 项）：邀请码摘要、并发兑换、会话不改绑、白名单、级联删除 |
+| `test_admin_invite.py` | 本地管理脚本的测试（41 项）：全部离线，用假 I/O 驱动整套流程 |
 | `templates/invite.html` | 邀请码输入页 |
 | `templates/profile.html` | 学习档案页（查看 / 修改） |
 | `DEPLOYMENT.md` | **部署说明**：怎么把应用放到 Railway 上跑，以及为什么必须只开 1 个 worker |
@@ -375,7 +378,7 @@ cd C:\Claude-Code\ai_tutor
 python -m unittest test_app -v
 ```
 
-217 项测试，全部**打桩运行，绝不调用真实 API**——不花一分钱、断网也能跑。
+246 项测试，全部**打桩运行，绝不调用真实 API**——不花一分钱、断网也能跑。
 
 跑整个项目的测试（网页 + 检索 + 生成 + 评测器 + 配置）：
 

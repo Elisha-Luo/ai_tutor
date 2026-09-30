@@ -14,7 +14,8 @@ from flask import Flask, render_template, request, redirect, url_for, session, j
 from openai import OpenAI                           # 从 openai 库里导入 OpenAI 类（DeepSeek 兼容它的接口）
 from env_utils import (load_dotenv, is_example_api_key, EXAMPLE_KEY_MESSAGE,   # 共用 .env 读取；示例值检测也在那边
                        is_example_secret, example_secret_message,
-                       EXAMPLE_FLASK_KEY, EXAMPLE_PEPPER)
+                       EXAMPLE_FLASK_KEY, EXAMPLE_PEPPER, EXAMPLE_ADMIN_TOKEN,
+                       ADMIN_MIN_TOKEN_CHARS)
 import retriever                                     # 本地检索层：把问题变成「最相关的几段资料」
 import rag                                           # 生成与引用层：让模型照着资料回答，并校验它引用的来源
 import profile_store                                 # 学习档案存储层：邀请码、学习者、会话绑定、偏好
@@ -87,6 +88,51 @@ if not INVITE_CODE_PEPPER:
 # 拿到数据库的人可以直接对摘要做离线爆破，把邀请码还原出来。
 if is_example_secret(INVITE_CODE_PEPPER, EXAMPLE_PEPPER):
     raise RuntimeError(example_secret_message("INVITE_CODE_PEPPER"))
+
+# ===================== 管理入口的令牌（可选） =====================
+#
+# 【它和上面三个密钥的最大区别：没配也能跑】
+# 上面三个缺一个就启动失败；这个只是「管理入口关着」。
+# 理由：日常运行完全不需要它，只有发码 / 撤销那一刻才需要，不该因为它没配就起不来。
+#
+# 【fail closed：只有「看起来像真的配了」才开门】
+# 以下四种一律当作【没配】——入口直接消失（404）：
+#   ① 根本没设           ② 只填了空白（"   " 这种，bool() 会以为是真值）
+#   ③ 还是模板里那句公开的示例值（等于任何人都能给自己发码）
+#   ④ 明显太短的值（打错、截断、占位符……总之不可能是我们让人生成的那串）
+# 宁可入口不存在，也不要"看起来开着"。
+#
+# 【多长才算够】常量定义在 env_utils（和示例值放一起），文档让人用
+# `python -c "import secrets; print(secrets.token_hex(32))"` 生成 —— 那是 64 个字符。
+#
+# 去掉首尾空白再比：环境变量里带个换行/空格很常见，那样会导致
+# 「操作者粘贴的令牌」和「服务端记着的令牌」明明一样却对不上。
+ADMIN_MINT_TOKEN = os.environ.get("ADMIN_MINT_TOKEN", "").strip()
+
+
+def _admin_token_looks_configured(token):
+    """这个值算不算「真的配了一个管理令牌」？"""
+    value = (token or "").strip()
+    if not value:                                      # ① 空 / 只有空白
+        return False
+    if is_example_secret(value, EXAMPLE_ADMIN_TOKEN):   # ② 模板示例值
+        return False
+    if len(value) < ADMIN_MIN_TOKEN_CHARS:             # ③ 明显过短
+        return False
+    return True
+
+
+ADMIN_ENABLED = _admin_token_looks_configured(ADMIN_MINT_TOKEN)
+
+# 令牌从【请求头】读，不从 URL、也不从表单里读：
+#   · 放 URL 会进访问日志和浏览器历史
+#   · 放表单会跟着请求体一起被各处记录下来
+ADMIN_TOKEN_HEADER = "X-Admin-Token"
+
+# 管理请求的体积上限。协议本身很小（一个码最多几十个字符），
+# 给 1KB 已经很宽松 —— 超过就直接拒绝，不解析。
+ADMIN_MAX_BODY_BYTES = 1024
+ADMIN_MAX_CODE_CHARS = 128
 
 BASE_URL = "https://api.deepseek.com"                 # DeepSeek 的接口地址
 MODEL = "deepseek-chat"                               # 要调用的模型名字
@@ -460,9 +506,34 @@ def reserve_api_call(limit, day=None):
 # 放在正文【前面】而不是后面 —— 免得用户读完了才发现它没有依据。
 GENERAL_ANSWER_MARKER = "AI 通用知识回答"
 
+# 【英文版标记】用户明确选了「全英文」或「全英文 + 高级表达」时用它。
+# 为什么必须跟着换：那是他自己的语言偏好。正文是英文、标签却是中文，
+# 他读不懂 —— 等于把「这条回答没有资料依据」这件事藏起来，透明标识就失效了。
+# 【含义必须完全等价】两句都只说「这是通用知识、不是课程材料」，不暗示别的。
+GENERAL_ANSWER_MARKER_EN = "AI general-knowledge answer — not based on course materials"
 
-def format_answer_with_sources(result):
+# 哪几种语言模式该用英文标记
+ENGLISH_MARKER_MODES = ("en_only", "en_advanced")
+
+
+def general_answer_marker(preferences):
+    """这次该用哪个 general_answer 标记。
+
+    【默认必须是中文】没有档案（匿名访客）、或者没填语言偏好时，行为与以前一模一样。
+    【只影响这一个 decision】answer / refuse / insufficient_evidence 的显示都不经过它。
+    """
+    mode = (preferences or {}).get("language_mode")
+    if mode in ENGLISH_MARKER_MODES:
+        return GENERAL_ANSWER_MARKER_EN
+    return GENERAL_ANSWER_MARKER
+
+
+def format_answer_with_sources(result, marker=GENERAL_ANSWER_MARKER):
     """把 rag.generate_answer() 的返回值，格式化成最终要显示、并存入数据库的文字。
+
+    marker 是 general_answer 那条路用的标识文字（默认中文；全英文偏好时传英文版）。
+    【它只是一个标签】换的只是措辞，不能因为换了语言就把标识省略掉 ——
+    省略就等于让用户看不出这条回答没有资料依据，那正是这个标识存在的意义。
 
     【为什么单独抽成一个纯函数】
     它没有副作用、只看传进来的字典，所以能单独测：喂一个结果字典进去，
@@ -492,7 +563,7 @@ def format_answer_with_sources(result):
 
     # 【情况一】general_answer：有回答，但没有资料依据 —— 必须标出来
     if decision == "general_answer":
-        return "【" + GENERAL_ANSWER_MARKER + "】\n\n" + answer
+        return "【" + marker + "】\n\n" + answer
 
     # 【情况二】不是真的回答了，就没有「资料来源」这回事
     if decision != "answer" or not citations:
@@ -946,7 +1017,9 @@ def index():                                          # 用户每次打开页面
                 # ---------- 第五步：格式化 + 存库 ----------
                 # 只有真的回答了，才会在后面附上「资料来源」；
                 # 拒答和证据不足不会凭空多出一个来源列表。
-                answer = format_answer_with_sources(result)
+                # 【标记跟着档案的语言偏好走】选了全英文的人，标签也用英文
+                # （默认和中文模式下还是原来那句中文，行为零变化）
+                answer = format_answer_with_sources(result, general_answer_marker(preferences))
                 save_exchange(sid, question, answer)
 
                 # 【日志只记统计量】决策、引用数、耗时、上下文的条数和字符数。
@@ -990,6 +1063,143 @@ def index():                                          # 用户每次打开页面
 
     # 渲染页面。历史每次都从数据库读，所以重启程序也不会丢。
     return _render(sid, question=question, error=error)
+
+
+# ===================== 管理入口：发码 / 撤销 =====================
+#
+# 【为什么需要它】邀请码是「组织者生成 → 发给用户」的，而线上只有容器里能碰到那个数据库。
+# 上一个办法是 SSH 进容器跑命令行 —— 每次都要过一遍 SSH 密钥和主机身份确认，
+# 而且明文码会出现在交互式终端的回显里。
+# 这个入口把「发码」变成一次 HTTPS 请求：**码在操作者本机生成**，服务端只登记摘要。
+#
+# 【四条不能破的规矩】
+#   ① 令牌只从请求头读：不进 URL（会进访问日志）、不进表单（会跟着请求体被记下来）
+#   ② 令牌、邀请码、摘要【绝不进日志】—— 日志只记「发生了什么事」和结果状态
+#   ③ 错误响应不回显内部信息：统一一句短话，不带异常原文、不带路径
+#   ④ 未配置（或配置成示例值）→ 入口当作不存在（404），和普通路由的 404 长得一样
+#
+# 【它明确做不到的事】不能给已有学习者补发邀请码 —— 请求体里只接受 code，
+# 出现任何别的字段（尤其 learner_id）一律 400。补发需要身份核验，本项目没有。
+
+def _admin_not_found():
+    """入口关闭时统一回 404。和「这个路径根本不存在」无法区分 —— 这是刻意的。"""
+    return jsonify({"error": "not_found"}), 404
+
+
+def _admin_authorized():
+    """校验请求头里的管理令牌。用常数时间比较，避免逐字节试出来。"""
+    supplied = request.headers.get(ADMIN_TOKEN_HEADER, "")
+    if not supplied:
+        return False
+    # 【两边都要 encode】compare_digest 对字符串只接受纯 ASCII，
+    # 传进来一个带中文的假令牌会抛 TypeError（那就变成 500 了，还顺带暴露堆栈）
+    return hmac.compare_digest(str(supplied).encode("utf-8"),
+                               str(ADMIN_MINT_TOKEN).encode("utf-8"))
+
+
+def _admin_reject(reason):
+    """管理请求格式不对时的统一响应。只回一个短标记，不回显任何输入。"""
+    log_event("admin_bad_request", stage=reason)
+    response = jsonify({"error": "bad_request"})
+    response.headers["Cache-Control"] = "no-store"
+    return response, 400
+
+
+@app.route("/admin/invites", methods=["POST"])
+def admin_mint_invite():
+    """登记一张【由操作者本地生成】的邀请码。幂等：同一个码重复登记不会多出一行。"""
+    if not ADMIN_ENABLED:
+        return _admin_not_found()
+    if not _admin_authorized():
+        log_event("admin_unauthorized", stage="mint")
+        return jsonify({"error": "unauthorized"}), 401
+
+    # ---- 体积与字段：只允许一个 code ----
+    if (request.content_length or 0) > ADMIN_MAX_BODY_BYTES:
+        return _admin_reject("too_large")
+    if len(request.form) != 1 or "code" not in request.form:
+        # 【这一条同时挡住 learner_id 之类的字段】想借管理入口补发？结构上就不可能。
+        return _admin_reject("unexpected_fields")
+
+    code = (request.form.get("code") or "").strip()
+    if not code or len(code) > ADMIN_MAX_CODE_CHARS:
+        return _admin_reject("bad_code")
+
+    conn = _connect()
+    try:
+        outcome = profile_store.register_generated_invite(conn, code, INVITE_CODE_PEPPER)
+    except Exception as exc:
+        # 【异常不外泄】只记类型；用户看到固定的那句话
+        log_event("admin_mint_failed", error_type=type(exc).__name__)
+        response = jsonify({"error": "internal_error"})
+        response.headers["Cache-Control"] = "no-store"
+        return response, 500
+    finally:
+        conn.close()
+
+    if outcome == profile_store.REGISTER_REJECTED:
+        log_event("admin_mint_failed", error_type="IntegrityError")
+        response = jsonify({"error": "internal_error"})
+        response.headers["Cache-Control"] = "no-store"
+        return response, 500
+
+    # 【日志只记结果状态】不记码、不记摘要、不记令牌
+    log_event("admin_invite_registered", stage=outcome)
+    response = jsonify({"result": outcome})
+    response.headers["Cache-Control"] = "no-store"      # 发码响应绝不进任何缓存
+    return response, 200
+
+
+@app.route("/admin/invites/revoke", methods=["POST"])
+def admin_revoke_invite():
+    """按【明文码】作废一张邀请码，并断开该学习者已绑定的会话。
+
+    【为什么必须明文】库里只有摘要，摘要不可逆 —— 没有明文就无法定位那一行。
+    这也意味着：**明文丢了就作废不了**（这是已知限制，不是这里能修的）。
+    """
+    if not ADMIN_ENABLED:
+        return _admin_not_found()
+    if not _admin_authorized():
+        log_event("admin_unauthorized", stage="revoke")
+        return jsonify({"error": "unauthorized"}), 401
+
+    if (request.content_length or 0) > ADMIN_MAX_BODY_BYTES:
+        return _admin_reject("too_large")
+    if len(request.form) != 2 or "code" not in request.form:
+        return _admin_reject("unexpected_fields")
+
+    # 【二次确认由服务端也要一道】客户端的确认框可以被绕过；这里要求显式的 confirm=yes
+    if (request.form.get("confirm") or "") != "yes":
+        return _admin_reject("no_confirm")
+
+    code = (request.form.get("code") or "").strip()
+    if not code or len(code) > ADMIN_MAX_CODE_CHARS:
+        return _admin_reject("bad_code")
+
+    conn = _connect()
+    try:
+        # 复用现有逻辑：作废 + 断开该学习者的会话（只打标记、不删行）
+        result = profile_store.revoke_invite(conn, code, INVITE_CODE_PEPPER)
+    except Exception as exc:
+        log_event("admin_revoke_failed", error_type=type(exc).__name__)
+        response = jsonify({"error": "internal_error"})
+        response.headers["Cache-Control"] = "no-store"
+        return response, 500
+    finally:
+        conn.close()
+
+    if not result["revoked"]:
+        log_event("admin_revoke_rejected", stage="not_found")
+        response = jsonify({"result": "not_found"})
+        response.headers["Cache-Control"] = "no-store"
+        return response, 200
+
+    log_event("admin_invite_revoked", stage="revoked",
+              sessions_dropped=result["sessions_dropped"])
+    response = jsonify({"result": "revoked",
+                        "sessions_dropped": result["sessions_dropped"]})
+    response.headers["Cache-Control"] = "no-store"
+    return response, 200
 
 
 # ===================== 邀请码入口 =====================

@@ -526,7 +526,8 @@ class ExampleSecretConstantsTest(unittest.TestCase):
 
         for name, constant in (("DEEPSEEK_API_KEY", env_utils.EXAMPLE_API_KEY),
                                ("FLASK_SECRET_KEY", env_utils.EXAMPLE_FLASK_KEY),
-                               ("INVITE_CODE_PEPPER", env_utils.EXAMPLE_PEPPER)):
+                               ("INVITE_CODE_PEPPER", env_utils.EXAMPLE_PEPPER),
+                               ("ADMIN_MINT_TOKEN", env_utils.EXAMPLE_ADMIN_TOKEN)):
             with self.subTest(variable=name):
                 self.assertIn(name, values, ".env.example 里没有 " + name + " 这一行")
                 self.assertEqual(values[name], constant,
@@ -629,6 +630,83 @@ class AppRefusesExampleSecretsTest(unittest.TestCase):
             with self.subTest(variable=name):
                 _, output = self._import_app(**{name: value})
                 self.assertNotIn(value, output)
+
+
+class AdminTokenSwitchTest(unittest.TestCase):
+    """管理令牌的开关：配成示例值 / 不配 → 入口关着；配了真值 → 打开。
+
+    【和上面两个密钥的关键区别】管理令牌【不是必填】：
+    配成示例值或不配时，应用要**照常启动**，只是管理入口关掉 —— 绝不能启动失败。
+    这里用子进程真的 import app，读出它算出来的 ADMIN_ENABLED，
+    而不是在测试里手写一个 False（那样测的是测试自己）。
+    """
+
+    def _admin_enabled(self, token_value):
+        """在子进程里 import app，返回 (退出码, ADMIN_ENABLED 的字面值, 输出)。"""
+        tmpdir = tempfile.mkdtemp(prefix="ai_tutor_admincheck_")
+        self.addCleanup(__import__("shutil").rmtree, tmpdir, ignore_errors=True)
+
+        env = dict(os.environ)
+        env["DEEPSEEK_API_KEY"] = "test-key-not-a-real-key"
+        env["FLASK_SECRET_KEY"] = "test-secret-not-a-real-key"
+        env["INVITE_CODE_PEPPER"] = "test-pepper-not-a-real-pepper"
+        env["CHAT_DB_PATH"] = os.path.join(tmpdir, "check.db")
+        env["PYTHONIOENCODING"] = "utf-8"
+        if token_value is None:
+            env.pop("ADMIN_MINT_TOKEN", None)
+        else:
+            env["ADMIN_MINT_TOKEN"] = token_value
+
+        proc = subprocess.run(
+            [sys.executable, "-c",
+             "import app; print('ADMIN_ENABLED=' + str(app.ADMIN_ENABLED))"],
+            cwd=BASE, env=env, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60)
+        output = (proc.stdout or "") + (proc.stderr or "")
+        return proc.returncode, output
+
+    def test_no_token_still_starts_but_the_entry_is_closed(self):
+        """【核心】不配令牌 → 应用照常启动，管理入口关着。"""
+        code, output = self._admin_enabled(None)
+
+        self.assertEqual(code, 0, "管理令牌不是必填，不该启动失败：\n" + output[-400:])
+        self.assertIn("ADMIN_ENABLED=False", output)
+
+    def test_the_example_token_still_starts_but_the_entry_is_closed(self):
+        """【核心】配成公开的示例值 → 照常启动，但入口必须关着。
+
+        否则任何人拿模板里那句公开的话就能给自己发邀请码。
+        """
+        code, output = self._admin_enabled(env_utils.EXAMPLE_ADMIN_TOKEN)
+
+        self.assertEqual(code, 0, "不该因为示例值就启动失败（它不是必填项）")
+        self.assertIn("ADMIN_ENABLED=False", output)
+
+    def test_a_real_looking_token_opens_the_entry(self):
+        code, output = self._admin_enabled("some-real-admin-token-9f3a" + "0" * 30)
+
+        self.assertEqual(code, 0)
+        self.assertIn("ADMIN_ENABLED=True", output)
+
+    def test_whitespace_only_and_short_tokens_keep_the_entry_closed(self):
+        """【核心】fail closed：只有空白、或者明显太短的值，都不算「配好了」。
+
+        · 只有空白："   " 在 Python 里是【真值】—— 只写 bool() 就会误开门
+        · 明显太短：多半是打错、截断，或者随手填了个占位符
+        """
+        for token in ("   ", "\t", "short", "x" * 31, "changeme"):
+            with self.subTest(token=repr(token)[:12]):
+                code, output = self._admin_enabled(token)
+                self.assertEqual(code, 0)                       # 仍然不该启动失败
+                self.assertIn("ADMIN_ENABLED=False", output,
+                              "这种值居然把管理入口打开了：" + repr(token))
+
+    def test_the_boundary_length_is_accepted(self):
+        """正好等于最小长度的值算配好了（边界是「短于」才算过短）。"""
+        code, output = self._admin_enabled("y" * env_utils.ADMIN_MIN_TOKEN_CHARS)
+
+        self.assertEqual(code, 0)
+        self.assertIn("ADMIN_ENABLED=True", output)
 
 
 if __name__ == "__main__":

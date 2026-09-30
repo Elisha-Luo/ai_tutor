@@ -51,6 +51,7 @@ os.environ["FLASK_SECRET_KEY"] = "test-secret-not-a-real-key"                 # 
 os.environ["INVITE_CODE_PEPPER"] = "test-pepper-not-a-real-pepper"            # 假的 invitation pepper，只用于测试
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # 保证能找到同文件夹下的 app.py
+import env_utils                                                # 常量（示例值等）在这里定义
 import app as tutor                                             # 导入被测对象
 
 
@@ -1976,6 +1977,264 @@ class TestPrivacyCopy(ChatTestCase):
         self.assertIn("我的学习档案", bound)
 
 
+# ===================== 5o. 管理入口：发码 / 撤销 =====================
+#
+# 【这一组守什么】这是唯一一个【带令牌的写入口】。四条红线：
+#   ① 没配令牌（或配成示例值）→ 入口当作不存在
+#   ② 令牌只从请求头读、用常数时间比较；错了什么都不写
+#   ③ 码明文只在响应里出现，服务端日志里一个字都没有
+#   ④ 只能登记【全新的未绑定码】—— 结构上不可能给已有学习者补发
+
+class TestAdminInviteApi(ChatTestCase):
+
+    TOKEN = "test-admin-token-not-a-real-one"
+
+    def setUp(self):
+        super().setUp()
+        tutor.ADMIN_MINT_TOKEN = self.TOKEN
+        tutor.ADMIN_ENABLED = True
+        self.addCleanup(self._restore_admin)
+
+    def _restore_admin(self):
+        """还原成「未配置」——否则后面的测试会莫名其妙地"管理入口开着"。"""
+        tutor.ADMIN_MINT_TOKEN = ""
+        tutor.ADMIN_ENABLED = False
+
+    def post(self, path, data, token=TOKEN):
+        headers = {} if token is None else {tutor.ADMIN_TOKEN_HEADER: token}
+        return tutor.app.test_client().post(path, data=data, headers=headers)
+
+    def mint(self, code, token=TOKEN):
+        return self.post("/admin/invites", {"code": code}, token=token)
+
+    def invite_row(self, code):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute(
+                "SELECT status, learner_id FROM invites WHERE code_digest = ?",
+                (tutor.profile_store.digest_invite_code(code, tutor.INVITE_CODE_PEPPER),)
+            ).fetchone()
+        finally:
+            conn.close()
+
+    # ---------- 入口的开 / 关 ----------
+
+    def test_the_entry_is_closed_when_no_token_is_configured(self):
+        """【核心】没配令牌 → 入口当作不存在（404），其它路由不受影响。"""
+        tutor.ADMIN_ENABLED = False
+
+        r = self.post("/admin/invites", {"code": "whatever"}, token="随便什么")
+
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(self.table_count("invites"), 0)
+        # 正常页面照常工作
+        self.assertEqual(tutor.app.test_client().get("/").status_code, 200)
+
+    def test_the_example_token_keeps_the_entry_closed(self):
+        """【核心】配成 .env.example 里那个公开示例值 = 没配 → 入口关闭。
+
+        否则等于「任何人都能拿模板里那句公开的话给自己发码」。
+        """
+        tutor.ADMIN_MINT_TOKEN = env_utils.EXAMPLE_ADMIN_TOKEN
+        tutor.ADMIN_ENABLED = False                    # app 启动时就是这么算的
+
+        r = self.post("/admin/invites", {"code": "whatever"},
+                      token=env_utils.EXAMPLE_ADMIN_TOKEN)
+
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(self.table_count("invites"), 0)
+
+    # ---------- 授权 ----------
+
+    def test_a_missing_or_wrong_token_writes_nothing(self):
+        """【核心】令牌缺失 / 错误 → 401，且不写库。"""
+        for token in (None, "错的令牌", self.TOKEN + "x", "带中文的伪造令牌"):
+            r = self.mint("new-code-" + str(token), token=token)
+            with self.subTest(token=str(token)[:8]):
+                self.assertEqual(r.status_code, 401)
+
+        self.assertEqual(self.table_count("invites"), 0, "授权失败却写了库")
+
+    def test_the_token_is_read_from_the_header_not_the_body(self):
+        """令牌放错地方（放请求体）→ 不认。"""
+        r = self.post("/admin/invites",
+                      {"code": "c1", "token": self.TOKEN}, token=None)
+
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(self.table_count("invites"), 0)
+
+    # ---------- 登记 ----------
+
+    def test_a_valid_request_registers_exactly_one_invite(self):
+        """【核心】正常路径：200 + created，库里只有摘要。"""
+        r = self.mint("fresh-invite-abc")
+
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json(), {"result": "created"})
+        self.assertEqual(self.invite_row("fresh-invite-abc"),
+                         (tutor.profile_store.INVITE_ACTIVE, None))
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            dump = " ".join(str(row) for row in
+                            conn.execute("SELECT * FROM invites"))
+        finally:
+            conn.close()
+        self.assertNotIn("fresh-invite-abc", dump, "邀请码明文被存进数据库了")
+
+    def test_the_same_code_twice_is_idempotent_and_does_not_duplicate(self):
+        """【核心】同码重试 → 200 + already_registered，且库里仍然只有一行。"""
+        self.assertEqual(self.mint("same").get_json(), {"result": "created"})
+
+        r = self.mint("same")
+
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json(), {"result": "already_registered"})
+        self.assertEqual(self.table_count("invites"), 1, "重复登记多出了一行")
+
+    def test_a_bound_code_is_reported_as_bound(self):
+        """已经被用掉的码 → 明确报 already_bound（不是成功）。"""
+        self.make_invite("used-code")
+        c = tutor.app.test_client()
+        self.enter_invite(c, "used-code")              # 有人用它进来了
+
+        r = self.mint("used-code")
+
+        self.assertEqual(r.get_json(), {"result": "already_bound"})
+        self.assertEqual(self.table_count("invites"), 1)
+
+    def test_a_revoked_code_is_reported_as_revoked(self):
+        self.make_invite("dead-code")
+        self.revoke("dead-code")
+
+        r = self.mint("dead-code")
+
+        self.assertEqual(r.get_json(), {"result": "revoked"})
+
+    def test_an_integrity_failure_is_not_reported_as_already_registered(self):
+        """【核心】数据库别的完整性问题 → 500 internal_error，绝不报「已登记」。"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                conn.execute("CREATE TRIGGER boom BEFORE INSERT ON invites "
+                             "BEGIN SELECT RAISE(ABORT, '演示用的故障'); END")
+        finally:
+            conn.close()
+
+        r = self.mint("never-inserted")
+
+        self.assertEqual(r.status_code, 500)
+        self.assertEqual(r.get_json(), {"error": "internal_error"})
+        self.assertIsNone(self.invite_row("never-inserted"))
+
+    # ---------- 请求体限制 ----------
+
+    def test_it_cannot_be_used_to_reissue_for_an_existing_learner(self):
+        """【核心】夹带 learner_id → 400。结构上不可能给已有学习者补发码。"""
+        self.make_invite("code-a")
+        c = tutor.app.test_client()
+        self.enter_invite(c, "code-a")
+        learner = self.learner_id_of(c)
+
+        r = self.post("/admin/invites", {"code": "sneaky", "learner_id": str(learner)})
+
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.table_count("invites"), 1, "多出了一张码")
+
+    def test_a_missing_or_overlong_code_is_rejected(self):
+        for data in ({}, {"code": ""}, {"code": "   "},
+                     {"code": "x" * (tutor.ADMIN_MAX_CODE_CHARS + 1)}):
+            r = self.post("/admin/invites", data)
+            with self.subTest(data=str(data)[:20]):
+                self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.table_count("invites"), 0)
+
+    def test_an_oversized_body_is_rejected(self):
+        r = self.post("/admin/invites", {"code": "c1", "padding": "x" * 5000})
+
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.table_count("invites"), 0)
+
+    # ---------- 响应与日志 ----------
+
+    def test_the_response_is_never_cached(self):
+        r = self.mint("cache-me")
+        self.assertEqual(r.headers.get("Cache-Control"), "no-store")
+
+    def test_no_secret_reaches_the_logs(self):
+        """【核心】令牌、邀请码明文、摘要，一个都不许进日志。"""
+        code = "log-check-code-9f2a"
+        digest = tutor.profile_store.digest_invite_code(code, tutor.INVITE_CODE_PEPPER)
+
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            self.mint(code)
+            self.mint(code)                            # 幂等那次也要查
+            self.mint("另一个码", token="错的令牌")       # 授权失败那次也要查
+        blob = "\n".join(captured.output)
+
+        self.assertNotIn(code, blob, "邀请码明文进了日志")
+        self.assertNotIn(digest, blob, "邀请码摘要进了日志")
+        self.assertNotIn(self.TOKEN, blob, "管理令牌进了日志")
+        # 该记的要记（只有状态，没有内容）
+        self.assertIn("admin_invite_registered", blob)
+        self.assertIn("stage=created", blob)
+
+    def test_errors_do_not_echo_internals(self):
+        r = self.mint("x" * 500)
+        body = r.get_data(as_text=True)
+        for leak in ("Traceback", "sqlite", "Trigger", "app.py", tutor.INVITE_CODE_PEPPER):
+            self.assertNotIn(leak, body)
+
+    # ---------- 撤销 ----------
+
+    def test_revoke_needs_a_valid_token_and_a_confirmation(self):
+        """【核心】撤销要有令牌 + 显式确认，缺一个都不写库。"""
+        self.make_invite("code-a")
+
+        no_token = self.post("/admin/invites/revoke",
+                             {"code": "code-a", "confirm": "yes"}, token=None)
+        no_confirm = self.post("/admin/invites/revoke", {"code": "code-a"})
+
+        self.assertEqual(no_token.status_code, 401)
+        self.assertEqual(no_confirm.status_code, 400)
+        self.assertEqual(self.invite_row("code-a"),
+                         (tutor.profile_store.INVITE_ACTIVE, None), "被改动了")
+
+    def test_revoking_cuts_off_the_bound_sessions(self):
+        """【核心】按明文码撤销 → 复用现有逻辑：码作废 + 已绑定会话失效。"""
+        self.make_invite("code-a")
+        c = tutor.app.test_client()
+        self.enter_invite(c, "code-a")
+        self.assertEqual(c.get("/profile").status_code, 200)
+
+        r = self.post("/admin/invites/revoke", {"code": "code-a", "confirm": "yes"})
+
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["result"], "revoked")
+        self.assertEqual(r.get_json()["sessions_dropped"], 1)
+        self.assertEqual(self.invite_row("code-a")[0], tutor.profile_store.INVITE_REVOKED)
+        # 那台浏览器现在进不了档案页了
+        self.assertEqual(c.get("/profile").status_code, 302)
+        self.assertIsNone(self.learner_id_of(c))
+
+    def test_revoking_an_unknown_code_changes_nothing(self):
+        r = self.post("/admin/invites/revoke", {"code": "从没发过", "confirm": "yes"})
+
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json()["result"], "not_found")
+
+    def test_revoke_never_puts_the_code_in_the_logs(self):
+        code = "revoke-log-check-1b"
+        self.make_invite(code)
+
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            self.post("/admin/invites/revoke", {"code": code, "confirm": "yes"})
+        blob = "\n".join(captured.output)
+
+        self.assertNotIn(code, blob)
+        self.assertIn("admin_invite_revoked", blob)
+
+
 # ===================== 5m. 会话边界：失效会话与新邀请码 =====================
 #
 # 【这一组修的是什么】两个真实复现出来的问题：
@@ -2807,6 +3066,136 @@ class TestDeleteAllData(ChatTestCase):
         self.assertEqual(self.table_count("messages"), 0, "已删除的数据被旧请求写回来了")
         self.assertEqual(self.table_count("learners"), 0)
         self.assertEqual(self.table_count("learner_sessions"), 0)
+
+
+# ===================== 5p. general_answer 的英文标识 =====================
+#
+# 【要解决什么】选了「全英文」的人，正文是英文、标签却是中文「AI 通用知识回答」——
+# 他读不懂，等于把「这条回答没有课程资料依据」这件事藏起来了，透明标识就失效了。
+#
+# 【边界】换的只是【标签本身】：默认/中文模式一个字不变；
+# answer / refuse / insufficient_evidence 完全不经过这段逻辑；
+# rag.py 里的固定兜底话术一个字不动。
+
+class TestGeneralAnswerMarker(ChatTestCase):
+
+    EN_MARKER = "AI general-knowledge answer — not based on course materials"
+    ZH_MARKER = "AI 通用知识回答"
+
+    def bind(self, code="c1"):
+        self.make_invite(code)
+        c = tutor.app.test_client()
+        self.enter_invite(c, code)
+        return c
+
+    def general_answer_reply(self):
+        return rag_reply(decision="general_answer", answer="直译是……", citations=[])
+
+    # ---------- 纯函数层 ----------
+
+    def test_the_marker_defaults_to_chinese(self):
+        """【核心防回归】默认（没有档案 / 没填语言偏好）必须还是那句中文。"""
+        for preferences in (None, {}, {"language_mode": "zh_pair"},
+                            {"level_code": "b1"}):
+            with self.subTest(preferences=preferences):
+                self.assertEqual(tutor.general_answer_marker(preferences), self.ZH_MARKER)
+
+    def test_english_modes_switch_the_marker(self):
+        for mode in ("en_only", "en_advanced"):
+            with self.subTest(mode=mode):
+                self.assertEqual(tutor.general_answer_marker({"language_mode": mode}),
+                                 self.EN_MARKER)
+
+    def test_formatting_still_puts_the_marker_before_the_body(self):
+        result = {"decision": "general_answer", "answer": "正文在这里。", "citations": []}
+
+        out = tutor.format_answer_with_sources(result, self.EN_MARKER)
+
+        self.assertTrue(out.startswith("【" + self.EN_MARKER + "】"))
+        self.assertLess(out.index(self.EN_MARKER), out.index("正文在这里。"))
+
+    def test_other_decisions_do_not_get_a_marker(self):
+        """answer / refuse / insufficient 都不该出现任何标识（换不换语言都一样）。"""
+        for decision, answer in (("answer", "有依据的回答。"),
+                                 ("refuse", "拒答。"),
+                                 ("insufficient_evidence", "证据不足。")):
+            result = {"decision": decision, "answer": answer,
+                      "citations": [{"source": "a.md", "heading": "甲"}]
+                      if decision == "answer" else []}
+            with self.subTest(decision=decision):
+                out = tutor.format_answer_with_sources(result, self.EN_MARKER)
+                self.assertNotIn(self.EN_MARKER, out)
+                self.assertNotIn(self.ZH_MARKER, out)
+
+    # ---------- 网页层 ----------
+
+    def test_an_english_profile_gets_the_english_marker(self):
+        """【核心】选了全英文 → 存进库里、显示在页面上的是英文标识，没有中文标识。"""
+        c = self.bind()
+        self.save_profile(c, language_mode="en_only")
+        self.fake.reply = self.general_answer_reply()
+
+        self.ask(c, "帮我改一下这句话")
+
+        saved = self.all_rows()[1][2]
+        self.assertIn(self.EN_MARKER, saved)
+        self.assertNotIn(self.ZH_MARKER, saved, "英文模式下还留着中文标识")
+
+        html = c.get("/").get_data(as_text=True)
+        self.assertIn("general-knowledge answer", html)
+
+    def test_an_advanced_english_profile_also_gets_it(self):
+        c = self.bind()
+        self.save_profile(c, language_mode="en_advanced")
+        self.fake.reply = self.general_answer_reply()
+
+        self.ask(c, "帮我改一下这句话")
+
+        self.assertIn(self.EN_MARKER, self.all_rows()[1][2])
+
+    def test_a_chinese_profile_keeps_the_chinese_marker(self):
+        """【核心防回归】选「中英对照」的人看到的还是原来那句中文。"""
+        c = self.bind()
+        self.save_profile(c, language_mode="zh_pair")
+        self.fake.reply = self.general_answer_reply()
+
+        self.ask(c, "帮我改一下这句话")
+
+        saved = self.all_rows()[1][2]
+        self.assertIn(self.ZH_MARKER, saved)
+        self.assertNotIn(self.EN_MARKER, saved)
+
+    def test_an_anonymous_visitor_keeps_the_chinese_marker(self):
+        """【核心防回归】匿名访客（没有档案）行为零变化。"""
+        c = tutor.app.test_client()
+        self.fake.reply = self.general_answer_reply()
+
+        self.ask(c, "随便问一句")
+
+        self.assertIn(self.ZH_MARKER, self.all_rows()[1][2])
+
+    def test_the_english_marker_is_never_dropped_or_turned_into_a_citation(self):
+        """【安全边界】换语言不等于可以不标：标识必须在，且不能变成"引用"。"""
+        c = self.bind()
+        self.save_profile(c, language_mode="en_only")
+        self.fake.reply = self.general_answer_reply()
+
+        self.ask(c, "帮我改一下这句话")
+
+        saved = self.all_rows()[1][2]
+        self.assertIn(self.EN_MARKER, saved, "标识被丢掉了")
+        self.assertNotIn("资料来源", saved, "general_answer 绝不能有来源区")
+
+    def test_rag_module_untouched_by_this_change(self):
+        """【结构性保证】这次只改展示标签：rag.py 的固定兜底话术一个字不动。"""
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "rag.py"), encoding="utf-8") as f:
+            source = f.read()
+
+        self.assertIn("这个问题我帮不上忙。", source)        # REFUSE_TEXT 开头
+        self.assertIn("资料里提到了相关的话题", source)      # INSUFFICIENT_TEXT 开头
+        self.assertNotIn("general-knowledge answer", source,
+                         "英文标签不该出现在 rag.py 里（那是展示层的事）")
 
 
 # ===================== 6. 纯函数：格式化成显示文本 =====================

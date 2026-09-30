@@ -318,6 +318,71 @@ def create_invite(conn, code, pepper):
     return True
 
 
+# ===================== 登记一张「外部生成」的邀请码 =====================
+#
+# 【和 create_invite / generate_invite_code 的分工】
+#   generate_invite_code() —— 在我们这边造一个码（老路：SSH 进去跑命令行）
+#   create_invite()        —— 把指定明文码登记进库；**重复登记算失败**（返回 False）
+#   register_generated_invite() —— 线上管理入口用：码由【操作者的脚本】本地生成，
+#                             这里只负责登记，而且**重复登记必须是幂等的**
+#
+# 【为什么幂等是硬要求】
+# 管理入口是走 HTTPS 的，响应可能丢：脚本发出去了、但没收到回复。
+# 这时操作者【手里已经有那张码了】（本地生成的），正确的做法是拿同一张码重试。
+# 如果重试会被当成「重复 / 出错」，操作者就会改生成第二张 —— 于是线上多了一张
+# 谁也不认识的码。所以「同一个码再次登记」必须给一个明确、可确认、不重复发码的结果。
+
+REGISTER_CREATED = "created"                       # 新登记成功
+REGISTER_ALREADY_REGISTERED = "already_registered"  # 同一张码之前就登记过，仍然有效未绑定
+REGISTER_ALREADY_BOUND = "already_bound"           # 这张码已经被某位学习者用掉了
+REGISTER_REVOKED = "revoked"                       # 这张码已被作废
+REGISTER_REJECTED = "rejected"                     # 数据库完整性错误，且【不是】"已存在"
+
+VALID_REGISTER_OUTCOMES = (REGISTER_CREATED, REGISTER_ALREADY_REGISTERED,
+                           REGISTER_ALREADY_BOUND, REGISTER_REVOKED,
+                           REGISTER_REJECTED)
+
+
+def register_generated_invite(conn, code, pepper):
+    """登记一张由外部生成的邀请码。返回上面那几种状态之一（**绝不返回码本身**）。
+
+    【只登记「全新的、未绑定的」码】这里没有任何 learner_id 参数 ——
+    从结构上保证它做不到「给已有学习者补发邀请码」那件事
+    （那件事需要身份核验，本项目没有，所以 reissue 是停用的）。
+
+    【为什么 IntegrityError 不能一律当成「已登记」】
+    完整性错误至少有四种来源：UNIQUE、CHECK、NOT NULL、触发器 RAISE。
+    只有「按摘要查得到这一行」才是幂等成功；查不到就说明是别的完整性问题，
+    必须如实报 rejected —— 否则数据库出错时我们会告诉操作者「已经登记好了」，
+    而他手上那张码其实根本不在库里。
+    """
+    digest = digest_invite_code(code, pepper)
+
+    try:
+        with conn:
+            conn.execute(
+                "INSERT INTO invites (code_digest, status, created_at) VALUES (?, ?, ?)",
+                (digest, INVITE_ACTIVE, _now()),
+            )
+        return REGISTER_CREATED
+    except sqlite3.IntegrityError:
+        # 走到这里不代表「已存在」—— 再查一次，用事实说话
+        row = conn.execute(
+            "SELECT status, learner_id FROM invites WHERE code_digest = ?", (digest,)
+        ).fetchone()
+        if row is None:
+            return REGISTER_REJECTED          # 库里有别的完整性问题
+
+        status, learner_id = row
+        if learner_id is not None:
+            return REGISTER_ALREADY_BOUND     # 已经被人用掉了
+        if status == INVITE_REVOKED:
+            return REGISTER_REVOKED           # 已作废（作废过的码不"复活"）
+        if status == INVITE_ACTIVE:
+            return REGISTER_ALREADY_REGISTERED  # 幂等：同一张码，之前登记过了
+        return REGISTER_REJECTED              # 状态不在白名单里（数据坏了）
+
+
 def issue_replacement_invite(conn, learner_id, pepper):
     """给一个【已经存在】的学习者补发一张新邀请码。返回新码；学习者不存在返回 None。
 

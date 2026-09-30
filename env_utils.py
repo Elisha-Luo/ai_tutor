@@ -175,6 +175,17 @@ def is_example_api_key(value):
 EXAMPLE_FLASK_KEY = "change-me-run-the-command-above-to-generate-your-own"
 EXAMPLE_PEPPER = "change-me-run-the-command-above-to-generate-your-own"
 
+# 【管理令牌】给「线上发码 / 撤销邀请码」那个管理入口用的。
+# 它和上面三个不一样：**没配也照样能跑**（只是管理入口关着）。
+# 所以它的示例值不需要「启动就报错」，而是「当成没配」——见 app.py 里的 ADMIN_ENABLED。
+EXAMPLE_ADMIN_TOKEN = "change-me-run-the-command-above-to-generate-your-own"
+
+# 【管理令牌最短多长才算「配好了」】
+# 文档让人用 `python -c "import secrets; print(secrets.token_hex(32))"` 生成 —— 那是 64 个字符。
+# 这里只要求 32 以上：不是要卡格式，而是「明显过短」的值（打错、截断、随手填的占位符）
+# 一定不是照着文档生成的，那就不该拿它当门锁。
+ADMIN_MIN_TOKEN_CHARS = 32
+
 
 def is_example_secret(value, example_value):
     """这个值是不是 `.env.example` 里那个公开的占位符（精确相等）？

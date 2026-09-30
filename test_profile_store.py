@@ -982,6 +982,86 @@ class TestSessionIsRevoked(StoreTestCase):
         self.assertTrue(profile_store.session_is_revoked(self.conn, "device-1"))
 
 
+# ===================== 3k. 登记「外部生成」的邀请码（幂等）=====================
+#
+# 【这一组守什么】线上发码走 HTTPS，响应可能丢。操作者手里有码，正确的做法是
+# 拿同一张码重试 —— 所以「同一个码重复登记」必须是**幂等**的，而且
+# 「数据库有别的完整性问题」绝不能被误报成「已经登记好了」。
+
+class TestRegisterGeneratedInvite(StoreTestCase):
+
+    def state(self, code):
+        return self.conn.execute(
+            "SELECT status, learner_id FROM invites WHERE code_digest = ?",
+            (profile_store.digest_invite_code(code, PEPPER),)).fetchone()
+
+    def test_a_fresh_code_is_registered(self):
+        outcome = profile_store.register_generated_invite(self.conn, "fresh-code", PEPPER)
+
+        self.assertEqual(outcome, profile_store.REGISTER_CREATED)
+        self.assertEqual(self.state("fresh-code"), (profile_store.INVITE_ACTIVE, None))
+
+    def test_registering_only_stores_the_digest(self):
+        """【核心安全断言】明文不进库。"""
+        profile_store.register_generated_invite(self.conn, "only-digest-xyz", PEPPER)
+
+        dump = " ".join(str(r) for r in self.conn.execute("SELECT * FROM invites"))
+        self.assertNotIn("only-digest-xyz", dump)
+
+    def test_registering_the_same_code_again_is_idempotent(self):
+        """【核心】同一张码重复登记 → 不产生第二行，返回「已登记过」。"""
+        profile_store.register_generated_invite(self.conn, "same-code", PEPPER)
+        outcome = profile_store.register_generated_invite(self.conn, "same-code", PEPPER)
+
+        self.assertEqual(outcome, profile_store.REGISTER_ALREADY_REGISTERED)
+        self.assertEqual(self.count("invites"), 1, "重复登记产生了第二行")
+
+    def test_a_bound_code_reports_bound_not_registered(self):
+        """已经被人用掉的码 → 必须如实说「已绑定」，不能报成功。"""
+        profile_store.create_invite(self.conn, "c1", PEPPER)
+        profile_store.redeem_invite(self.conn, "c1", PEPPER)
+
+        outcome = profile_store.register_generated_invite(self.conn, "c1", PEPPER)
+
+        self.assertEqual(outcome, profile_store.REGISTER_ALREADY_BOUND)
+        self.assertEqual(self.count("invites"), 1)
+
+    def test_a_revoked_code_reports_revoked_not_registered(self):
+        """作废过的码不"复活"，也不能被当成新登记成功。"""
+        profile_store.create_invite(self.conn, "c1", PEPPER)
+        profile_store.revoke_invite(self.conn, "c1", PEPPER)
+
+        outcome = profile_store.register_generated_invite(self.conn, "c1", PEPPER)
+
+        self.assertEqual(outcome, profile_store.REGISTER_REVOKED)
+        self.assertEqual(self.state("c1"), (profile_store.INVITE_REVOKED, None))
+
+    def test_other_integrity_errors_are_not_reported_as_already_registered(self):
+        """【核心】完整性错误 ≠ 已登记。
+
+        用触发器制造一个「跟唯一约束无关」的完整性错误：
+        这时库里的那一行【并不存在】，如果我们一律按「已登记」回，
+        就等于告诉操作者"你那张码已经好了"，而它其实根本不在库里。
+        """
+        with self.conn:
+            self.conn.execute(
+                "CREATE TRIGGER boom BEFORE INSERT ON invites "
+                "BEGIN SELECT RAISE(ABORT, '演示用的故障'); END")
+
+        outcome = profile_store.register_generated_invite(self.conn, "never-inserted", PEPPER)
+
+        self.assertEqual(outcome, profile_store.REGISTER_REJECTED)
+        self.assertIsNone(self.state("never-inserted"), "居然真的插进去了")
+        self.assertEqual(self.count("invites"), 0)
+
+    def test_every_outcome_is_in_the_known_set(self):
+        """返回值只能是那几个约定的状态之一（防止以后加了分支忘了登记）。"""
+        profile_store.register_generated_invite(self.conn, "c1", PEPPER)
+        self.assertIn(profile_store.REGISTER_CREATED, profile_store.VALID_REGISTER_OUTCOMES)
+        self.assertIn(profile_store.register_generated_invite(self.conn, "c1", PEPPER),
+                      profile_store.VALID_REGISTER_OUTCOMES)
+
+
 # ===================== 3e. 补发命令已停用 =====================
 #
 # 【为什么要有这一组】「按编号补发」在没有身份核验的前提下是个危险入口：
