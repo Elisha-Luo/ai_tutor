@@ -571,6 +571,52 @@ class TestTeachingAccuracyPrompt(RagTestCase):
         self.assertIn("最容易犯的错", p)
         self.assertIn("通常是形容词 / 通常是副词", p)
 
+    # ---------- A-3. A2 复现之后的第二次最小改进 ----------
+    #
+    # 【改动针对的失败模式 —— 从三次真实复测的【共同点】读出来的】
+    #
+    # 三次复测里，`more fast → faster` 的【答案】都对，差别只在理由怎么写的：
+    #   · 第一、三次：说的是「修饰动词」「已经有比较级形式」—— A2 未触发；
+    #   · 第二次：多写了一句「它是短形容词」—— A2 触发。
+    # 也就是说，失败那次并不是**判断不出**词性，而是**多说了一个不需要的标签**，
+    # 而且恰好是教材里最顺口的那个（「短形容词加 -er」）。
+    #
+    # 现有规则管的是「理由要和真实词性对得上」「怎么判断词性」——
+    # 它默认「既然你要说词性，就得说对」，却**没说「不需要时就别说」**。
+    # 这次补的就是这条，外加一条说明：教材里那些按类别给的说法，本身只适用于那一类词。
+    #
+    # 【仍然没有放进提示词】原句、原句片段、答案要点，以及任何具体英文词 ——
+    # 新增文字里依旧不含一个英文单词，下面的反泄题测试会连带把这段一起查一遍。
+    #
+    # ⚠️ 和上面一样：这些断言只证明「要求写进了 system 提示词」。
+    #    模型下一轮会不会少贴标签，只能靠真实复测回答（需另行授权）。
+
+    def test_unnecessary_part_of_speech_labels_are_discouraged(self):
+        """通用要求：不需要词性也能说清楚时，就不要顺手贴一个标签。"""
+        p = self.system_prompt()
+        self.assertIn("不是每处都要贴词性标签", p)
+        self.assertIn("顺手再加一个词性判断", p)
+        self.assertIn("连标签一起记住", p)
+
+    def test_a_rule_and_a_label_must_not_justify_each_other(self):
+        """禁止「为了套上一条规则而临时指定词性」—— 两者要各自被本句证实。"""
+        p = self.system_prompt()
+        self.assertIn("规则和词性必须各自都被这句话证实", p)
+        self.assertIn("不能拿一个去圆另一个", p)
+
+    def test_a_class_specific_rule_is_not_a_general_rule(self):
+        """教材里的说法讲的是【某一类词】，套用前要先确认眼前这个词是不是那一类。"""
+        p = self.system_prompt()
+        self.assertIn("别把「某一类词的规则」当成通用规则", p)
+        self.assertIn("不要引用这条规则", p)
+
+    def test_the_same_word_can_change_category_by_position(self):
+        """【本轮新增的知识点】形容词和副词里有一批同形词，所以「通常属于哪类」不能替代「此刻属于哪类」。"""
+        p = self.system_prompt()
+        self.assertIn("同一个词换个位置可能就换一类", p)
+        self.assertIn("形容词和副词里有一批词是同形的", p)
+        self.assertIn("不能替代", p)
+
     # ---------- B. 答案不能泄进提示词（本轮验收设计修正的重点）----------
 
     def test_m01_sentence_is_not_in_the_system_prompt(self):
