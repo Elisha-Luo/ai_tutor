@@ -111,6 +111,57 @@ DOC_TITLE_WEIGHT = 2    # 整份文档的一级标题里的词，算 2 遍
 BIGRAM_STOP_CHARS = "的"
 
 
+# ---- 英文功能词：这些词出现在问题里，【不代表】问题在问它们 ----
+#
+# 【为什么需要】
+# BM25 只看「词重不重合」，它不知道 the / to / they 这类词几乎不携带信息。
+# 于是一句**英文**问题（比如「帮我改这句英文」）会和某段中文资料靠
+# the / it / they / to / you 这些词对上，拿到一个看起来很高的分数 ——
+# 实测过：一个 13.14 分的"命中"，逐词拆开一看，命中的 6 个词【全是功能词】，
+# 一个实词都没有。这段资料被当成「可用资料」递给模型，就有被误引的风险。
+#
+# 【这个高分跟「来源多样性」那条规则无关，别记错】
+# retrieve() 里的来源多样性是一条**每来源【上限】**（每个文件最多贡献
+# ceil(top_k / 2) 段）——它只会**砍掉**候选，不会给任何片段加分。
+# 那个 13.14 是这一段自己算出来的，纯粹由功能词造成：
+# 既不是多样性规则凑出来的，也不是什么「保底配额」。
+# 它叫「上限」不是「配额」——两者方向正好相反。
+#
+# 【这份表是【照着本知识库核对过】的，不是照搬通用停用词表】
+# 通用停用词表会把 have / has / been / since / for 一并删掉 ——
+# 但在这个项目里，它们**恰恰是知识点本身**（知识库讲的就是现在完成时）。
+# 照搬会把真正该命中的东西也一起删掉。所以下面是逐词核对之后的保守名单。
+#
+# 【明确保留（即使它们也常被列进通用停用词表）】
+#   · 现在完成时的信号词：since / for / just / already / yet / ever / never /
+#     far（so far）/ now（up to now）/ recently  —— 它们是考题的一部分
+#   · be 动词家族：be / being / been / am / is / are / was / were —— 语法知识点
+#   · 助动词：do / does / did —— 问答和否定都靠它们
+#   · 指示代词：this / that / these / those —— 本身就是一个常见考点
+#   · 疑问词：what / which / who / when / where / why / how —— 用户可能直接问它们
+#
+# 【过滤掉的只限于「纯语法胶水」】
+# 冠词、人称/物主代词、不定式 to、常见介词、连词 ——
+# 判定标准很直接：**一个词单独出现在问题里，不能作为「这个问题和那段资料有关」的证据。**
+# 就算用户真的问「the 怎么用」，那个问题也一定是中文写成的，靠这一个词也匹配不出东西。
+#
+# 【代价（必须写出来）】
+# 英文里的 for / since / to 有时是实义用法（"wait for" / "the key to"）。
+# 这一版把它们中的 since / for / to 区别对待：since 和 for 是信号词，保留；
+# to 是纯语法胶水，过滤。真换成别的语料时必须重新核对这份表。
+#
+# 【它做不到什么 —— 别把这行改动当成"引用相关性已经有保障"】
+# 过滤只解决「靠功能词拿到高分」这一件事。过滤之后，那句英文问题**仍然**会
+# 因为 learn 这种实词命中一段无关资料（分数很低，但非零）。
+# **检索改善 ≠ 引用相关性已获保证** —— 引用是否真的支持回答，这一层依然没人管。
+ENGLISH_FUNCTION_WORDS = frozenset("""
+a an the
+i you he she it we they me him her us them my your his its our their
+to of in on at by with from as into over under than
+and or but if
+""".split())
+
+
 # ===================== 分词 =====================
 
 # 英文单词 / 数字：连续的字母数字算一个词
@@ -141,6 +192,10 @@ def tokenize(text):
     tokens = []
 
     for word in ASCII_WORD_RE.findall(text):                # 先把英文单词和数字挑出来
+        if word in ENGLISH_FUNCTION_WORDS:
+            # 【为什么直接丢掉】理由和代价见 ENGLISH_FUNCTION_WORDS 上面的说明。
+            # 一句话：the / to / they 出现在问题里，不能说明这个问题和资料有关。
+            continue
         tokens.append(word)
 
     for run in CJK_RUN_RE.findall(text):                    # 再处理中文片段

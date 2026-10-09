@@ -386,6 +386,229 @@ class TestDecisionBoundaryPrompt(RagTestCase):
         self.assertNotIn("询问课程的业务事实，而资料里没有记录", self.system_prompt())
 
 
+# ===================== 5b-2. 教学准确性提示词 =====================
+#
+# 【这一组能守住什么、守不住什么 —— 必须说清楚，别读错】
+#
+# 起因是一次真实的线上验收失败：用户先让助手改一句话，
+# 再追问「上一句的两个主要错误」。助手记住了上下文，但**解释错了两个地方** ——
+# 把一处【本来就正确】的形式说成违反了规则（`make + 宾语 + 动词原形` 里的 learn
+# 已经是动词原形），又把修饰动词的 fast 的解释说成了形容词比较级。
+#
+# 【本轮的验收设计修正：提示词里【不】放那道真实原句和它的逐项答案】
+# 原因很直接：真实复测要重问**同一道题**。如果 system 提示词里躺着原句和标准答案，
+# 那次复测就变成「看着答案考试」，测不出模型自己会不会讲对。
+# 所以这里只放**通用的核对要求**（先看形式、再看词性、再套规则），
+# 并用一条测试钉住：**M01 的原句和它的答案要点不得出现在 system 提示词里**。
+#
+# 【2026-10-08 首次真实复测之后又补了两条】
+# 那次复测（M01）**未通过**，但暴露的两处毛病都是【通用】的，不是那道题特有的：
+#   ① 改写里把某个词改了，却没把这项改动当成错误解释（用户看不出动了什么、为什么动）；
+#   ② 把一个自己都承认「语法没问题」的表达，列进了「主要错误」清单。
+# 所以补了两条通用要求：**改动要能对上解释**、**错误和可选建议必须分开列**。
+# 提示词里依旧**不**放那道原句和它的答案 —— 下一轮复测还要重问同一道题。
+#
+# 【第二次真实复测之后又补了一条 —— 因为 A2 复现了】
+# 两次复测里，模型对**同一处词性问题**的说法明显不同：
+#   · 第一次说「the comparative simply modifies the verb」—— A2 未触发；
+#   · 第二次说「Fast is a short adjective」—— A2 触发。
+# 一个**推测**（没有直接证据）：第一次像是在按句中的修饰关系说，第二次像是在按这个词
+# 常见的词性说。这只解释了**措辞的差别**，**不能证明这就是出错的原因**。
+# 能确认的只有一件事：原来那条规则只写了「理由必须和真实词性对得上」，**没写怎么判断词性**。
+# 所以补的是【判断方法】。**但第一版那句话写得太绝对** ——
+# 「修饰名词的是形容词，修饰动词 / 形容词 / 副词的是副词」是一条**公式**，而它并不成立：
+# 英文里**名词也能作定语**（名词修饰名词），所以「修饰名词 → 一定是形容词」是错的。
+# 现在改成：看**整句的结构和它此刻起的作用**，两个方向都要看 ——
+# 既不能只看这个词常见的词性，也不能只看它挨着谁就机械下结论；
+# **「修饰谁」是线索，不是能单独定词性的公式**；仍然定不下来就不要编。
+# 一如既往：提示词里**不**出现那道题的原句、答案，也不出现任何具体英文词。
+#
+# 【这一组测试只能证明「这些要求真的写进了发给模型的 system 提示词」】
+# 它【证明不了】模型下一次讲解就是对的 —— 模型完全可能不照做。
+# 「模型这次有没有讲对」只能靠人看真实回答（见 PERSONALIZATION_EVALS.md 的 M01 / M02）。
+#
+# ⚠️ 不要把「假客户端测试通过」当成「模型的语法解释已被验证正确」。
+#    假客户端只会返回测试自己写好的字符串，它对语法一窍不通。
+
+class TestTeachingAccuracyPrompt(RagTestCase):
+    """检查教学准确性的几条要求有没有写进 system 提示词，
+    以及 M01 那道真实原句和它的答案有没有**泄进提示词**。
+
+    【这个类能证明什么、不能证明什么 —— 别读错】
+
+    能证明的**只有一件事**：这些要求**确实出现在发给模型的 system 消息里**。
+    证明**不了**的：模型下一轮会不会照着讲。
+
+    原因很直接：这里用的是假客户端，它返回什么完全由测试自己写死 ——
+    它对语法一窍不通。**不要把这里的绿灯当成「模型的语法解释已被验证正确」。**
+
+    【具体到 A2】本类**证明不了**模型下次会把词性讲对。
+    **M01 的 A2 目前仍记为未解决** —— 要动它只能靠真实复测（另行授权），
+    不是靠这里多加几条断言。
+    """
+
+    # 【M01 的原句】只作为**测试输入**用，绝不允许出现在 system 提示词里。
+    # 它同时是 PERSONALIZATION_EVALS.md 里 M01 的复测输入 —— 所以这里必须钉死。
+    M01_SENTENCE = "AI make student learn more fast, but they depend to it too much."
+
+    # 【M01 分项标准的答案要点】同样不许进提示词，否则复测等于开卷考试。
+    M01_ANSWER_POINTS = (
+        "students",     # B2 的正确答案
+        "缺冠词",       # B2 的理由
+        "faster",       # B3 的正确答案
+        "more fast",    # B3 要改掉的原形式（写出来就等于点明了要改哪里）
+        "主谓一致",     # B1 的理由
+    )
+
+    def call_prompt(self, question):
+        """跑一次，回报真正发出的 (system 内容, user 内容)。"""
+        self.ask(question=question)
+        messages = self.fake.calls[0]["messages"]
+        system = messages[0]
+        user = messages[1]
+        self.assertEqual(system["role"], "system", "第一条消息必须是 system")
+        self.assertEqual(user["role"], "user", "第二条消息必须是 user")
+        return system["content"], user["content"]
+
+    def system_prompt(self):
+        """用 M01 那道真实问题取回 system 提示词。"""
+        return self.call_prompt("Can you improve this sentence: " + self.M01_SENTENCE)[0]
+
+    # ---------- A. 通用要求必须在 ----------
+
+    def test_teaching_accuracy_section_exists(self):
+        """提示词里必须有一节专门讲教学准确性。"""
+        self.assertIn("教学准确性", self.system_prompt())
+
+    def test_rule_is_check_form_and_part_of_speech_first(self):
+        """通用要求：先核对实际形式和词性，再解释规则。"""
+        p = self.system_prompt()
+        self.assertIn("先核对形式，再解释规则", p)
+        self.assertIn("实际形式", p)
+        self.assertIn("词性", p)
+
+    def test_a_correct_form_must_not_be_reported_as_an_error(self):
+        """通用要求：形式已经对了就不能说它错，也不能硬套不适用的规则。"""
+        p = self.system_prompt()
+        self.assertIn("形式已经对了，就不能说它错", p)
+        self.assertIn("根本不适用的规则", p)
+
+    def test_part_of_speech_must_match_the_reason(self):
+        """通用要求：理由必须和这个词真实的词性对得上。"""
+        p = self.system_prompt()
+        self.assertIn("词性判错，理由一定是错的", p)
+        self.assertIn("理由必须和它真实的词性对得上", p)
+
+    def test_uncertainty_rule_is_present(self):
+        """拿不准时宁可只说「这里需要调整」，也不要编一条规则。"""
+        p = self.system_prompt()
+        self.assertIn("不确定就不要编理由", p)
+        self.assertIn("一个错的解释比不给解释更糟", p)
+
+    # ---------- A-2. 首次真实复测暴露的两类通用问题 ----------
+    #
+    # 2026-10-08 那次本地复测（M01）未通过，暴露的两处都是【通用】毛病，
+    # 不是那一道题特有的，所以做成提示词里的通用要求：
+    #   ① 改写里把某个词改了，却没把这项改动当作错误解释；
+    #   ② 把一个自己都承认「语法没问题」的表达，列进了「主要错误」清单。
+
+    def test_grammar_errors_and_optional_suggestions_are_separated(self):
+        """通用要求：错误和「可选建议」必须分开列，不能混在一个清单里。"""
+        p = self.system_prompt()
+        self.assertIn("错误和可选建议必须分开列", p)
+        self.assertIn("并没有错", p)
+        self.assertIn("不能放进「错误」清单里", p)
+
+    def test_admitting_it_is_fine_does_not_excuse_mislabeling(self):
+        """顺口承认「其实也对」但仍旧列在错误清单下 —— 提示词要明确禁止这种排法。"""
+        self.assertIn("它其实也是对的", self.system_prompt())
+
+    def test_every_real_fix_must_be_explained(self):
+        """通用要求：因【真实错误】而动过的地方，要说明改了什么、为什么改。"""
+        p = self.system_prompt()
+        self.assertIn("改动要能对上解释", p)
+        self.assertIn("改成了什么 + 为什么改", p)
+
+    def test_polish_does_not_need_a_line_by_line_explanation(self):
+        """【防止矫枉过正】不能要求逐字解释每一处润色 —— 那会把回答拖长、也不是用户要的。"""
+        p = self.system_prompt()
+        self.assertIn("不必逐字解释每一处润色", p)
+        self.assertIn("不要算成错误", p)
+
+    def test_part_of_speech_is_judged_by_structure_and_role(self):
+        """词性要看【整句结构 + 它在句中起的作用】—— 补的是「怎么判断」，不只是「要判对」。"""
+        p = self.system_prompt()
+        self.assertIn("整句的结构和它此刻起的作用", p)
+        self.assertIn("不能只看「这个词通常是什么词性」", p)
+        self.assertIn("也不能只看它挨着谁就机械下结论", p)
+
+    def test_modifying_is_only_a_clue_not_a_formula(self):
+        """【本轮修正的核心】「修饰谁」只是线索，不是能单独定词性的公式。
+
+        英文里**名词也能作定语**（名词修饰名词），所以
+        「修饰名词 → 一定是形容词」这条机械规则本身就是错的。
+        """
+        p = self.system_prompt()
+        self.assertIn("是**线索**，不是一条能单独定词性的公式", p)
+        self.assertIn("名词也可以作定语", p)
+
+    def test_the_old_absolute_formula_is_gone(self):
+        """【回归】那条过于绝对的表述不许再回来。"""
+        p = self.system_prompt()
+        self.assertNotIn("修饰**名词**的，是**形容词**", p)
+        self.assertNotIn("修饰**动词、形容词或另一个副词**的，是**副词**", p)
+        self.assertNotIn("先定修饰关系，再谈词性", p)
+
+    def test_uncertainty_about_part_of_speech_is_covered(self):
+        """拿不准时不要编一个词性去圆规则。"""
+        p = self.system_prompt()
+        self.assertIn("拿不准就直说", p)
+        self.assertIn("不要编一个词性去圆一条规则", p)
+
+    def test_the_common_mistake_is_still_named(self):
+        """点名错法：拿「这个词通常是什么词性」直接当结论。"""
+        p = self.system_prompt()
+        self.assertIn("最容易犯的错", p)
+        self.assertIn("通常是形容词 / 通常是副词", p)
+
+    # ---------- B. 答案不能泄进提示词（本轮验收设计修正的重点）----------
+
+    def test_m01_sentence_is_not_in_the_system_prompt(self):
+        """【核心】M01 的原句不能出现在 system 提示词里，否则复测就成了开卷考试。
+
+        注意这一条同时也证明了测试是有意义的：同一个句子**确实**发给了模型 ——
+        只不过只出现在 user 消息里，system 里找不到它。
+        """
+        system, user = self.call_prompt("Can you improve this sentence: " + self.M01_SENTENCE)
+        self.assertNotIn(self.M01_SENTENCE, system)
+        self.assertIn(self.M01_SENTENCE, user)
+
+    def test_m01_sentence_fragments_are_not_in_the_system_prompt(self):
+        """原句被拆开放进去也不行 —— 逐段查一遍。"""
+        p = self.system_prompt()
+        for fragment in ("AI make student learn", "depend to it too much",
+                         "make student learn"):
+            self.assertNotIn(fragment, p)
+
+    def test_m01_answer_points_are_not_in_the_system_prompt(self):
+        """M01 的答案要点也不许进提示词 —— 点明要改哪里，等于给出答案。"""
+        p = self.system_prompt()
+        for point in self.M01_ANSWER_POINTS:
+            self.assertNotIn(point, p)
+
+    def test_citation_rules_are_not_loosened(self):
+        """【边界没有被顺手放宽】四种 decision 和引用规则一个字都没动。
+
+        这一组加的是「怎么讲」的要求，绝不该顺带放松「能不能引」的约束。
+        """
+        p = self.system_prompt()
+        for decision in ("answer", "general_answer", "insufficient_evidence", "refuse"):
+            self.assertIn(decision, p)
+        self.assertIn("decision 为 answer 时，citations 至少要有 1 项", p)
+        self.assertIn("绝对不能】给出任何 citation", p)
+        self.assertIn("绝对不许自己编造文件名或标题", p)
+
+
 # ===================== 5c. 短期对话上下文 =====================
 #
 # 分成两组：

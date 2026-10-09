@@ -45,8 +45,14 @@ class TestTokenize(unittest.TestCase):
         self.assertEqual(R.tokenize("现在完成时"), ["现在", "在完", "完成", "成时"])
 
     def test_english_lowercased(self):
-        """英文统一转小写，这样 Have 和 have 算同一个词。"""
-        self.assertEqual(R.tokenize("Have YOU Ever"), ["have", "you", "ever"])
+        """英文统一转小写，这样 Have 和 have 算同一个词。
+
+        【样本在 2026-10-08 改过一次】原来用的是 "Have YOU Ever"，
+        但 you 现在属于英文功能词（见第 8 节），会被过滤掉 ——
+        拿一个会被过滤的词来测「转小写」会得出误导性的结论。
+        换成同样的句型、但全是实义词，测的仍然是同一件事。
+        """
+        self.assertEqual(R.tokenize("Have EVER Seen"), ["have", "ever", "seen"])
 
     def test_mixed_chinese_english(self):
         """中英混排时两边的词都要切出来。"""
@@ -409,6 +415,185 @@ class TestDocumentTitleIsReallyUsed(unittest.TestCase):
         for c in self.r.chunks:
             self.assertIn("doc_title", c)
             self.assertTrue(c["doc_title"].strip())
+
+
+# ===================== 8. 英文功能词过滤 =====================
+#
+# 【要解决什么 —— 来自一次真实验收】
+# 一句**英文**改写题（"Can you improve this sentence ..."）检索到一段讲
+# **现在完成时**的资料，还拿了个 **13.14** 的高分。把它命中的词逐个数出来：
+# 只有 a / it / the / they / to / you —— **全是功能词，一个实词都没有**。
+# 那段资料因此被当成「可用资料」递给模型，后来真的被引用到了页面上。
+#
+# 【这组测试能证明什么、不能证明什么】
+# 能证明：功能词过滤**真的在生效**；过滤之后 37 道验收题该找到的来源一个没少；
+# 那句英文题的「高分假命中」没有了。
+# **证明不了**：模型从此不会再引用无关资料。
+# 过滤之后那句英文题**仍然**会因为 learn 这种实词命中一段无关资料（分数低，但非零）。
+# **检索改善 ≠ 引用相关性已获保证** —— 引用是否真的支持回答，这一层至今没人管。
+#
+# 【这组测试允许针对那句题写死，因为它是「回归证据」】
+# 被测试盯住的是**行为**；而修复本身（ENG-功能词表）是通用的，
+# 里没有任何题目、题号或文件名。这个区别很重要，别搞反。
+
+class TestEnglishFunctionWords(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.r = R.Retriever()
+
+    # ---------- A. 规则本身 ----------
+
+    def test_pure_function_words_are_dropped(self):
+        """冠词、人称代词、不定式 to、常见介词、连词都不再作为词元。
+
+        【注意 for 不在这个名单里】它是现在完成时的信号词，被**有意保留** ——
+        所以它仍然会参与匹配（这也是那句英文题过滤后还剩 2.9 分的原因之一）。
+        """
+        tokens = R.tokenize("Can you improve this sentence for a classroom discussion?")
+        for gone in ("you", "a", "to", "and"):
+            self.assertNotIn(gone, tokens, gone + " 是纯语法胶水，应该被过滤掉")
+        self.assertIn("for", tokens, "for 是信号词，必须保留")
+        self.assertIn("this", tokens, "this 是常见考点，必须保留")
+        # 实词照常保留
+        self.assertIn("improve", tokens)
+        self.assertIn("sentence", tokens)
+        self.assertIn("classroom", tokens)
+        self.assertIn("discussion", tokens)
+
+    def test_articles_and_pronouns_are_gone_from_a_mixed_query(self):
+        """中英混排时，英文功能词照样被丢掉，中文一个字都不受影响。"""
+        tokens = R.tokenize("帮我看看 they 和 it 用对了没有")
+        self.assertNotIn("they", tokens)
+        self.assertNotIn("it", tokens)
+        self.assertIn("看看", tokens)
+
+    def test_knowledge_bearing_words_are_kept(self):
+        """【最关键的一条】可能承载英语知识点的词，一个都不许过滤掉。
+
+        这份名单是**照着本知识库核对**出来的，不是照搬通用停用词表：
+        通用表会把 have / has / been / since / for 全删掉，
+        而在这个项目里它们恰恰是知识点本身。
+        """
+        protected = [
+            # 现在完成时的信号词（知识库专门有一节讲它们）
+            "since", "for", "just", "already", "yet", "ever", "never",
+            "far", "now", "recently",
+            # be 动词家族
+            "be", "being", "been", "am", "is", "are", "was", "were",
+            # 助动词
+            "do", "does", "did",
+            # 指示代词（本身是常见考点）
+            "this", "that", "these", "those",
+            # 疑问词
+            "what", "which", "who", "when", "where", "why", "how",
+        ]
+        for word in protected:
+            self.assertNotIn(word, R.ENGLISH_FUNCTION_WORDS,
+                             word + " 不该被过滤 —— 它在本知识库里是知识点")
+
+    def test_filter_only_contains_plain_grammatical_glue(self):
+        """过滤表里只准出现「纯语法胶水」，不许混进实词。"""
+        for word in R.ENGLISH_FUNCTION_WORDS:
+            self.assertRegex(word, r"^[a-z]+$")
+        # 抽查几个明显是实义的词，绝不能在表里
+        for content in ("learn", "student", "sentence", "grammar", "vocabulary"):
+            self.assertNotIn(content, R.ENGLISH_FUNCTION_WORDS)
+
+    def test_chinese_tokenization_is_untouched(self):
+        """这次改的只是英文侧；中文 bigram 行为一个字符都不许变。"""
+        self.assertEqual(R.tokenize("现在完成时"), ["现在", "在完", "完成", "成时"])
+        self.assertEqual(R.tokenize("的"), [])
+
+    # ---------- B. 全语料回归：该找到的还得找得到 ----------
+
+    def test_no_expected_source_is_lost_across_the_eval_cases(self):
+        """【核心回归】37 道验收题，期望来源一题都不许丢。
+
+        过滤功能词会改变检索分数。这条测试保证「改动没有把真正有资料依据的回答搞坏」。
+        """
+        cases = _load_eval_cases()
+        lost = []
+        for case in cases:
+            expected = set(case.get("expected_sources") or [])
+            found = {h["source"] for h in self.r.retrieve(case["question"], top_k=3)}
+            missing = expected - found
+            if missing:
+                lost.append(str(case.get("id")) + " 丢了 " + str(sorted(missing)))
+        self.assertEqual(lost, [], "过滤之后有题找不回期望来源：" + "；".join(lost))
+
+    def test_the_three_cross_source_cases_still_keep_both_files(self):
+        """跨来源题最容易被误伤 —— 两份来源必须都还在。"""
+        cases = [c for c in _load_eval_cases() if c.get("category") == "cross_source"]
+        self.assertEqual(len(cases), 3, "跨来源题应该正好 3 道（题库变了就来看这里）")
+        for case in cases:
+            expected = set(case["expected_sources"])
+            found = {h["source"] for h in self.r.retrieve(case["question"], top_k=3)}
+            self.assertEqual(expected - found, set(),
+                             str(case["id"]) + " 丢了一份来源：" + str(sorted(expected - found)))
+
+    def test_the_one_on_one_tutoring_trap_still_gets_material(self):
+        """一对一辅导那道题期望 insufficient_evidence，前提是【资料提到了相关机制】。
+
+        它的检索结果一旦变空，模型就只能改口说 refuse —— 那不是我们想要的改变。
+        """
+        case = [c for c in _load_eval_cases() if c["id"] == "trap-one-on-one-tutoring"][0]
+        hits = self.r.retrieve(case["question"], top_k=3)
+        self.assertTrue(hits, "这道题的检索结果不该为空")
+        self.assertIn("course_faq.md", {h["source"] for h in hits},
+                      "该题的依据在 course_faq.md 里，被过滤掉了")
+
+    # ---------- C. 那句真实英文题的回归 ----------
+
+    REAL_WRITING_QUESTION = (
+        "Can you improve this sentence for a classroom discussion and explain the main "
+        "mistakes? 'AI make student learn more fast, but they depend to it too much.'"
+    )
+
+    def test_the_english_writing_question_no_longer_scores_high_on_function_words(self):
+        """【本轮的核心回归】功能词过滤之前，这句题的最高分是 **13.14**。
+
+        那个分数完全由 a / it / the / they / to / you 撑起来 —— 一个实词都没有。
+        过滤之后最高分必须掉到 **3 以下**。
+        3 这个数字不是拍脑袋：全题库里期望回答的题，最低分是 4.395
+        （vs-context-memory），所以 3 已经在「真正有依据」的下方。
+        """
+        hits = self.r.retrieve(self.REAL_WRITING_QUESTION, top_k=3)
+        top = hits[0]["score"] if hits else 0.0
+        self.assertLess(top, 3.0,
+                        "英文改写题又靠功能词拿到高分了：" + str(top))
+
+    def test_the_unrelated_present_perfect_section_is_gone(self):
+        """具体到那次事故：讲现在完成时的「基本结构」不该再被这句题捞出来。
+
+        它当初是**第一名**（13.14）。这里针对题面写死是【回归证据】，不是修复方式。
+        """
+        hits = self.r.retrieve(self.REAL_WRITING_QUESTION, top_k=3)
+        got = {(h["source"], h["heading"]) for h in hits}
+        self.assertNotIn(("grammar_present_perfect.md", "基本结构"), got)
+
+    def test_the_residual_match_is_weak_and_honestly_bounded(self):
+        """【诚实记录残留】过滤之后还剩什么？
+
+        剩下的命中来自 for / this 这类**被有意保留**的词，以及 learn 这个实词。
+        它们都是弱命中 —— 这条测试把「弱」钉住，防止有人误以为已经彻底解决。
+        """
+        hits = self.r.retrieve(self.REAL_WRITING_QUESTION, top_k=3)
+        for h in hits:
+            self.assertLess(h["score"], 3.0, "残留命中不该是高分的")
+
+
+def _load_eval_cases():
+    """读验收题库。检索层的回归拿它当「不该被改坏」的清单。
+
+    【为什么检索层要读评测题库】
+    题库里的 expected_sources 是「这个问题该找到哪份资料」的权威答案。
+    拿它当标尺，才能证明「过滤功能词没有把真正有依据的回答搞坏」。
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "evals", "rag_cases.json")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 if __name__ == "__main__":
