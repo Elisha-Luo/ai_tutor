@@ -314,25 +314,68 @@
         max-width: none;                     /* 取消最大宽度限制 */
         border-radius: 0;                    /* 手机上没有圆角更好看 */
       }
-      .messages {                            /* 对话区 */
-        padding: 16px;                       /* 内边距缩小，小屏幕上留更多空间给内容 */
+
+      /* ---------- 手机上的阅读体验：宽度还给回答，高度还给对话 ---------- */
+      /* 【只动留白，不动字号】手机阅读吃力时，第一反应往往是「缩小字号塞更多字」，
+         但那正好是错的：字越小越难读。所以这一节里 font-size 一个都没改。 */
+
+      .chat-header {                         /* 顶部标题栏 */
+        padding: 12px 14px 10px;             /* 桌面是 22/28/18：手机上这段说明一直占着，压缩它 */
       }
+      h1 {                                   /* 大标题 */
+        margin: 0 0 4px;                     /* 标题和下面说明之间的空隙收紧 */
+      }
+      .nav {                                 /* 「我的学习档案」那一行 */
+        margin: 8px 0 0;                     /* 上边距收紧 */
+      }
+      .nav a {                               /* 档案入口链接本身 */
+        display: inline-block;               /* 让它能带内边距 */
+        padding: 4px 6px;                    /* 扩大手指可点区域（字号保持不变） */
+      }
+      .chat.in-chat .subtitle {              /* 已经开始聊天了（由模板加 in-chat 标记） */
+        display: none;                       /* 两行说明是「进来之前」看的；开聊后让位给对话 */
+      }
+
+      .messages {                            /* 对话区 */
+        padding: 12px 8px;                   /* 左右从 16 收到 8：气泡多用的就是这部分宽度 */
+      }
+      .msg.ai .bubble {                      /* AI 回答气泡 */
+        max-width: 96%;                      /* 78% → 96%：一行能多放几个字，中英混排换行明显变少 */
+      }
+      .msg.user .bubble {                    /* 自己说的话 */
+        max-width: 88%;                      /* 也跟着放宽，但仍留出「左 AI / 右自己」的差别 */
+      }
+      .bubble {                              /* 所有气泡 */
+        padding: 12px 14px;                  /* 左右内边距 16 → 14，正文可用宽度再多一点 */
+      }
+      .msg.ai .bubble p {                    /* 回答里的段落 */
+        margin: 0 0 12px;                    /* 10 → 12：中英混排的长段落之间更容易分清 */
+      }
+      .msg.ai .bubble ul,                    /* 回答里的列表 */
+      .msg.ai .bubble ol {
+        margin: 0 0 12px;                    /* 和段落用同样的底部间距 */
+        padding-left: 18px;                  /* 缩进 22 → 18：换行的第二行不会被挤得太窄 */
+      }
+      .msg.ai .bubble li {                   /* 列表里的每一项 */
+        margin-bottom: 6px;                  /* 4 → 6：一项占两行时，项与项之间不至于糊成一片 */
+      }
+
       .composer {                            /* 输入栏 */
-        padding: 12px 16px 16px;             /* 内边距缩小 */
+        padding: 12px 8px 14px;              /* 左右跟着对话区收窄，输入框和按钮都更宽 */
       }
       .error {                               /* 错误提示条 */
-        margin: 0 16px;                      /* 左右间距跟着缩小，保持对齐 */
+        margin: 0 8px;                       /* 左右间距跟着收敛，保持对齐 */
       }
       .status {                              /* 正在思考的提示条 */
-        margin-left: 16px;                   /* 左右间距跟着缩小，和其它元素保持对齐 */
-        margin-right: 16px;                  /* 右边同理 */
+        margin-left: 8px;                    /* 左右同理 */
+        margin-right: 8px;
       }
     }
   </style>
 </head>
 
 <body>                                       <!-- 下面开始是页面上能看到的内容 -->
-  <div class="chat">                         <!-- 整个聊天面板 -->
+  <div class="chat{% if history %} in-chat{% endif %}">   <!-- 整个聊天面板；已经开聊时多一个 in-chat 标记（手机端用它收起顶部说明文字） -->
 
     <header class="chat-header">             <!-- 顶部标题栏 -->
       <h1>🎓 AI 学习助手</h1>                 <!-- 大标题 -->
