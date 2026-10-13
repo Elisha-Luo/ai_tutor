@@ -60,7 +60,7 @@ VALID_LEVELS = ("a1", "a2", "b1", "b2", "c1")           # 英语水平（CEFR �
 
 # 语言模式：对应 PRODUCT_REQUIREMENTS 第 8 节的三种
 VALID_LANGUAGE_MODES = (
-    "zh_pair",       # 中英对照：英文在前，中文解释紧随其后
+    "zh_pair",       # 中英对照：英文关键句/改写句/例句/搭配照常给，后面只用中文解释必要难点
     "en_only",       # 全英文：只用英文，用词按水平控制
     "en_advanced",   # 全英文 + 高级表达：主动给出更地道的说法
 )

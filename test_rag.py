@@ -655,6 +655,325 @@ class TestTeachingAccuracyPrompt(RagTestCase):
         self.assertIn("绝对不许自己编造文件名或标题", p)
 
 
+class TestAnswerContentGuidance(RagTestCase):
+    """检查「回答内容怎么写」那一节有没有写进 system 提示词。
+
+    【这一组能证明什么、不能证明什么 —— 别读错】
+
+    能证明的**只有一件事**：这些要求**确实出现在发给模型的 system 消息里**。
+    证明**不了**的：模型下一次会不会照着写。
+
+    原因和 TestTeachingAccuracyPrompt 一样 —— 这里用的是假客户端，
+    它返回什么完全由测试自己写死，它不懂教学。
+    **不要把这里的绿灯当成「模型已经会给搭配、会先直答了」。**
+
+    【和 M01–M03 的关系】
+    这一组**不改** M01–M03 的既定判定标准，也**不替代**它们。
+    M01–M03 仍然只能靠真实调用 + 人工判定（见 PERSONALIZATION_EVALS.md 的 M 组）。
+    这里唯一的额外价值是：如果哪天有人把这几条要求从提示词里删掉了，测试会红。
+    """
+
+    # 【M01 的答案要点】继续钉住：这一节扩写之后也不许把它们带进提示词。
+    # 那是 M01 复测要考的正确答案，写进提示词等于把复测变成开卷考试。
+    MUST_NOT_LEAK = ("students", "faster", "more fast", "缺冠词", "主谓一致")
+
+    def call_prompt(self, question, chunks=None):
+        """跑一次，回报真正发出的 (system 内容, user 内容)。"""
+        self.ask(question=question, chunks=chunks)
+        messages = self.fake.calls[0]["messages"]
+        self.assertEqual(messages[0]["role"], "system", "第一条消息必须是 system")
+        self.assertEqual(messages[1]["role"], "user", "第二条消息必须是 user")
+        return messages[0]["content"], messages[1]["content"]
+
+    def system_prompt(self):
+        return self.call_prompt("帮我改一下这句话：I think study abroad is good.")[0]
+
+    # ---------- A. 这一节必须在，且四件事都说到了 ----------
+
+    def test_answer_content_section_exists(self):
+        """提示词里必须有一节专门讲「回答内容怎么写」。"""
+        self.assertIn("回答怎么写", self.system_prompt())
+
+    def test_the_direct_answer_comes_first(self):
+        """先直答：正文第一句就回答问题，不许用铺垫开头、不许复述问题。"""
+        p = self.system_prompt()
+        self.assertIn("先直答", p)
+        self.assertIn("不要用「这是一个很好的问题」", p)
+        self.assertIn("也不要先把用户的问题复述一遍", p)
+
+    def test_the_extension_is_collocation_or_near_synonym(self):
+        """适合时补的那 1–2 条，指的是固定搭配或相近表达的区别，并配短例子。"""
+        p = self.system_prompt()
+        self.assertIn("固定搭配", p)
+        self.assertIn("相近表达的区别", p)
+        self.assertIn("短例子", p)
+
+    def test_the_extension_is_not_mandatory_for_every_question(self):
+        """【防止硬塞】不是每道题都要给延伸；宁可只给一条准确的。"""
+        p = self.system_prompt()
+        self.assertIn("不是每道题都要给", p)
+        self.assertIn("宁可只给一条准确的", p)
+
+    def test_a_guessed_extension_must_be_omitted(self):
+        """延伸也必须准确：拿不准宁可不写 —— 教错一个搭配更糟。"""
+        p = self.system_prompt()
+        self.assertIn("宁可不写", p)
+        self.assertIn("教错一个搭配", p)
+
+    def test_the_extension_never_joins_the_error_list(self):
+        """【接 M02】延伸属于「可选建议」，绝不能混进「错误」清单。"""
+        p = self.system_prompt()
+        self.assertIn("绝不能混进「错误」清单", p)
+        self.assertIn("也不要把延伸里提到的说法说成是用户写错了", p)
+
+    def test_padding_is_named_and_forbidden(self):
+        """三类废话必须点名禁止：交代检索过程、免责声明与通用建议、同义反复。"""
+        p = self.system_prompt()
+        self.assertIn("不要交代「检索到的资料为什么用不上」", p)
+        self.assertIn("免责声明", p)
+        self.assertIn("通用建议", p)
+        self.assertIn("叫啰嗦", p)
+
+    def test_detailed_means_value_not_padding(self):
+        """「详细」= 能立刻用上的信息，不是更长的铺垫或更多免责声明。"""
+        self.assertIn("更长的铺垫或更多的免责声明", self.system_prompt())
+
+    def test_brief_must_not_get_an_extension(self):
+        """【护住 B03】选了「精简」就不加延伸 —— 短不等于没答。"""
+        p = self.system_prompt()
+        self.assertIn("「精简」是什么意思", p)
+        self.assertIn("不要加延伸", p)
+
+    def test_detailed_length_label_mentions_the_extension(self):
+        """档案送到模型的那一行「详细」也要带上这个口径（措辞层，不是判定层）。"""
+        label = rag._LENGTH_LABELS["detailed"]
+        self.assertIn("搭配或近义表达", label)
+        self.assertIn("不要为了长而长", label)
+        # 【不越界】另外两档本轮不动
+        self.assertEqual(rag._LENGTH_LABELS["brief"], "精简：只给结果和最关键的一句解释")
+        self.assertEqual(rag._LENGTH_LABELS["normal"], "标准：结果 + 解释 + 可选说法")
+
+    # ---------- B. general_answer 不许再交代检索过程 ----------
+
+    def test_general_answer_must_not_narrate_the_retrieval_process(self):
+        """走通用知识回答时，不要写「资料里没提到」这类说明 —— 标识已经说明了。"""
+        p = self.system_prompt()
+        self.assertIn("不要在正文里交代检索过程", p)
+        self.assertIn("检索到的片段与你的问题无关", p)
+
+    # ---------- B2. 这条「不叙述检索过程」必须带限定，不能盖到业务事实上 ----------
+    #
+    # 【为什么必须钉住】「资料不支持，就直接按你自己的知识回答」这句话单独看范围过宽：
+    # 课程价格、退费、有没有一对一辅导这类【业务事实】，正确做法是
+    # insufficient_evidence / refuse —— 一旦被读成「资料没有就用通用知识答」，
+    # 就等于允许模型凭常识编课程事实，那正是整套规则里最严重的一类错误。
+    #
+    # 【这些测试能证明什么】只证明：限定条件确实写进了【发给模型的那条 system 消息】
+    # （system_prompt() 取的是 fake client 真正收到的 messages[0]）。
+    # 【证明不了】模型会不会照限定去选 —— 假客户端不懂业务边界。
+    # 真实效果只能由一次另行授权的真实复测回答。
+    NARRATION_MARK = "不要交代「检索到的资料为什么用不上」"
+    BILINGUAL_MARK = "中英对照不等于把同一段写两遍"
+
+    @staticmethod
+    def _flat(text):
+        """把换行和缩进压成单空格 —— 断言看的是意思，不是提示词怎么折行。"""
+        return " ".join(text.split())
+
+    def _bullet_containing(self, mark):
+        """取出 system 消息里包含 mark 的那一条 bullet（含它的续行，到下一条 bullet 为止）。
+
+        按【行】切：先找到 mark 所在行，往上找到本条 bullet 的开头
+        （以「-」或「·」开头的行），再往下找到下一条 bullet 的开头。
+        这样断言的范围就是「同一条 bullet」，不会把后面几条一起吃进来。
+        """
+        lines = self.system_prompt().splitlines()
+        start = next(i for i, line in enumerate(lines) if mark in line)
+
+        top = start
+        while top > 0 and not lines[top - 1].lstrip().startswith(("-", "·")):
+            top -= 1
+
+        end = start + 1
+        while end < len(lines) and lines[end].strip() and not lines[end].lstrip().startswith(("-", "·")):
+            end += 1
+
+        return self._flat(" ".join(lines[top:end]))
+
+    def test_narration_ban_carries_its_scope_in_the_same_bullet(self):
+        """限定必须和那条规则【同一条 bullet 里】，不能飘在别处。"""
+        bullet = self._bullet_containing(self.NARRATION_MARK)
+        self.assertIn("这一条只适用于", bullet)
+        self.assertIn("判成了 general_answer", bullet)
+
+    def test_course_facts_never_get_filled_in_from_general_knowledge(self):
+        """【业务事实不吃这一条】该 insufficient_evidence / refuse 就照走，不许拿通用知识补齐。"""
+        bullet = self._bullet_containing(self.NARRATION_MARK)
+        self.assertIn("课程业务事实不适用这一条", bullet)
+        self.assertIn("insufficient_evidence", bullet)
+        self.assertIn("refuse", bullet)
+        self.assertIn("绝不能", bullet)
+        self.assertIn("把它补成一个像样的答案", bullet)
+
+    def test_the_anti_padding_rule_does_not_silence_required_refusal_text(self):
+        """【护住安全文案】「不要写免责声明」不能变成省略必要拒答说明的借口。"""
+        p = self._flat(self.system_prompt())
+        self.assertIn("不适用于安全与边界要求的拒答文案", p)
+        self.assertIn("该说的那句固定说明照写", p)
+
+    # ---------- B3. 回答表达：比较要带语境、中英对照不写两遍、语言按档案 ----------
+    #
+    # 【能证明什么】只证明这些要求确实进了 fake client 收到的 system 消息。
+    # 【证明不了】模型会不会照做 —— 假客户端不懂教学，它返回什么由测试写死。
+    # 真实效果只能由一次另行授权的真实复测回答。
+
+    def test_comparisons_must_state_their_context_and_are_still_welcome(self):
+        """【限定 + 保留】「更自然 / 更地道」必须带语境；没依据就不硬排优劣 —— 但比较照给。
+
+        这一条同时钉住两件事：加了限定条件，**没有**把「给比较」这件事一起禁掉。
+        """
+        bullet = self._bullet_containing("相近表达的区别")
+        self.assertIn("必须点明它成立的语境", bullet)
+        self.assertIn("没有可靠依据就不要硬排优劣", bullet)
+        self.assertIn("两种都能用", bullet)              # 没依据时该怎么说
+        self.assertIn("有用的比较照给", bullet)          # 防止日后被改成一刀切禁止
+
+    def test_bilingual_means_pairing_not_duplicating(self):
+        """【中英对照】配对的单位是句子和短语，不是整篇回答；英文内容照常给。"""
+        bullet = self._bullet_containing(self.BILINGUAL_MARK)
+        self.assertIn("单位是句子和短语，不是整篇回答", bullet)
+        self.assertIn("英文关键句、改写后的句子、例句和搭配照常给", bullet)
+        self.assertIn("不算重复", bullet)
+        self.assertIn("复述一遍", bullet)
+        self.assertIn("不要", bullet)
+        self.assertIn("逐句翻译", bullet)
+
+    def test_zh_pair_label_states_the_unit_and_keeps_chinese(self):
+        """档案行也要带同一套口径：英文内容照常给 + 只用中文解释必要难点。
+
+        【为什么必须留住「中文解释」这四个字】B01 的判据就是
+        「回答中确实存在中文解释」——改写措辞时把它弄丢，
+        等于让 B01 变成一条没法满足的要求。
+        """
+        label = rag._LANGUAGE_LABELS["zh_pair"]
+        self.assertIn("中文解释", label, "B01 要的「中文解释」被改没了")
+        self.assertIn("照常给", label)
+        self.assertIn("不是重复", label)
+        self.assertIn("不要先写一整段英文讲解", label)
+        self.assertNotIn("逐句", label, "「逐句对照」的旧口径又回来了")
+
+    def test_english_examples_and_collocations_must_not_be_dropped(self):
+        """【防过头】去重不许把英文例句、搭配，或必需的中文解释一起删掉。
+
+        钉住两件事：① 那条去重规则必须点名「英文内容照常给」「一处都不能省」；
+        ② 讲搭配 / 延伸的规则仍然在 —— 否则模型可能为了「不重复」
+        把用户最想要的搭配和例句也一起省掉。
+        """
+        bullet = self._bullet_containing(self.BILINGUAL_MARK)
+        self.assertIn("例句和搭配照常给", bullet)
+        self.assertIn("一处都不能省", bullet)
+
+        p = self._flat(self.system_prompt())
+        self.assertIn("固定搭配", p)
+        self.assertIn("短例子", p)
+
+    def test_the_deduplication_rule_must_not_cut_needed_explanations(self):
+        """【防过头】去重**不许**把理解生词 / 搭配 / 用法所必需的解释一起删掉。"""
+        p = self._flat(self.system_prompt())
+        self.assertIn("这条不是让你少解释", p)
+        self.assertIn("一处都不能省", p)
+        self.assertIn("生词、搭配和用法", p)
+
+    def test_the_answer_field_language_follows_the_profile(self):
+        """【语言中立】answer 说明改成「按档案语言偏好、无档案默认中文」，旧写法必须消失。"""
+        p = self._flat(self.system_prompt())
+        self.assertIn("语言按上面的档案语言偏好走", p)
+        self.assertIn("默认用中文", p)
+        self.assertNotIn("给用户看的中文回答", p, "旧的写死「中文回答」还在")
+
+    def test_the_json_example_in_the_prompt_still_has_exactly_three_keys(self):
+        """【结构不得变】提示词里那个 JSON 示例仍然只有 decision / answer / citations。"""
+        line = [l.strip() for l in self.system_prompt().splitlines()
+                if l.strip().startswith('{"decision"')]
+        self.assertEqual(len(line), 1, "JSON 示例那一行没找到或不止一行")
+        obj = json.loads(line[0])
+        self.assertEqual(sorted(obj.keys()), ["answer", "citations", "decision"])
+
+    def test_the_public_format_doc_has_no_contradicting_chinese_claim(self):
+        """【同步检查】描述公开返回格式的注释不能一边写死中文、一边说按档案来。"""
+        doc = rag.generate_answer.__doc__ or ""
+        self.assertNotIn("给用户看的中文回答", doc, "公开格式注释里还留着写死的「中文回答」")
+        for key in ("decision", "answer", "citations"):
+            self.assertIn(key, doc, "公开三键的说明少了一个：" + key)
+
+    # ---------- C. 三类问题：进入模型时的结构（这是本轮唯一能自动查的部分）----------
+
+    # 三道代表性输入。**只作为测试输入**，验证的是「发出去的东西对不对」，
+    # 不是「模型答得好不好」。
+    BROAD_WRITING = "帮我改一下这段话：I think study abroad is good for students."
+    VOCAB = "affect 和 effect 有什么区别？还有哪些常见搭配？"
+    TEXTBOOK_GRAMMAR = "since 和 for 在现在完成时里有什么区别？"
+
+    def test_the_three_question_types_each_reach_the_model_once(self):
+        """三类问题各只调用模型一次，且 system 提示词完全一致。"""
+        systems = []
+        for q in (self.BROAD_WRITING, self.VOCAB, self.TEXTBOOK_GRAMMAR):
+            self.call_prompt(q)
+            systems.append(self.fake.calls[-1]["messages"][0]["content"])
+        self.assertEqual(len(self.fake.calls), 3, "三类问题各调用一次，不能多调")
+        self.assertEqual(len(set(systems)), 1, "system 提示词必须每次都一样")
+
+    def test_a_writing_question_without_material_still_goes_out_as_a_question(self):
+        """宽泛写作问题（资料不支持）→ 提示词要说明「本次没有资料」，并原样带上问题。"""
+        _, user = self.call_prompt(self.BROAD_WRITING, chunks=[])
+        self.assertIn("本次【没有】可用的资料片段", user)
+        self.assertIn(self.BROAD_WRITING, user)
+
+    def test_a_vocabulary_question_without_material_still_goes_out_as_a_question(self):
+        """词汇问题（资料不支持）同上 —— 不许因为没资料就把它变成拒答。"""
+        _, user = self.call_prompt(self.VOCAB, chunks=[])
+        self.assertIn("本次【没有】可用的资料片段", user)
+        self.assertIn(self.VOCAB, user)
+
+    def test_a_textbook_grammar_question_carries_its_chunk_and_can_be_answer(self):
+        """课本语法问题（资料支持）→ 片段连同来源、标题一起发出去，answer 这条路才是通的。"""
+        chunks = [dict(CHUNK_SINCE_FOR)]
+        result = self.ask(question=self.TEXTBOOK_GRAMMAR, chunks=chunks,
+                          reply=self.answer_json(text="since 接时间点，for 接时间段。"))
+        user = self.fake.calls[0]["messages"][1]["content"]
+        self.assertIn(CHUNK_SINCE_FOR["source"], user)
+        self.assertIn(CHUNK_SINCE_FOR["heading"], user)
+        self.assertIn(CHUNK_SINCE_FOR["text"], user)
+        self.assertEqual(result["decision"], "answer")
+        self.assertEqual(len(result["citations"]), 1)
+
+    def test_the_three_types_keep_their_own_decision_shape(self):
+        """三种问题各自的**形状**不同 —— 这正是网页上显示方式不同的原因。
+
+        · 宽泛写作 / 词汇（无资料）→ general_answer：有正文、**citations 必须是空**
+        · 课本语法（有资料）        → answer：有正文、**citations 非空**
+        """
+        general = self.ask(question=self.VOCAB, chunks=[],
+                           reply={"decision": "general_answer",
+                                  "answer": "affect 多作动词，effect 多作名词。",
+                                  "citations": []})
+        self.assertEqual(general["decision"], "general_answer")
+        self.assertEqual(general["citations"], [])
+
+        answered = self.ask(question=self.TEXTBOOK_GRAMMAR,
+                            chunks=[dict(CHUNK_SINCE_FOR)],
+                            reply=self.answer_json(text="since 接时间点，for 接时间段。"))
+        self.assertEqual(answered["decision"], "answer")
+        self.assertTrue(answered["citations"])
+
+    # ---------- D. 红线：这一节扩写不许把 M01 的答案带进来 ----------
+
+    def test_the_rewrite_did_not_leak_m01_answer_points(self):
+        p = self.system_prompt()
+        for bad in self.MUST_NOT_LEAK:
+            self.assertNotIn(bad, p, "M01 的答案要点泄进提示词了：" + bad)
+
+
 # ===================== 5c. 短期对话上下文 =====================
 #
 # 分成两组：

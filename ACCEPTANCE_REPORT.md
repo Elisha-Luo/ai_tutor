@@ -7,6 +7,278 @@
 
 ---
 
+## 2026-10-13 · 会话条件更正 ＋ 单题独立会话复测（**记录，不是稳定修复**）
+
+**状态**：本条**只记录事实与口径** —— **不改任何既定评分，也不改任何历史结果**；
+本轮**没有调用模型**（记的是 2026-10-13 当天已经发生的那几次本地复测）。
+**一句话结论**：单题这一次是 `general_answer` / `ok` / 0 引用 / **2573 ms** ——
+用户看到的是一份含直答、必要中文解释、带语境的比较和搭配延伸的回答。
+**n = 1，不得读成「问题已修复」「改动有效」或「原因已找到」。**
+
+### 一、三次运行的会话条件（**这次记准，替换掉「会话结构未知」的旧说法**）
+
+| 运行 | 会话条件 | 结果要点 |
+| --- | --- | --- |
+| ① **最早三题**（此前那一次本地三题验收） | **三题各自独立会话**（无上下文累积） | 写作题 `general_answer`、无引用、偏长、**有有用搭配**、**有整段双语重复**、比较缺语境；改错题解释正确但有少量双语重复；一对一辅导题正确判 `insufficient_evidence` |
+| ② **中间三题**（本次本地复测） | **三题共用同一会话**（第 2 题带着第 1 题的上下文，第 3 题带着前两题） | 写作题 `general_answer` / `ok` / 0 引用（该次回答里搭配与中文解释都在、**当次未观察到整段双语重复** —— 单次观测，**不构成改善证据**）；改错题 **`missing_citations` 降级**；一对一辅导题 `insufficient_evidence` / `ok` |
+| ③ **最新单题**（本次本地复测） | **独立会话**（提问前消息数 = 0） | 改错题 `general_answer` / `ok` / 0 引用 / **2573 ms** |
+
+> **两条口径更正**
+>
+> 1. 此前写过的「上次的会话结构未知」**作废**：三次条件如上表 —— ①与③都是独立会话，②是共用会话。
+>    因此 **②里那次 `missing_citations` 不能归因于「上下文累积」**；它**没有被解释**，
+>    仍然只是一个**待诊断现象**（见第二节末）。
+> 2. **不做跨次优劣比较、也不做「已改善」的判断**：①与②是不同条件，①与③各只有 1 个样本，
+>    题目回答也各不相同轮次。②里改错题这次只拿到固定文案、③里拿到真实回答，
+>    那是**两次各自的一次观测**，不能写成「这次比上次差 / 好」。
+
+### 二、两个诊断码的准确含义（按 `rag.py` 实现，**不要混同**）
+
+`rag.py` 的校验分**五道关**，引用相关的是第 4、第 5 关：
+
+| 诊断码 | 触发条件（按实现） | 出处 |
+| --- | --- | --- |
+| `invalid_citations` | **第 4 关**：`_normalize_citations()` 返回 `None` —— citations **不是列表**（例如 `null`）、**条目结构不对**（缺 `source` / `heading`，或不是字符串）、**或引用了本次没给它的 `(source, heading)`**（文件名或标题是编的） | `rag.py:873-876` |
+| `missing_citations` | **第 5 关**：`decision` 已经是 `answer`、正文非空，但 **citations 是空列表**（一条都没给） | `rag.py:887-890` |
+
+> **最容易被记反的一点**：
+> · **空列表 `[]` 会通过第 4 关**，然后在 `answer` 分支被判 `missing_citations`；
+> · **非空但坏**（格式不对、或编造来源）在第 4 关就被判 `invalid_citations`，根本走不到第 5 关。
+>
+> 一句话：`missing_citations` = 「**说好有依据，却一条出处都没给**」；
+> `invalid_citations` = 「**给了出处，但那出处不合法**」。**两者不是一回事。**
+>
+> **共同后果**：两者都走 `_degrade()` → 对外 decision 变成 `insufficient_evidence`，
+> 用户看到固定文案 `INSUFFICIENT_TEXT`（`rag.py:140-142`），**模型原文不保留**，
+> 日志里只留这个固定诊断枚举。所以 ② 那次改错题**没有可读的改错内容** ——
+> 不是「模型没答」，而是回答被安全网挡掉了。
+>
+> ⚠️ **不要因此放宽引用安全网**：一条坏引用否掉整份是**设计如此**
+> （`rag.py` 的注释写明：一条引用是编的，说明整份都可能不可信）。
+> ② 那次 `missing_citations` 的**具体成因至今未查明**，**不得**在报告里写成「已找到根因」；
+> ③ 里它没有复现，也**不等于**已解决或已解释。
+
+### 三、一次误操作记录（如实留档）
+
+核对标识常量时，曾执行 `python -c "import app"` 而**没有设 `CHAT_DB_PATH`**，
+于是那个进程按默认路径**打开了项目里的 `chat.db`**（启动日志：`db_file=...\chat.db`）。
+
+- 该导入在模块级只执行 `CREATE TABLE IF NOT EXISTS ...`，在**已有库上是空操作**；
+- **前后指纹一致：49152 字节 / mtime 2026/10/9 20:05:43（未变）→ 未见持久变化**；
+- 留档在此：按「不碰现有 chat.db」的要求，这本不该发生。
+
+### 四、③ 的运行条件（供复核）
+
+| 项 | 值 |
+| --- | --- |
+| 数据库 | **全新临时库**（`CHAT_DB_PATH` → 临时文件），跑完即删 |
+| 会话 | **独立**（提问前消息数 = 0） |
+| 档案 | `b1` / `level_uncertain=0` / `academic` / `writing` / `detailed` / `zh_pair` |
+| 模型调用 | **恰好 1 次**（临时库 `api_usage = ('2026-10-13', 1)`）、`max_retries=0`、**未重试** |
+| 密钥来源 | 该临时进程在 `import app` **之前移除**进程里的 `DEEPSEEK_API_KEY`，改由项目 `.env` 提供 |
+| 鉴权检查 | 先做一次不生成回答的 `models.list`：**通过**（不通过就停，不换密钥） |
+| TLS / 代理 | TLS 校验保持开启；代理环境变量只在**该临时进程内**清空 |
+
+**边界**：n = 1；改动未提交、未推送、未部署（线上仍是 `c4cd0e1`）。
+
+---
+
+## 2026-10-10 · M01 第四次本地真实复测：判定**通过**（按预设标准字面判定）
+
+**状态**：按 M01 预设的 A / B / C 三条口径，**三条全部满足 → 判定通过**；
+**恰好 2 次真实调用**，两次 `diagnostic_code=ok`，无执行错误；
+**M01 的预设判定标准与三次历史结果一个字未改**；**本轮之后仍未推送、未部署**（`b12b479` 仍只在本地）。
+
+> ### ⚠️ 这一次通过 = 「这一次满足了标准」，**不等于「A2 已修复」**
+>
+> 样本仍是 **1 次**；第②轮有一处**词性表述的边界情况**（见第六节），按**字面标准**不构成 A2，
+> 但它是下一次复测最该盯的地方。**不要把本节读成「改好了」。**
+
+### 一、为什么跑这一次
+
+`3f0964e`（教学准确性通用规则）+ `b12b479`（不需要时不要贴词性标签）这两轮改动，
+**针对的正是 M01 的 A2 失分点**，但自 2026-10-09 提交后**从未做过真实复测**
+—— 上一节明确记着「本轮不做真实复测」「A2 仍记为未解决」。
+改动不经复测，就既不能说它有效，也不能说它无效。这是本次复测的唯一目的。
+
+### 二、运行条件
+
+| 项 | 值 |
+| --- | --- |
+| **代码版本** | **本地工作区新代码**：`HEAD = b12b479`，`git status` 干净、无未提交改动。**不是** Railway 上仍跑的 `c4cd0e1` |
+| **身份与档案** | 临时库新建学习者；写入后**回读逐项确认** = `b2` / `level_uncertain=0` / `en_advanced` / `normal` / `academic` / `writing`，与 M01 前置条件**六项全对** |
+| **数据库隔离** | `CHAT_DB_PATH` → 临时库；运行前后比对项目内 `chat.db` 的**大小与 mtime，完全未变** |
+| **会话** | 同一会话**连续两轮**；第②轮日志 `context_messages=2` / `context_chars=1354` → 上下文确实带上（第①轮为 0）。**1354 与第九节那次逐字相同**，说明上下文拼装未变 |
+| **模型调用** | **恰好 2 次**（临时库 `api_usage` = `('2026-10-10', 2)`），两次 `diagnostic_code=ok` |
+| **回答来源** | 两轮均为 `decision=general_answer` —— **符合预期**：这是通用英语改错题，本就不该靠课程资料 |
+| **密钥** | 未查看、未输出任何密钥值（只确认「已配置」及长度）。`.env` 里仍是模板占位符，真实密钥来自环境变量，`env_utils` 的 `setdefault` 使其生效 |
+
+**前置条件三条逐条对照**（不满足就不能声称完成 M01 回归）：
+① 同一份档案五项一致 —— ✅ 六项回读全对；
+② 同一会话连续两轮 —— ✅ 见上；
+③ 隔离临时库、不碰现有聊天数据 —— ✅ `chat.db` 未变。
+
+### 三、两轮回答（逐字记录，供以后重新判读）
+
+**第①轮问**：`Can you improve this sentence for a classroom discussion and explain the main mistakes? 'AI make student learn more fast, but they depend to it too much.'`
+
+**第①轮答**：
+
+> 【AI general-knowledge answer — not based on course materials】
+>
+> **Improved version**
+>
+> > *AI helps students learn faster, but they rely on it too much.*
+>
+> **Main mistakes**
+>
+> 1. **Subject–verb agreement — "AI make" → "AI makes"**
+>    "AI" is a singular noun here (the technology), so the verb needs the third-person singular *-s*: *makes*. In your sentence the base form *make* does not agree with the subject.
+>
+> 2. **"learn more fast" → "learn faster"**
+>    To compare two degrees of speed you need the comparative form of the adverb, *faster* — not *more* + adjective. *More fast* is not a valid comparison in English.
+>
+> 3. **"depend to it" → "depend on it"**
+>    *Depend* is always followed by the preposition **on** (or *upon* in formal writing): *depend on something*. "Depend to" is not a correct collocation.
+>
+> 4. **Pronoun agreement — "student" → "students"**
+>    In a general statement about a group, English uses the plural: *students*. With *students* (plural), the pronoun referring back to them must also be plural: **they depend on *it*** — *it* correctly refers to *AI*, so that part is fine; only the noun needed fixing.
+>
+> **Optional, more natural alternatives**
+>
+> - *AI enables students to learn faster, but they rely on it too heavily.*
+> - *AI speeds up students' learning, yet they become overly dependent on it.*
+> - *While AI helps students learn faster, it also makes them too reliant on it.*
+>
+> For classroom discussion you could also soften the claim, so it sounds more balanced:
+>
+> > *AI can help students learn faster, but there is a risk that they become too dependent on it.*
+
+**第②轮问**：`What were the two most important mistakes in the sentence I just sent? Give me one short exercise to practise them.`
+
+**第②轮答**：
+
+> 【AI general-knowledge answer — not based on course materials】
+>
+> **The two most important mistakes**
+>
+> 1. **"depend to it" → "depend on it"** — a collocation error that actually breaks the meaning. *Depend* is always followed by **on** (or *upon* in formal registers): *depend on something*. *Depend to* does not exist, so this is the one a reader would notice first.
+>
+> 2. **"learn more fast" → "learn faster"** — a genuine grammatical error. *Fast* has a one-syllable comparative *faster*; *more fast* is not a valid English comparison. Note that *more quickly* would also be grammatical, but *more fast* is simply wrong.
+>
+> Subject–verb agreement (*AI make → makes*) is certainly an error too, but it is a single missing *-s*, whereas the two above affect meaning and collocation, so they matter more in a classroom discussion.
+>
+> **Short exercise**
+>
+> Rewrite each sentence so it is correct. Two of the three contain one of the errors above.
+>
+> 1. Good teachers make students learn quick, but students depend to them too much.
+> 2. Remote work lets people finish tasks more fast, but it also requires them to depend on self-discipline.
+> 3. A good dictionary helps writers write accurate, but they depend to it too heavily.
+>
+> *Answers: 1. …learn quickly… / …depend on them…  2. …finish tasks faster… (the second half is already correct)  3. …write accurately… / …depend on it…*
+
+### 四、逐项判定（按 M01 预设标准，**未作任何改动**）
+
+#### A · 一票否决（任一轮出现即不通过）
+
+| # | 预设的失败表现 | 本轮是否出现 | 依据 |
+| --- | --- | --- | --- |
+| A1 | 声称 `make student learn` 违反「make + 宾语 + 动词原形」／说 `learn`「应该用原形」／说这里缺 `to` 或多 `to` | **未出现** ❌ | 两轮**都没有提到** `make + 宾语 + 动词原形` 这条规则，也没有对 `learn` 的形式提出任何异议 |
+| A2 | 把修饰动词 `learn` 的 `fast` / `faster` 说成**形容词**或**形容词比较级** | **未出现** ❌ | 第①轮明写「the comparative form of **the adverb**」；第②轮**回避了词性**，只说「one-syllable comparative」（边界情况，**单列于第六节**） |
+
+> **A 组结论**：两款均未触发 → **一票否决不适用**。
+
+#### B · 必答项（**两轮合计**覆盖）
+
+| # | 应指出 | 本轮 | 出处 |
+| --- | --- | --- | --- |
+| B1 | 主谓一致 `AI make` → `AI makes` | ✅ **命中** | 第①轮第 1 条；第②轮末尾也再次提到 |
+| B2 | 可数名词单数缺冠词 `student` → `students` / `a student` | ✅ **命中**（**这正是第九节唯一没做到的那一项**） | 第①轮第 4 条：「"student" → "students"」「English uses the plural: *students*」 |
+| B3 | `more fast` → `faster`，**且理由正确**（`fast` 在此是**副词**） | ✅ **命中**，且不与 A2 冲突 | 第①轮第 2 条：「the comparative form of the adverb, *faster*」 |
+| B4 | `depend to it` → `depend on it` | ✅ **命中** | 第①轮第 3 条；第②轮第 1 条 |
+
+> **B 组结论**：B1–B3（判定门槛）**全部命中**；B4 亦命中 → 不记「不完整」。
+
+#### C · 第②轮专项（只看第②轮自己做没做到）
+
+| # | 第②轮必须做到 | 本轮 | 依据 |
+| --- | --- | --- | --- |
+| C1 | 正确接住「刚才那句」 | ✅ | 直接分析上一轮那句，无「你指哪一句」、未要求重新粘贴 |
+| C2 | 指出至少两个**真实存在**的错误 | ✅ | 给出 `depend to → on`、`more fast → faster` 两条，并补充主谓一致；**三条都是真错误**，无误报 |
+| C3 | 给出**一个**练习，且针对上述错误 | ✅ | 三道改写句，分别针对 `quick/quickly`、`more fast/faster`、`accurate/accurately` 与 `depend to/on`，并附答案 |
+
+> **C 组结论**：C1 / C2 / C3 全部做到。
+
+#### 判定口径核对
+
+| 口径 | 结果 |
+| --- | --- |
+| 1. A1 / A2 在任一轮都不出现 | ✅ |
+| 2. B1–B3 在两轮合计里全部命中 | ✅ |
+| 3. C1 / C2 / C3 在第②轮全部做到 | ✅ |
+
+**三条同时满足 → 本次 M01 判定：通过。**
+
+### 五、与三次历史运行并列
+
+| 运行 | 日期 | A2 | 总判定 | 失败点 |
+| --- | --- | --- | --- | --- |
+| ①（第九节） | 2026-10-08 | 未触发（「the comparative **simply modifies the verb**」） | **未通过** | 唯一缺 **B2** |
+| ②（第十一节） | 2026-10-08 | **触发**（「*Fast* is a **short adjective**」） | **未通过** | A2 一票否决 |
+| ③（第十五节） | 2026-10-08 | 未触发（小标题「Adverb form」） | **未通过** | 唯一缺 **B2**（该节判分已更正） |
+| **④（本节）** | **2026-10-10** | **未触发**（第①轮「the adverb」；第②轮回避词性） | **通过** | 无 |
+
+**相对历史的两点观察**（**不构成结论**）：
+
+1. **B2 这次命中了。** ①那次唯一没做到的就是 B2 —— 说明「可数名词单数」这一类，现在会被主动点到。
+2. **A2 在前四次的共同弱点是「贴词性标签」，这次第①轮不但没贴错，还主动说对了（adverb）。**
+
+### 六、⚠️ 边界情况：第②轮那处「one-syllable comparative」
+
+第②轮原句：**「*Fast* has a one-syllable comparative *faster*」**。
+
+**按 A2 的**字面**标准，这不构成触发** —— A2 要求的是把它说成**形容词**或**形容词比较级**，
+而这句**根本没有给出词性**（既不是形容词，也不是副词），只陈述了「单音节比较级」这个形式事实。
+
+**但必须把话说全：**
+
+- 它**也没有给出 B3 要求的那个正确理由**（`fast` 在此是**副词**）。B3 只要求「两轮合计」出现一次，
+  第①轮已经给对了，所以**不影响本次判定**；
+- 「单音节比较级」在英文教材里**恰恰是形容词那条规则的措辞来源**（短形容词加 `-er`）。
+  换句话说：**它绕开了词性，但走到了同一条规则的门口。**
+- 因此这是**「换了个说法的同一类风险」**，不是「风险消失了」。
+  **下一次复测要盯的就是这一句** —— 如果再往前半步说成「one-syllable adjective」，
+  就正好落回 A2。
+
+> **这一条不计入本次 M01 评分**（沿用第九节「另记新观察」的处置方式），
+> 也**没有修改 A2 的任何一个字**。
+
+### 七、这次**不能**得出的结论（边界）
+
+1. **样本仍是 1 次。** 前三次运行里，失分点在 B2 → A2 → B2 之间漂移过；
+   一次通过**不能**证明稳定，**更不能**据此说「A2 已修复」。
+2. **不能**说明是 `b12b479` 那条「不要贴词性标签」规则起的作用 ——
+   本轮**没有对照组**（没跑旧代码），两处改动的贡献无法拆分。
+3. **两轮回答都来自同一个模型、同一次运行**，彼此不独立。
+4. **本轮的 `chat.db` 未被触碰**，也不代表长期如此 —— 这只说明这一次隔离成功。
+5. **线上仍是旧代码。** 本节结论**只对 `b12b479`（本地）成立**，对 Railway 上那份 `c4cd0e1` 不成立。
+
+### 八、费用与授权
+
+本次为**单独授权的 2 次真实调用**（授权明确覆盖「M01 两轮」这一次运行）。
+执行结果与授权一致：临时库 `api_usage = 2`，**未超出**。
+**任何再次真实调用仍需新的授权。**
+
+### 九、下一步（**尚未执行**）
+
+1. 按本文档既定纪律，**本轮结论需要沉淀为一次独立复测**才能谈稳定 —— 建议**间隔一段时间再跑一次**，
+   重点看第②轮那处词性表述是否又滑回 A2；
+2. **`b12b479` / `3f0964e` 仍未推送、未部署** —— 推送与部署是独立动作，需另行决定；
+3. 本轮**未改动任何业务代码、题库、评测器、评分标准与历史记录**。
+
+---
+
 ## 2026-10-09 · A2 的第二次最小改进：不需要时不要贴词性标签
 
 **状态**：离线验证通过（**794 项测试** OK，dry-run 正常）；
@@ -83,8 +355,9 @@ git diff --check                                         → exit 0
    假客户端返回什么完全由测试写死 —— 它对语法一窍不通。
 2. **因此 A2 仍然记为【未解决】**，M01 的预设判定标准与三次历史结果**一个字都没改**。
 3. **这是同一处失败的第三次提示词补丁**（第十节 → 第十四节 → 本轮）。
-   三次真实复测是 **1 次通过、2 次未通过**，且**失分点每次都在漂移** ——
+   截至当时的三次真实复测**全部未通过**（失分点依次 **B2 → A2 → B2**，**每次都在漂移**）——
    这本身就说明**运行之间的波动很大**，而**补文字能不能收敛它，本轮无法回答**。
+   （第四次于 2026-10-10 按预设标准通过一次，见本文件顶部。）
    下一轮真实复测需要**新的授权**，**不自动重跑**。
 4. **本轮没有动采样参数。** 如果判断**波动本身**才是主要矛盾，调低 `temperature`
    是一条候选路径 —— 但它会改变**所有**回答的行为，也会让既有评测分数的**可比性失效**，
@@ -897,7 +1170,7 @@ git diff --check                                         → exit 0
 | C2 指出至少两个真实错误 | ✅ | 两个主要错误 + 一个「稍小的问题」+ 一处复数说明 |
 | C3 给出一个练习 | ✅ | 填空题 2 题 + 答案，针对主谓一致与 `depend on` |
 
-> **按判定口径：A1/A2 任一轮都不出现、B1–B3 两轮合计全部命中、C1–C3 第②轮全部做到 → M01 判定【通过】。**
+> **按判定口径：A1/A2 任一轮都不出现 ✅、C1–C3 第②轮全部做到 ✅，但 B1–B3 **没有全部命中** —— **B2 未命中**（见上表）→ **M01 判定【未通过】。**
 
 #### M02 逐项判定（按预设标准，未改动）
 
@@ -928,7 +1201,7 @@ git diff --check                                         → exit 0
 | --- | --- | --- | --- | --- |
 | 第一次（第九节） | 未通过 | 未触发 | **B2 未命中** | 改了 `student` 却没解释 |
 | 第二次（第十一节） | 未通过 | **A2 触发** | B2 命中 | 把 `fast` 说成「短形容词」 |
-| **第三次（本节）** | **通过** | 未触发 | 全部命中 | 把 `fast` 归到 **「Adverb form」** 下 |
+| **第三次（本节）** | **未通过** | 未触发 | **B2 未命中** | 把 `fast` 归到 **「Adverb form」** 下；`student` 只被说成「更自然」，没当成错误 |
 
 **观察（不改判定）**：本轮第①轮是 `general_answer` + 0 引用，与第二次运行的 `answer` + 1 条无关引用不同。
 这与「检索层功能词过滤后那句题的假命中从 13.14 降到 2.90」方向一致，
@@ -936,8 +1209,9 @@ git diff --check                                         → exit 0
 
 #### 未解决的风险（**不得读成已修好**）
 
-1. **一次样本。** M01 三次运行 = 两次不通过 + **一次通过**，即 **1/3** —— **不能说 A2 已解决**。
-   前两次分别是 B2 未命中、A2 触发，说明**失分点本身在漂移**。
+1. **一次样本。** 截至本节（第三次运行），M01 **前三次运行全部未通过** —— 失分点依次是 **B2 未命中 → A2 触发 → B2 未命中**，
+   说明**失分点本身在漂移**，**不能说 A2 已解决**。
+   （其后 **2026-10-10 的第四次运行按预设标准通过了一次**，见本文件顶部；四次合计 **1/4**，样本量仍不足以谈稳定。）
 2. **M02 两次运行 = 通过、不通过 → 尚未稳定**，而且这次触发的是**同一种失败模式**（把「没错、只是更精确」的说法列进错误清单）。
 3. **无关引用仍未验证**：本轮完全没有引用，M03 没被考到。
 4. **Railway 上仍是旧代码**，本轮全部真实复测都基于未提交、未部署的本地代码。

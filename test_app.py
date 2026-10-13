@@ -1453,6 +1453,63 @@ class TestProfilePage(ChatTestCase):
 
 # ===================== 5h. 档案真的进了提示词 =====================
 
+class TestLengthModeGating(ChatTestCase):
+    """「详细」和「精简」这两档，必须**真的送到模型面前**，而且不能互相串味。
+
+    【为什么单独测这一件事】
+    rag.py 只管把档案代号翻成人话；「这一档到底有没有生效」要看
+    app.py → rag 这一路拼出来的提示词。所以这里走网页全流程，检查
+    假客户端**实际收到**的那段 user 消息。
+
+    【能证明什么、不能证明什么】
+    能证明：档案里选的档位进了提示词，而且「详细」才带那条补搭配的口径。
+    证明不了：模型照不照做 —— 假客户端不懂教学（见 test_rag.TestAnswerContentGuidance）。
+    """
+
+    def prompt_text(self, index=-1):
+        """取出发给模型的 user 消息正文。"""
+        return self.fake.calls[index]["messages"][1]["content"]
+
+    def system_text(self):
+        return self.fake.calls[-1]["messages"][0]["content"]
+
+    def bind(self, code="gate1"):
+        self.make_invite(code)
+        c = tutor.app.test_client()
+        self.enter_invite(c, code)
+        return c
+
+    def test_detailed_mode_carries_the_extension_wording(self):
+        """选了「详细」→ 提示词里的那一行要带上「补搭配或近义表达」这个口径。"""
+        c = self.bind()
+        self.save_profile(c, length_mode="detailed")
+        self.ask(c, "affect 和 effect 有什么区别？")
+
+        sent = self.prompt_text()
+        self.assertIn("详细", sent)
+        self.assertIn("搭配或近义表达", sent)
+        self.assertIn("不要为了长而长", sent)
+
+    def test_brief_mode_does_not_carry_the_extension_wording(self):
+        """【护住 B03】选了「精简」→ 不许把「补搭配」那条口径带进这次请求。"""
+        c = self.bind()
+        self.save_profile(c, length_mode="brief")
+        self.ask(c, "affect 和 effect 有什么区别？")
+
+        sent = self.prompt_text()
+        self.assertIn("精简", sent)
+        self.assertNotIn("搭配或近义表达", sent)
+
+    def test_the_brief_exemption_is_decided_in_the_system_prompt(self):
+        """「精简就不加延伸」这条规则常驻 system 提示词 —— 模型每道题都看得到。"""
+        c = self.bind()
+        self.save_profile(c, length_mode="brief")
+        self.ask(c, "affect 和 effect 有什么区别？")
+
+        system = self.system_text()
+        self.assertIn("不要加延伸", system)
+
+
 class TestProfileReachesTheModel(ChatTestCase):
 
     def prompt_text(self, index=-1):
@@ -1517,6 +1574,51 @@ class TestProfileReachesTheModel(ChatTestCase):
         self.assertEqual(r.status_code, 302)
         self.assertIn("学习者档案", self.prompt_text())
         self.assertIn("中英对照", self.prompt_text())      # 默认语言模式
+
+    def test_the_answer_language_rule_and_the_chosen_mode_both_reach_the_model(self):
+        """【本轮新增】语言这件事有两半，都要出现在假客户端收到的东西里：
+
+        ① system 消息里那条规则 —— 语言按档案偏好走、没有档案时默认中文；
+        ② user 消息里这一档的具体偏好行。
+
+        【能证明什么】两半确实都发出去了。
+        【证明不了】模型会不会照它选语言 —— 假客户端不懂教学，它返回什么是测试写死的。
+        """
+        c_en = self.bind("lang-en")
+        self.save_profile(c_en, language_mode="en_only")
+        self.ask(c_en, "随便问一句")
+        system = self.fake.calls[-1]["messages"][0]["content"]
+        self.assertIn("语言按上面的档案语言偏好走", system)
+        self.assertIn("默认用中文", system)
+        self.assertIn("全英文", self.prompt_text())
+
+        c_pair = self.bind("lang-pair")
+        self.save_profile(c_pair, language_mode="zh_pair")
+        self.ask(c_pair, "随便问一句")
+        self.assertIn("中英对照", self.prompt_text())
+
+    def test_the_bilingual_dedup_wording_reaches_both_messages(self):
+        """【本轮新增】中英对照的新口径，两半都要在假客户端收到的东西里：
+
+        ① user 消息里那一行语言偏好（英文内容照常给 + 不要整段复述）；
+        ② system 消息里那条通用去重规则（单位是句子和短语）。
+
+        【能证明什么】两条都确实发出去了。
+        【证明不了】模型会不会照做 —— 假客户端不懂教学，它返回什么由测试写死。
+        """
+        c = self.bind("dedup-zh")
+        self.save_profile(c, language_mode="zh_pair")
+        self.ask(c, "帮我改一下这句话：I am afraid of fly.")
+
+        user = " ".join(self.prompt_text().split())
+        self.assertIn("中英对照", user)
+        self.assertIn("不是重复", user)
+        self.assertIn("不要先写一整段英文讲解", user)
+
+        system = " ".join(self.fake.calls[-1]["messages"][0]["content"].split())
+        self.assertIn("单位是句子和短语，不是整篇回答", system)
+        self.assertIn("例句和搭配照常给", system)
+        self.assertIn("一处都不能省", system)
 
     def test_the_profile_cannot_become_a_citation_source(self):
         """【核心安全断言】档案**不是资料**。
@@ -3931,9 +4033,18 @@ class TestDeploymentArtifacts(unittest.TestCase):
         self.assertIn("计费", doc, "没提备份会产生存储费用")
 
     def test_doc_is_honest_that_no_backup_was_created(self):
-        """【诚实性】没做过的事就要写没做过。"""
+        """【诚实性】没做过的事就要写没做过。
+
+        【2026-10-12 更新】原来断言的是「没有实际创建任何备份」这句写作时的说明。
+        后来实测发现：平台**拒绝**为非 Pro 工作区创建手动备份
+        （BAD_USER_INPUT: ... only available for Pro workspaces），
+        所以文档改成了更强的一版：「这个卷**没有任何备份**，也没有备份计划，
+        而且平台**拒绝创建**」。
+        断言跟着改成这组新措辞 —— 本意没变：没备份这件事必须白纸黑字写出来。
+        """
         doc = self.read("DEPLOYMENT.md")
-        self.assertIn("没有实际创建任何备份", doc)
+        self.assertIn("没有任何备份", doc, "没写「没有备份」")
+        self.assertIn("拒绝创建", doc, "没写「平台拒绝创建」")
 
     # ---------- 健康检查的「请求次数」与「重新部署停机」（第二轮修正） ----------
     #

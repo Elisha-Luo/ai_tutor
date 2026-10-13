@@ -18,6 +18,7 @@
 import os           # 环境变量、拼路径
 import io           # 接住打印输出，用来证明「什么都没打印」
 import json         # 把返回对象序列化，检查里面有没有密钥
+import shutil       # 复制项目文件到临时目录（子进程的隔离环境要用）
 import subprocess   # 在子进程里真的跑一次 app.py，验证它会停下来
 import sys          # 模块搜索路径
 import tempfile     # 造临时 .env 文件，不碰项目里真的那个
@@ -429,12 +430,96 @@ class MakeClientRejectsBadKeysTest(unittest.TestCase):
         self.assertEqual(client.base_url.host, "api.deepseek.com")
 
 
-class AppRefusesExampleKeyTest(unittest.TestCase):
+# ===================== 子进程端到端测试的共用底座 =====================
+#
+# 【为什么这三个类都要真的 import app】只有真的执行 app.py 的模块级检查，
+# 才能证明「它会停下来」。在源码里 grep 一个字符串证明不了这件事。
+#
+# 【共用底座负责挡掉两样东西】
+#
+#   1. **项目根目录那份 .env**。app.py 启动时会读它 —— 而且是**显式传路径**：
+#        load_dotenv(os.path.join(BASE_DIR, ".env"))        （app.py:35-37）
+#      BASE_DIR 来自 app.py 自己的 __file__，所以改 env_utils.DEFAULT_ENV_PATH
+#      对它没有任何作用（试过，无效）。而 .env 里可能放着真实配置。一旦被读到：
+#        · 「不配密钥必须停」会被 .env 补上的密钥救活 → 假红；
+#        · 「不配管理令牌 → 入口必须关着」可能被 .env 里的令牌打开 → 也是假结果。
+#      做法：把项目文件**复制一份到临时目录、但不带 .env**，让子进程在副本里
+#      import app。于是 app.py 眼里的「项目根」就是副本目录，
+#      `<副本>/.env` 不存在 —— 它根本无从读到真实配置。
+#      副本里的 .py 与被测文件逐字节相同（同一批文件刚复制过去），
+#      所以**执行的仍然是真正的 app.py**，不是替身。
+#
+#   2. **别的测试留下的失效 CHAT_DB_PATH**。那些临时目录测试一结束就删了，
+#      继承下来会让 app.py 先在「数据库所在目录不存在」那一关停掉 ——
+#      测到的就不是原来那件事了（这种失败真的发生过）。
+#      做法：每次都指到本测试自己的临时目录。
+#
+# 【共用底座不碰的东西】不改 env_utils.py / app.py，不读、不打印任何真实配置值。
+
+class IsolatedAppProcessTestCase(unittest.TestCase):
+    """在「无 .env 的项目副本」里跑子进程 `import app` 的共用底座。"""
+
+    # 一套【能通过启动检查】的测试假值。刻意做得很好认：万一出现在不该出现的地方，一眼看得出。
+    FAKE_API_KEY = "test-key-not-a-real-key"
+    FAKE_FLASK_KEY = "test-secret-not-a-real-key"
+    FAKE_PEPPER = "test-pepper-not-a-real-pepper"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+        # 项目文件的副本，但【不含 .env】—— 这就是「子进程读不到真实配置」的保证
+        self.app_dir = os.path.join(self.tmp.name, "app")
+        shutil.copytree(
+            BASE, self.app_dir,
+            ignore=shutil.ignore_patterns(
+                ".env", ".git", "__pycache__", "*.pyc", "*.db", "results"))
+
+        # 数据库：本测试自己的临时目录（目录必须存在，app.py 会检查）
+        self.data_dir = os.path.join(self.tmp.name, "data")
+        os.makedirs(self.data_dir, exist_ok=True)
+        self.db_path = os.path.join(self.data_dir, "child.db")
+
+    def child_env(self, **overrides):
+        """子进程要用的环境变量。overrides 里传 None 表示【把这个变量删掉】。"""
+        env = dict(os.environ)
+        env["DEEPSEEK_API_KEY"] = self.FAKE_API_KEY
+        env["FLASK_SECRET_KEY"] = self.FAKE_FLASK_KEY
+        env["INVITE_CODE_PEPPER"] = self.FAKE_PEPPER
+        env["CHAT_DB_PATH"] = self.db_path
+        env["PYTHONIOENCODING"] = "utf-8"        # 中文提示不因编码问题炸掉
+        for key, value in overrides.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
+        return env
+
+    def run_app(self, code="import app", **overrides):
+        """在隔离副本里真的 import app，返回 (退出码, 输出)。
+
+        导入的是副本里的 app（副本目录排在 sys.path 最前），
+        这样 app.py 眼里的项目根 = 副本目录，那里没有 .env。
+        """
+        child_code = ("import sys; sys.path.insert(0, " + repr(self.app_dir) + "); "
+                      + code)
+        proc = subprocess.run(
+            [sys.executable, "-c", child_code],
+            cwd=self.app_dir, env=self.child_env(**overrides),
+            capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60)
+        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+
+
+class AppRefusesExampleKeyTest(IsolatedAppProcessTestCase):
     """【端到端】网页厨房（app.py）也必须拦住示例值。
 
     用子进程跑 `import app`，这样是真的执行 app.py 的模块级检查，
     而不是在源码里 grep 一个字符串 —— grep 过了不等于程序真的会停。
     子进程完全离线：检查发生在创建客户端之前。
+
+    【环境隔离】用共用底座：项目副本（不含 .env）+ 独立临时数据库，
+    见 IsolatedAppProcessTestCase 的说明。
     """
 
     def _import_app(self, key_value):
@@ -442,19 +527,7 @@ class AppRefusesExampleKeyTest(unittest.TestCase):
 
         key_value 传 None 表示【不设】这个环境变量。
         """
-        code = "import app"
-        env = dict(os.environ)
-        env.pop("DEEPSEEK_API_KEY", None)
-        if key_value is not None:
-            env["DEEPSEEK_API_KEY"] = key_value
-        # PYTHONIOENCODING 保证中文提示在子进程里不会因为编码问题炸掉
-        env["PYTHONIOENCODING"] = "utf-8"
-
-        proc = subprocess.run(
-            [sys.executable, "-c", code],
-            cwd=BASE, env=env, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=60)
-        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        return self.run_app(DEEPSEEK_API_KEY=key_value)
 
     def test_app_refuses_the_example_value(self):
         """【核心】用示例值启动 app.py → 直接失败，并给出固定提示。"""
@@ -468,10 +541,26 @@ class AppRefusesExampleKeyTest(unittest.TestCase):
         self.assertNotIn(env_utils.EXAMPLE_API_KEY, output)
 
     def test_app_refuses_missing_key(self):
-        """没配密钥同样要停 —— 这是原本就有的行为，别被这次修改弄丢。"""
+        """没配密钥同样要停 —— 这是原本就有的行为，别被这次修改弄丢。
+
+        【为什么这条最依赖上面那层隔离】它是三条里唯一一条把密钥【留空】的。
+        只要子进程还能读到项目 .env，.env 就会把密钥补上，这条必红 ——
+        而它红了并不代表 app.py 有问题。
+        """
         code, output = self._import_app(None)
         self.assertNotEqual(code, 0)
         self.assertIn("DEEPSEEK_API_KEY", output)
+
+    def test_a_normal_test_key_still_starts_the_app(self):
+        """【地基】测试专用的假密钥必须能正常启动。
+
+        【为什么这一条必须有】上面三条断言的都是「必须停」。如果隔离本身写坏了
+        （比如子进程环境缺了什么，导致 app.py 无论如何都起不来），
+        那三条会**因为错误的原因通过** —— 这条就是拿来堵这个洞的：
+        同一个子进程、同一套隔离，只把密钥换成假值，必须能起来（退出码 0）。
+        """
+        code, output = self._import_app("test-key-not-a-real-key")
+        self.assertEqual(code, 0, "测试用的假密钥居然起不来：\n" + output[-500:])
 
 
 # ===================== 另外两个密钥的示例值 =====================
@@ -569,8 +658,12 @@ class ExampleSecretDetectionTest(unittest.TestCase):
             env_utils.EXAMPLE_PEPPER, env_utils.EXAMPLE_API_KEY))
 
 
-class AppRefusesExampleSecretsTest(unittest.TestCase):
-    """【端到端】子进程里真的 import app，证明它会停下来。"""
+class AppRefusesExampleSecretsTest(IsolatedAppProcessTestCase):
+    """【端到端】子进程里真的 import app，证明它会停下来。
+
+    【环境隔离】用共用底座：项目副本（不含 .env）+ 独立临时数据库，
+    见 IsolatedAppProcessTestCase 的说明。
+    """
 
     def _import_app(self, **overrides):
         """在子进程里 import app。返回 (退出码, 输出)。
@@ -578,26 +671,7 @@ class AppRefusesExampleSecretsTest(unittest.TestCase):
         基线给一套【能通过检查】的假值，再用 overrides 覆盖其中某一项。
         值传 None 表示把这个变量删掉。
         """
-        tmpdir = tempfile.mkdtemp(prefix="ai_tutor_envcheck_")
-        self.addCleanup(__import__("shutil").rmtree, tmpdir, ignore_errors=True)
-
-        env = dict(os.environ)
-        env["DEEPSEEK_API_KEY"] = "test-key-not-a-real-key"
-        env["FLASK_SECRET_KEY"] = "test-secret-not-a-real-key"
-        env["INVITE_CODE_PEPPER"] = "test-pepper-not-a-real-pepper"
-        env["CHAT_DB_PATH"] = os.path.join(tmpdir, "check.db")
-        env["PYTHONIOENCODING"] = "utf-8"
-        for key, value in overrides.items():
-            if value is None:
-                env.pop(key, None)
-            else:
-                env[key] = value
-
-        proc = subprocess.run(
-            [sys.executable, "-c", "import app"],
-            cwd=BASE, env=env, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=60)
-        return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+        return self.run_app(**overrides)
 
     def test_the_baseline_fake_values_still_work(self):
         """【核心】测试专用的假值必须照常可用 —— 别把检查做得太狠。
@@ -632,38 +706,31 @@ class AppRefusesExampleSecretsTest(unittest.TestCase):
                 self.assertNotIn(value, output)
 
 
-class AdminTokenSwitchTest(unittest.TestCase):
+class AdminTokenSwitchTest(IsolatedAppProcessTestCase):
     """管理令牌的开关：配成示例值 / 不配 → 入口关着；配了真值 → 打开。
 
     【和上面两个密钥的关键区别】管理令牌【不是必填】：
     配成示例值或不配时，应用要**照常启动**，只是管理入口关掉 —— 绝不能启动失败。
     这里用子进程真的 import app，读出它算出来的 ADMIN_ENABLED，
     而不是在测试里手写一个 False（那样测的是测试自己）。
+
+    【「不配令牌」这一条特别依赖隔离】令牌为空时，如果子进程还能读到项目里的 .env，
+    而 .env 又恰好配了 ADMIN_MINT_TOKEN，那它就会把入口打开 ——
+    于是「不配 → 必须关着」这条会红，或者反过来掩盖真正的问题。
+    用共用底座之后，子进程读到的配置**只有**本测试给的那一套，
+    「未配置令牌」才是真的未配置：项目副本里没有 .env，环境变量也被显式删掉了。
+    （见 IsolatedAppProcessTestCase 的说明。）
     """
 
     def _admin_enabled(self, token_value):
-        """在子进程里 import app，返回 (退出码, ADMIN_ENABLED 的字面值, 输出)。"""
-        tmpdir = tempfile.mkdtemp(prefix="ai_tutor_admincheck_")
-        self.addCleanup(__import__("shutil").rmtree, tmpdir, ignore_errors=True)
+        """在子进程里 import app，返回 (退出码, 输出)。
 
-        env = dict(os.environ)
-        env["DEEPSEEK_API_KEY"] = "test-key-not-a-real-key"
-        env["FLASK_SECRET_KEY"] = "test-secret-not-a-real-key"
-        env["INVITE_CODE_PEPPER"] = "test-pepper-not-a-real-pepper"
-        env["CHAT_DB_PATH"] = os.path.join(tmpdir, "check.db")
-        env["PYTHONIOENCODING"] = "utf-8"
-        if token_value is None:
-            env.pop("ADMIN_MINT_TOKEN", None)
-        else:
-            env["ADMIN_MINT_TOKEN"] = token_value
-
-        proc = subprocess.run(
-            [sys.executable, "-c",
-             "import app; print('ADMIN_ENABLED=' + str(app.ADMIN_ENABLED))"],
-            cwd=BASE, env=env, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=60)
-        output = (proc.stdout or "") + (proc.stderr or "")
-        return proc.returncode, output
+        输出里带着 `ADMIN_ENABLED=` 那一行，由子进程里真的算出来。
+        token_value 传 None 表示【不设】这个环境变量（= 未配置令牌）。
+        """
+        return self.run_app(
+            "import app; print('ADMIN_ENABLED=' + str(app.ADMIN_ENABLED))",
+            ADMIN_MINT_TOKEN=token_value)
 
     def test_no_token_still_starts_but_the_entry_is_closed(self):
         """【核心】不配令牌 → 应用照常启动，管理入口关着。"""
