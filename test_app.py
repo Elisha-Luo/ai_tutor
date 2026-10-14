@@ -4099,5 +4099,33 @@ class TestDeploymentArtifacts(unittest.TestCase):
         self.assertIn("PostgreSQL", doc)                 # 指明了真正的出路
 
 
+class TestInterfaceGuidance(ChatTestCase):
+    """首页的入门引导必须清楚，且示例不能擅自替用户发问。"""
+
+    def test_first_visit_shows_how_to_start(self):
+        html = tutor.app.test_client().get("/").get_data(as_text=True)
+        self.assertIn("把问题说出来就好", html)
+        self.assertIn("还没有对话", html)
+        self.assertIn("点选只会填入输入框，确认后再发送", html)
+        self.assertIn('href="/invite"', html)
+
+    def test_starters_are_not_submit_buttons(self):
+        html = tutor.app.test_client().get("/").get_data(as_text=True)
+        self.assertEqual(html.count('type="button" class="starter"'), 3)
+        self.assertIn("input.value = starter.dataset.prompt", html)
+        self.assertIn('id="ask-form"', html)
+
+    def test_shared_stylesheet_is_served_without_auth(self):
+        client = tutor.app.test_client()
+        self.assertIn('/static/ui.css', client.get("/").get_data(as_text=True))
+        self.assertIn('/static/ui.css', client.get("/invite").get_data(as_text=True))
+        css = client.get("/static/ui.css")
+        try:
+            self.assertEqual(css.status_code, 200)
+            self.assertIn("@media (max-width: 600px)", css.get_data(as_text=True))
+        finally:
+            css.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)      # 直接 python test_app.py 也能跑
