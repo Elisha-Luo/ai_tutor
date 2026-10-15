@@ -480,12 +480,7 @@ class TestExistingBehaviour(ChatTestCase):
         self.assertEqual(self.all_rows(), [], "重复请求不该写数据库")
 
     def test_lock_is_released_after_ai_error(self):
-        """AI 报错之后锁必须还回来，否则页面就再也用不了了。
-
-        【注意行为变了】以前模型报错会让整个请求失败、显示一条错误。
-        现在 rag.py 会把模型异常安全降级成「证据不足」，所以请求本身是成功的
-        （302 跳转），只是回答变成了一句安全的拒答。锁照样必须释放。
-        """
+        """模型服务失败返回可重试错误，释放锁，不存成教学回答。"""
         c = tutor.app.test_client()
         c.get("/")
 
@@ -495,8 +490,9 @@ class TestExistingBehaviour(ChatTestCase):
 
         r = self.ask(c, "这一问会失败")
 
-        self.assertEqual(r.status_code, 302)                # 安全降级后照常走 PRG
+        self.assertEqual(r.status_code, 503)
         self.assertFalse(tutor._lock.locked(), "出错后锁必须被释放")
+        self.assertEqual(self.all_rows(), [])
 
     def test_no_api_key_in_database(self):
         """数据库里绝不能出现 API 密钥。"""
@@ -664,8 +660,8 @@ class TestRagPipeline(ChatTestCase):
         self.assertNotIn("我觉得应该这样回答", dump, "坏 JSON 的原文被当成回答存下来了")
         self.assertNotIn("资料来源", dump)
 
-    def test_api_exception_does_not_leak_and_is_saved_as_safe_refusal(self):
-        """【核心】模型异常时：不泄露异常原文，同时记下一条安全拒答。"""
+    def test_api_exception_does_not_leak_or_save_a_teaching_answer(self):
+        """服务故障不伪装成证据不足；保留输入且不泄露内部细节。"""
         marker = "内部细节-接口炸了-7c1e"
 
         def boom(model, messages, **kwargs):
@@ -673,14 +669,17 @@ class TestRagPipeline(ChatTestCase):
         self.fake.chat.completions.create = boom
 
         c = tutor.app.test_client()
-        self.ask(c, "随便问一句")
+        response = self.ask(c, "随便问一句")
 
         rows = self.all_rows()
-        self.assertEqual(len(rows), 2, "安全降级后仍应记下这一问一答")
+        self.assertEqual(rows, [], "服务故障不能污染对话上下文")
         dump = " ".join(str(r) for r in rows)
         self.assertNotIn(marker, dump, "异常原文泄露进数据库了")
 
-        html = c.get("/").get_data(as_text=True)
+        html = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 503)
+        self.assertIn(tutor.MODEL_UNAVAILABLE_MESSAGE, html)
+        self.assertIn('value="随便问一句"', html)
         self.assertNotIn(marker, html, "异常原文泄露到页面了")
         self.assertNotIn("资料来源", dump)
 
@@ -4125,6 +4124,76 @@ class TestInterfaceGuidance(ChatTestCase):
             self.assertIn("@media (max-width: 600px)", css.get_data(as_text=True))
         finally:
             css.close()
+
+
+class TestModelOutageRecovery(ChatTestCase):
+    """跨浏览器故障只占一次额度，失败不写回答，冷却结束后可恢复。"""
+
+    def test_busy_then_timeout_then_cooldown_then_recovery(self):
+        entered = threading.Event()
+        release = threading.Event()
+        responses = []
+        original_create = self.fake.chat.completions.create
+
+        def blocked(model, messages, **kwargs):
+            self.fake.calls.append({"model": model, "messages": messages})
+            entered.set()
+            release.wait(3)
+            raise TimeoutError("private-timeout-detail")
+
+        self.fake.chat.completions.create = blocked
+        request_thread = threading.Thread(target=lambda: responses.append(
+            self.ask(tutor.app.test_client(), "第一个问题")))
+        request_thread.start()
+        try:
+            self.assertTrue(entered.wait(2))
+            second = self.ask(tutor.app.test_client(), "另一台设备的问题")
+            self.assertIn(tutor.LOCKED_MESSAGE, second.get_data(as_text=True))
+            self.assertEqual(len(self.fake.calls), 1)
+        finally:
+            release.set()
+            request_thread.join(4)
+        self.assertFalse(request_thread.is_alive())
+        self.assertEqual(responses[0].status_code, 503)
+        self.assertFalse(tutor._lock.locked())
+        self.assertEqual(self.all_rows(), [])
+        self.assertNotIn("private-timeout-detail", responses[0].get_data(as_text=True))
+
+        cooldown = self.ask(tutor.app.test_client(), "再次尝试")
+        self.assertEqual(cooldown.status_code, 503)
+        self.assertIn(tutor.MODEL_UNAVAILABLE_MESSAGE, cooldown.get_data(as_text=True))
+        self.assertEqual(len(self.fake.calls), 1)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            used = conn.execute("SELECT used FROM api_usage WHERE day = ?",
+                                (tutor._utc_day(),)).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(used, 1, "繁忙/冷却期间不能再次扣额度")
+
+        tutor._model_retry_after = 0.0  # 模拟冷却时间已经过去，无需真的等待。
+        self.fake.chat.completions.create = original_create
+        recovered = self.ask(tutor.app.test_client(), "现在可以回答")
+        self.assertEqual(recovered.status_code, 302)
+        self.assertEqual(len(self.all_rows()), 2)
+        self.assertEqual(len(self.fake.calls), 2)
+
+    def test_provider_error_keeps_existing_history_and_input(self):
+        browser = tutor.app.test_client()
+        self.ask(browser, "已经回答的问题")
+        existing = self.all_rows()
+
+        def failed(*args, **kwargs):
+            raise RuntimeError("sensitive-provider-details")
+
+        self.fake.chat.completions.create = failed
+        failed_response = self.ask(browser, "需要稍后重试的问题")
+        self.assertEqual(failed_response.status_code, 503)
+        self.assertEqual(self.all_rows(), existing)
+        html = failed_response.get_data(as_text=True)
+        self.assertIn('value="需要稍后重试的问题"', html)
+        self.assertNotIn("sensitive-provider-details", html)
+        self.assertFalse(tutor._lock.locked())
 
 
 if __name__ == "__main__":

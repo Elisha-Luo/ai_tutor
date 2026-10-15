@@ -11,7 +11,7 @@ import logging                                      # 打结构化日志
 import threading                                    # 用它的「锁」防止同一时间处理两个请求
 from datetime import datetime, timedelta, timezone  # datetime 记录消息时间；timedelta 设置 cookie 有效期；timezone 算 UTC 日期
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify   # session 给每个浏览器发身份标记；jsonify 拼 JSON 响应
-from openai import OpenAI                           # 从 openai 库里导入 OpenAI 类（DeepSeek 兼容它的接口）
+from model_client import BoundedModelClient         # 模型调用有总时限，超时会结束子进程
 from env_utils import (load_dotenv, is_example_api_key, EXAMPLE_KEY_MESSAGE,   # 共用 .env 读取；示例值检测也在那边
                        is_example_secret, example_secret_message,
                        EXAMPLE_FLASK_KEY, EXAMPLE_PEPPER, EXAMPLE_ADMIN_TOKEN,
@@ -204,6 +204,9 @@ MAX_QUESTION_LENGTH = _read_positive_int("MAX_QUESTION_LENGTH", 500, minimum=1)
 
 # 全站每天最多调用多少次模型（按 UTC 日期算），用来保护演示费用。
 DAILY_API_LIMIT = _read_positive_int("DAILY_API_LIMIT", 50, minimum=1)
+MODEL_REQUEST_TIMEOUT_SECONDS = _read_positive_int(
+    "MODEL_REQUEST_TIMEOUT_SECONDS", 30, minimum=5, maximum=60)
+MODEL_RETRY_COOLDOWN_SECONDS = 30
 
 # 请求体大小上限（64 KB）。
 # 【它和 MAX_QUESTION_LENGTH 管的不是一回事】
@@ -217,7 +220,8 @@ TOO_LONG_MESSAGE = ("你问的问题太长了（最多 " + str(MAX_QUESTION_LENG
                     + " 个字符），请精简一下再发。")
 TOO_LARGE_MESSAGE = "你发送的内容太大了，请把问题缩短一些再试。"
 QUOTA_MESSAGE = "今天的使用额度已经用完了，请明天再来。"
-LOCKED_MESSAGE = "上一个问题还在处理中，等它回答完再问下一个吧。"
+LOCKED_MESSAGE = "回答服务正在处理其他请求，请稍后再试。你的问题已保留在输入框中。"
+MODEL_UNAVAILABLE_MESSAGE = "回答服务暂时没有响应，请约半分钟后再试。你的问题已保留在输入框中。"
 
 
 # ===================== 数据库位置 =====================
@@ -326,12 +330,14 @@ app.secret_key = SECRET_KEY                           # 交给 Flask，用来签
 app.permanent_session_lifetime = timedelta(days=30)   # cookie 有效期 30 天（浏览器关掉再打开，历史还在）
 app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH # 请求体超过 64KB 直接拒掉，不会先整个读进内存
 
-client = OpenAI(api_key=API_KEY, base_url=BASE_URL)   # 创建 OpenAI 客户端，整个程序共用一个
+client = BoundedModelClient(api_key=API_KEY, base_url=BASE_URL,
+                            timeout=MODEL_REQUEST_TIMEOUT_SECONDS)
 
 # 【防止重复提问的第一道防线（服务端）】
 # 「锁」可以理解成一支只有一把的钥匙：谁先拿到，谁才能干活；其他人拿不到就得等着。
 # 我们故意设成「拿不到就不等，直接放弃」——因为拿不到就说明已经有一个问题在处理了。
 _lock = threading.Lock()
+_model_retry_after = 0.0                            # 只在持锁期间读写；故障后暂停新模型请求
 
 
 # ===================== 数据库相关的三个函数 =====================
@@ -902,6 +908,7 @@ def request_too_large(_error):
 
 @app.route("/", methods=["GET", "POST"])              # 绑定到网站根地址 "/"，允许 GET 和 POST
 def index():                                          # 用户每次打开页面或点发送都会执行它
+    global _model_retry_after
     sid = _ensure_session_id()
     learner_id = _learner_id_for(sid)                 # 这个浏览器有没有绑定学习档案（None = 匿名）
 
@@ -929,11 +936,16 @@ def index():                                          # 用户每次打开页面
 
             # 试着去拿那把锁。拿不到 = 已经有一个请求正在问 AI（多半是用户又按了一次回车）。
             if not _lock.acquire(blocking=False):
+                log_event("request_busy")
                 return _render(sid, question=question, error=LOCKED_MESSAGE)
 
             # try ... finally：不管中间成功还是失败，最后都必须把锁还回去。
             # 失败时忘了还锁的话，这把锁就永远拿不回来了，之后所有提问都会被拒绝。
             try:
+                if time.monotonic() < _model_retry_after:
+                    log_event("model_cooldown")
+                    return _render(sid, question=question,
+                                   error=MODEL_UNAVAILABLE_MESSAGE, status=503)
                 # ---------- 第一步：找出相关的那几段资料 ----------
                 # 【为什么检索要单独包一层 try】
                 # 检索这一步自己炸了，属于程序缺陷，和「资料里确实没有」完全是两回事：
@@ -1011,8 +1023,18 @@ def index():                                          # 用户每次打开页面
                 #      还是某一关校验没过、被安全降级下来的 —— 两者排查方向完全相反。
                 #      diagnostic_code 是【不含任何内容的固定短枚举】，只写日志，
                 #      【绝不】进页面、也不进数据库（result 仍然只有三个键）。
+                log_event("model_request_started")
                 result, diagnostic_code = rag.generate_answer_with_context_and_profile(
                     question, chunks, recent_messages, preferences, client, MODEL)
+
+                if diagnostic_code == rag.DIAG_API_OR_RESPONSE_ERROR:
+                    _model_retry_after = time.monotonic() + MODEL_RETRY_COOLDOWN_SECONDS
+                    log_event("model_request_failed", diagnostic_code=diagnostic_code,
+                              stage=getattr(client, "last_error_code", None) or "response_error",
+                              elapsed_ms=int(round((time.perf_counter() - started) * 1000)))
+                    # 服务故障没有产生教学回答：保留输入，不把“资料不足”存入上下文。
+                    return _render(sid, question=question,
+                                   error=MODEL_UNAVAILABLE_MESSAGE, status=503)
 
                 # ---------- 第五步：格式化 + 存库 ----------
                 # 只有真的回答了，才会在后面附上「资料来源」；
