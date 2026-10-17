@@ -20,15 +20,22 @@
 # =====================================================================
 
 import os                                  # 设环境变量、拼路径
+import re                                  # 从页面里抠出常量（等待状态的客户端断言）
 import sys                                 # 把当前文件夹加进模块搜索路径
 import json                                # 假模型要返回 JSON，这里负责拼
 import atexit                              # 程序结束时顺手清理临时文件
 import shutil                              # 删除临时文件夹用
 import sqlite3                             # 测试里要直接查数据库，验证数据真的写进去了
+import subprocess                          # 用 node 跑页面里那段纯函数（本机没有就跳过）
 import tempfile                            # 建临时文件夹，让测试用独立的数据库文件
+import time                                # 假上游要「挂住」一段时间
 import unittest                            # Python 自带的测试框架，不用额外安装
+import http.server                         # 本机假上游：只是一个本地 HTTP 服务
 import importlib                           # 用来「重新加载模块」，模拟重启 Flask
 import threading                           # 并发测每日额度时要起多个线程一起抢
+import http.client                         # 真实浏览器那一组：把请求转发给本机 Flask
+import urllib.parse                        # 同上：拼/拆探针回传的那串查询参数
+import html as html_module                 # 同上：DOM 转出来的文本要先反转义再当 JSON 读
 
 # =====================================================================
 # 【顺序极其重要】下面这几行必须在 import app 之前执行，原因有两个：
@@ -52,6 +59,7 @@ os.environ["INVITE_CODE_PEPPER"] = "test-pepper-not-a-real-pepper"            # 
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # 保证能找到同文件夹下的 app.py
 import env_utils                                                # 常量（示例值等）在这里定义
+import model_client                                             # 真实的有界客户端：假上游那一组要用它
 import app as tutor                                             # 导入被测对象
 
 
@@ -183,6 +191,20 @@ class ChatTestCase(unittest.TestCase):
     def ask(self, client, question="随便问一句"):
         """模拟一次完整的提问，返回响应对象。"""
         return client.post("/", data={"question": question})
+
+    def use_fake_upstream(self, mode, timeout=10):
+        """把 app 的客户端换成【真的】BoundedModelClient，指向本机假上游。
+
+        【和 FakeClient 的区别】FakeClient 是纯打桩，用来测网页自己那一层；
+        这个用的是真实代码路径（真的起子进程、真的发 HTTP、真的有 deadline），
+        用来测「超时 / 上游报错 / 卡住」这些只有真链路才答得准的事。
+        """
+        upstream = FakeUpstream(mode)
+        self.addCleanup(upstream.stop)
+        tutor.client = model_client.BoundedModelClient(
+            api_key="test-key-not-a-real-key", base_url=upstream.base_url,
+            timeout=timeout)
+        return upstream
 
     # ---------- 学习档案相关的小工具 ----------
 
@@ -4194,6 +4216,1966 @@ class TestModelOutageRecovery(ChatTestCase):
         self.assertIn('value="需要稍后重试的问题"', html)
         self.assertNotIn("sensitive-provider-details", html)
         self.assertFalse(tutor._lock.locked())
+
+
+# =====================================================================
+# 等待状态、重试时机、问题文字不丢（客户端那一半）
+#
+# 【和上面那组的分工】「超时/503/冷却」在服务端早就测过了
+# （test_busy_then_timeout_then_cooldown_then_recovery、
+#  test_provider_error_keeps_existing_history_and_input）。
+# 这一组补的是另一半：请求**再也回不来**时，页面会不会一直卡在「思考中」，
+# 刷新之后那句问题还在不在，以及用户怎么知道能不能重试。
+#
+# 【能证明什么】服务端把预算 / 回显 / 用户消息条数真的交给了页面；
+# 页面脚本能把「思考中」收回来、且**不会自己重发**；
+# 「刷新后把问题放回输入框」「这次发送算不算上一次的重发」这两条规则的判定表
+# （用 node 跑页面里同一段函数）；
+# 「响应丢了、用户又发一次」不会变成两次模型调用（服务端那一半，用身份牌挡住 ——
+#  而身份牌只在「是同一条问题」且「那份回答还在库里」时才作数，见下一组）；
+# 以及用**本机假上游**跑通真实链路 —— 真实的 BoundedModelClient
+# 打真实 HTTP 端口，超时/上游 503 都落到同一个可重试的 503 页。
+#
+# 【证明不了什么】
+#   · 真实浏览器里的定时器行为（这一组只测下发内容、判定表、服务端行为；
+#     浏览器那一半在下面 TestWaitingStateInRealBrowser 里，用本机 Chrome 跑）；
+#   · 模型真实行为（这里用的是本机假上游，不联网、不用真密钥）。
+# =====================================================================
+
+class FakeUpstream:
+    """本机假上游：一个只会按 mode 回答的 HTTP 服务。
+
+    【为什么要有它】超时到底会不会真的杀掉子进程、上游 503 会不会真的映射成
+    upstream_error —— 这些应该由**真实代码路径**回答，而不是靠打桩猜。
+    它只监听 127.0.0.1 的随机端口，不出网、不碰任何真实密钥。
+
+    mode：
+      ok        —— 立刻回一个格式正确的回答
+      slow      —— 先停一下再回答（「慢但还活着」）
+      hang      —— 收下请求就不吭声，一直拖到客户端自己的 deadline 放弃（测服务端超时）
+      status503 —— 立刻回 503（测上游报错）
+      gate      —— 收下请求，等测试说「可以了」再回答。用来把请求【确定性地】卡在半路：
+                   不依赖任何秒数，也不会因为机器慢就变成另一回事。
+    """
+
+    ANSWER = {"decision": "general_answer", "answer": "【假上游】假回答。", "citations": []}
+    GATE_WAIT_SECONDS = 30          # gate 模式下，最多替测试举着请求这么久
+    HANG_WAIT_SECONDS = 60          # hang 模式下，最多装死这么久
+
+    def __init__(self, mode="ok"):
+        self.mode = mode
+        self.requests = 0
+        self.arrived = threading.Event()    # 收到请求就亮：测试靠它对齐时序，不靠 sleep
+        self.release = threading.Event()    # gate 模式：测试放行
+        self.finished = threading.Event()   # 测试收工时让还在装死的线程立刻收手
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(length)
+                outer.requests += 1
+                outer.arrived.set()
+                mode = outer.mode              # 测试中途可以改：上游「恢复」了
+                if mode == "hang":
+                    outer.finished.wait(FakeUpstream.HANG_WAIT_SECONDS)
+                    return                     # 什么都不回：连接就这么挂着
+                if mode == "gate":
+                    outer.release.wait(FakeUpstream.GATE_WAIT_SECONDS)
+                if mode == "status503":
+                    body = json.dumps({"error": {"message": "upstream busy"}}).encode()
+                    self.send_response(503)
+                else:
+                    if mode == "slow":
+                        time.sleep(1.5)
+                    body = json.dumps({
+                        "id": "x", "object": "chat.completion", "created": 0,
+                        "model": "deepseek-chat",
+                        "choices": [{"index": 0, "finish_reason": "stop",
+                                     "message": {"role": "assistant",
+                                                 "content": json.dumps(
+                                                     FakeUpstream.ANSWER,
+                                                     ensure_ascii=False)}}],
+                    }).encode()
+                    self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass                                # 别把请求日志刷到测试输出里
+
+        class QuietUpstreamServer(http.server.ThreadingHTTPServer):
+            def handle_error(self, request, client_address):
+                pass                     # 客户端被 deadline 杀掉时连接会被重置，那是正常现象
+
+        self.server = QuietUpstreamServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    @property
+    def base_url(self):
+        return "http://127.0.0.1:%d/v1" % self.server.server_address[1]
+
+    def stop(self):
+        self.finished.set()                # 先让装死/举着的线程收手，再关服务
+        self.release.set()
+        self.server.shutdown()
+        self.server.server_close()
+
+
+# 【给模型子进程留出启动时间的超时值】
+#
+# 客户端每问一次都会【新起一个子进程】（Python 解释器 + import openai）。
+# 这台机器上实测：光 import openai 就要 1.7～2.0 秒，加上解释器启动总共约 2.1 秒
+# （空启动只要 0.14 秒，所以慢的就是那个 import）；端到端一次提问大约 1.9～3.2 秒。
+#
+# 结论：任何「小于冷启动时间」的 deadline，都会在子进程还没连上上游时把它杀掉。
+# 那时候上游收到的请求数是 0，测试会报「0 != 1」——但它证明的不是「超时处理有问题」，
+# 而是「这次的超时设得比启动还短」。所以凡是需要上游【真的收到】请求的用例，
+# 都留足余量，而不是原来那个 2 秒。
+#
+# 这个值本身是「装死用例」的 deadline：测试要等满它，所以不能随便往大里写。
+# 10 秒 ≈ 正常一次提问的 3～5 倍，机器偶尔忙一下也还站得住；
+# 万一真的没连上，用例会明确报「上游一次请求都没收到」，不会含混成 0 != 1。
+HUNG_UPSTREAM_TIMEOUT_SECONDS = 10
+
+# 【真上游那一组的兜底超时】不是被测对象，够宽就行：它只决定「真出错时多久放弃」。
+# 正常一次提问约 1.9～3.2 秒，给 20 秒是为了不让机器偶尔一忙就误报成服务故障。
+REAL_UPSTREAM_TIMEOUT_SECONDS = 20
+
+
+class TestWaitingStateRecoveryAndRetry(ChatTestCase):
+
+    def page(self, client=None):
+        client = client or tutor.app.test_client()
+        return client.get("/").get_data(as_text=True)
+
+    @staticmethod
+    def body_tag(html):
+        start = html.index("<body")
+        return html[start:html.index(">", start)]
+
+    def use_fake_upstream(self, mode, timeout=10):
+        """把 app 的客户端换成真的 BoundedModelClient，指向本机假上游。"""
+        upstream = FakeUpstream(mode)
+        self.addCleanup(upstream.stop)
+        tutor.client = model_client.BoundedModelClient(
+            api_key="test-key-not-a-real-key", base_url=upstream.base_url,
+            timeout=timeout)
+        return upstream
+
+    def ask_with_attempt(self, client, question, attempt):
+        """像页面那样提问：问题 + 这次尝试的身份牌。"""
+        return client.post("/", data={"question": question, "attempt": attempt})
+
+    def run_in_node(self, script):
+        """把一小段 JS 交给 node 跑（本机没有 node 就跳过这一条）。"""
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("本机没有 node，跳过判定表")
+        return subprocess.run([node, "-e", script], capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", timeout=60)
+
+    def recovery_logic(self):
+        """把页面里那段【纯函数】原样抠出来 —— 测的就是它在浏览器里跑的那一份。"""
+        html = self.page()
+        found = re.search(r"// recovery-logic:start(.*?)// recovery-logic:end", html, re.S)
+        self.assertIsNotNone(found, "找不到 recovery-logic 标记，判定表没法测")
+        return found.group(1)
+
+    # ---------- A. 页面把「服务端事实」交给客户端 ----------
+
+    def test_the_page_carries_the_server_budget(self):
+        """页面上那个等待上限必须来自服务端配置，不能在脚本里另写一个数字。"""
+        html = self.page()
+        body = self.body_tag(html)
+        self.assertIn('data-model-budget-seconds="%d"'
+                      % tutor.MODEL_REQUEST_TIMEOUT_SECONDS, body)
+        self.assertIn("dataset.modelBudgetSeconds", html)
+        # 没有错误时横幅必须真的藏着（客户端要往它里面写话，所以它得常驻在页面里）
+        self.assertIn('id="error-banner" role="alert" hidden', html)
+
+    def test_the_client_deadline_is_strictly_longer_than_the_server_budget(self):
+        """看门狗必须比服务端的硬超时【晚】动手 —— 否则它会抢在正常回答前面报错。"""
+        body = self.body_tag(self.page())
+        budget = int(re.search(r'data-model-budget-seconds="(\d+)"', body).group(1))
+        margin = int(re.search(r'data-stall-margin-seconds="(\d+)"', body).group(1))
+        self.assertEqual(budget, tutor.MODEL_REQUEST_TIMEOUT_SECONDS)
+        self.assertEqual(margin, tutor.MODEL_STALL_MARGIN_SECONDS)
+        self.assertGreaterEqual(margin, 10, "余量太小，客户端可能先于服务端报错")
+        self.assertIn("STALL_SECONDS", self.page())
+
+    def test_the_user_message_count_is_exposed_for_the_restore_rule(self):
+        """页面靠【条数】判断「刚才那一条记下来没有」，这个数只能由服务端数。
+
+        用条数而不是「最后一条消息的文字」，是因为用户完全可能连着问两次一样的问题：
+        那时文字一样、条数却会多。条数变了才说明库里有新东西。
+        """
+        client = tutor.app.test_client()
+        self.assertIn('data-user-count="0"', self.body_tag(self.page(client)))
+        self.ask(client, "已经问过的问题")
+        self.assertIn('data-user-count="1"', self.body_tag(self.page(client)))
+        self.ask(client, "再问一条")
+        self.assertIn('data-user-count="2"', self.body_tag(self.page(client)))
+        # 换一个浏览器看同一页：别人的问题不该算进来
+        self.assertIn('data-user-count="0"',
+                      self.body_tag(self.page(tutor.app.test_client())))
+
+    def test_the_page_carries_a_data_epoch_that_ordinary_loads_do_not_change(self):
+        """页面要拿到「这份数据（这个浏览器名下这一摊）的代号」。
+
+        【为什么非得由服务端给】它是「那条暂存的问题属于哪一份数据」的凭据 ——
+        要跟「删除」这件事对得上，而删除只在服务端发生，页面自己编一个没有意义。
+        【它换不换，由删除那一组看着】这里只管两件事：页面确实拿到了；
+        以及【平时刷新和提问都不许换】—— 换了就等于把用户手上那条还没答完的问题白白作废。
+        """
+        client = tutor.app.test_client()
+        first = self.epoch_in(self.body_tag(self.page(client)))
+        self.assertRegex(first, r"^[0-9a-f]{32}$", "代号该是 32 位十六进制")
+
+        self.assertEqual(self.epoch_in(self.body_tag(self.page(client))), first,
+                         "普通刷新不该换代号")
+        self.ask(client, "随便问一句")
+        self.assertEqual(self.epoch_in(self.body_tag(self.page(client))), first,
+                         "提问也不该换代号")
+        # 【不同的浏览器各是各的】它属于这个浏览器，不是全站共用的一个数
+        self.assertNotEqual(self.epoch_in(self.body_tag(self.page(tutor.app.test_client()))),
+                            first)
+
+    @staticmethod
+    def epoch_in(body_tag):
+        """从 <body ...> 那段里把数据代号抠出来。"""
+        found = re.search(r'data-data-epoch="([^"]*)"', body_tag)
+        if found is None:
+            raise AssertionError("首页没有下发数据代号：" + body_tag)
+        return found.group(1)
+
+    # ---------- B. 收回等待状态：只动界面，绝不重发 ----------
+
+    def test_the_inline_script_parses(self):
+        """【防打错】页面里那段内联脚本必须能通过语法检查。
+
+        下面的断言都是按文本匹配的：万一我把某一行写坏了（少个括号），
+        文本断言照样能过，但真实浏览器里整段脚本都不会执行 —— 那才是最难查的一种坏。
+        这里用 node 只做语法解析（不执行），本机没有 node 就跳过。
+        """
+        node = shutil.which("node")
+        if node is None:
+            self.skipTest("本机没有 node，跳过语法检查")
+        html = self.page()
+        blocks = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", html, re.S)
+        self.assertEqual(len(blocks), 1, "内联脚本块不止一个，这里只检查唯一的那段")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "inline.js")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(blocks[0])
+            proc = subprocess.run([node, "--check", path], capture_output=True,
+                                  text=True, encoding="utf-8", errors="replace",
+                                  timeout=30)
+        self.assertEqual(proc.returncode, 0, "内联脚本有语法错误：\n" + (proc.stderr or ""))
+
+    def test_the_release_function_puts_the_composer_back(self):
+        html = self.page()
+        block = html[html.index("function releaseComposer"):]
+        block = block[:block.index("\n    }")]
+        for expected in ("input.readOnly = false", "classList.remove('waiting')",
+                         "button.disabled = false", "button.innerHTML = buttonLabel",
+                         "sending = false"):
+            self.assertIn(expected, block, "收回等待状态时漏了：" + expected)
+
+    def test_nothing_in_the_page_resends_or_reloads_on_its_own(self):
+        """【红线】客户端超时只恢复界面：不重发、不刷新。
+
+        客户端能不能「中止」那次 POST？不能 —— 表单导航一旦发出去，
+        浏览器这边没有中止的口子。所以这里【不许】出现任何自动重发的写法。
+        """
+        html = self.page()
+        for forbidden in ("fetch(", "XMLHttpRequest", "form.submit(",
+                          "location.reload(", "location.href ="):
+            self.assertNotIn(forbidden, html, "页面不该自己重发或重载：" + forbidden)
+
+    def test_the_watchdog_only_lifts_the_waiting_state(self):
+        html = self.page()
+        block = html[html.index("watchdog = window.setTimeout"):]
+        block = block[:block.index("}, STALL_SECONDS * 1000);")]
+        self.assertIn("releaseComposer()", block)
+        self.assertIn("notice(", block)
+        self.assertNotIn("submit", block, "看门狗里不该有任何提交动作")
+
+    def test_the_watchdog_notice_does_not_tell_the_user_to_just_resend(self):
+        """【这一轮要改的正是这句话】看门狗只能把「结果未知」说清楚，
+        并且给一个【手动】刷新入口；不能把「再发一次」当成建议递给用户 ——
+        第一次可能早就答完了、只是响应丢了，重发就是第二次调用。"""
+        html = self.page()
+        block = html[html.index("watchdog = window.setTimeout"):]
+        block = block[:block.index("}, STALL_SECONDS * 1000);")]
+        self.assertIn("结果未知", block)
+        self.assertIn("不会自动重发", block)
+        for forbidden in ("再点「发送」", "重新发送", "可以直接重发"):
+            self.assertNotIn(forbidden, block, "看门狗不该建议用户直接重发：" + forbidden)
+        # 手动刷新入口：一个普通链接，点不点由用户决定
+        self.assertIn('<a class="error-action" id="error-action" href="/"', html)
+        self.assertIn("notice(", block)
+        self.assertIn(", true)", block, "看门狗这条提示要把「刷新看看结果」露出来")
+
+    def test_the_form_carries_an_attempt_token(self):
+        """每次发送都要带一个身份牌，服务端才认得出「这是同一次尝试的重发」。"""
+        html = self.page()
+        self.assertIn('name="attempt" id="attempt-input"', html)
+        self.assertIn("document.getElementById('attempt-input').value = attempt.token",
+                      html)
+
+    def test_a_second_submit_while_waiting_is_still_swallowed(self):
+        """重复点击保护还在：等待期间再点，事件被拦下、不再发一次。"""
+        html = self.page()
+        block = html[html.index("form.addEventListener('submit'"):]
+        block = block[:block.index("if (sending) {") + 200]
+        self.assertIn("if (sending) {", block)
+        self.assertIn("event.preventDefault();", block)
+
+    # ---------- C. 两条判断规则（用 node 跑页面里同一段函数） ----------
+
+    def test_the_restore_rule_table(self):
+        """刷新后「放回输入框 / 认定答过了 / 丢掉」的判定表。
+
+        【为什么用条数而不是文字】看第 4 条：连着问两次一模一样的问题时，
+        文字一样、条数却多了一条 —— 只看文字会把「答完了」认成「没答」，或者反过来。
+        【为什么清空数据是单独一列】看最后两条：那种情况下条数根本看不出来
+        （基准是发出去时的 0，删完还是 0），只能靠服务端那个一次性信号判死。
+        """
+        script = self.recovery_logic() + """
+const cases = [
+  // 服务端回显, pending, 条数, 刚清空过, 现在还绑着吗, 期望 restore, 期望 clear, 期望 answered
+  ['', null, 0, false, false, null, false, false],                 // 什么都没记着
+  ['', {q:'还没答完的问题', before:0}, 0, false, false, '还没答完的问题', false, false], // 没被记下来 → 放回输入框
+  ['', {q:'已答完的问题', before:0}, 2, false, false, null, true, true],  // 记下来了 → 认定答过了
+  ['', {q:'同样的话', before:2}, 3, false, false, null, true, true],      // 连着问两次同样的话：条数 2→3
+  ['', {q:'同样的话', before:2}, 2, false, false, '同样的话', false, false], // 条数没动 → 还是没答完
+  ['服务端回显了', {q:'还没答完的问题', before:0}, 0, false, false, null, false, false], // 已回显 → 不重复写
+  ['', {q:'   ', before:0}, 0, false, false, null, false, false],   // 空白不算一条问题
+  ['', {q:'刚被清掉的问题', before:0}, 0, true, false, null, true, false],  // 刚清空过 → 丢掉，绝不放回
+  ['服务端回显了', {q:'刚被清掉的问题', before:0}, 0, true, false, null, true, false], // 同上，回显也不留
+  ['', null, 0, true, false, null, true, false],                    // 刚清空过、本来就没记着 → 清干净
+  // 没有那个一次性信号时：靠「历史变短了」认出来（别的标签页删的，信号被它用掉了）
+  ['', {q:'别的标签页删掉的', before:3}, 0, false, false, null, true, false],
+  ['', {q:'别的标签页删掉的', before:3}, 2, false, false, null, true, false],
+  ['', {q:'别的标签页删掉的', before:3}, 3, false, false, '别的标签页删掉的', false, false],
+  // 条数看不出来的那一种（暂存时基准就是 0）：靠「原先绑着、现在不绑了」认出来
+  ['', {q:'解绑前问出去的', before:0, bound:true}, 0, false, false, null, true, false],
+  ['', {q:'解绑前问出去的', before:0, bound:true}, 0, false, true, '解绑前问出去的', false, false],
+  ['', {q:'匿名时问的', before:0, bound:false}, 0, false, false, '匿名时问的', false, false], // 本来就没绑过
+];
+let bad = 0;
+for (const [echo, pending, count, wiped, bound, wantRestore, wantClear, wantAnswered] of cases) {
+  const got = planPendingRestore(echo, pending, count, wiped, bound);
+  if (got.restore !== wantRestore || got.clear !== wantClear || got.answered !== wantAnswered) {
+    bad++; console.log('FAIL', JSON.stringify([echo, pending, count, wiped, bound]), JSON.stringify(got));
+  }
+}
+console.log(bad === 0 ? 'TABLE_OK' : 'TABLE_BAD');
+"""
+        proc = self.run_in_node(script)
+        self.assertIn("TABLE_OK", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_the_attempt_rule_table(self):
+        """「这次发送是不是上一次的重发」的判定表 —— 重发必须沿用同一个身份牌。"""
+        script = self.recovery_logic() + """
+const cases = [
+  // pending, 这次打的字, 新 id, 条数, 现在绑着吗, 期望 token, 期望 before, 期望 reuse, 期望 bound
+  [null, 'A', 'new1', 0, false, 'new1', 0, false, false],          // 第一次发：新牌子，记下当前条数
+  [{q:'A', token:'t1', before:0, bound:true}, 'A', 'new2', 1, false, 't1', 0, true, true],
+  [{q:'A', token:'t1', before:0}, '  A  ', 'new2', 1, false, 't1', 0, true, false], // 两端空白不算差别
+  [{q:'A', token:'t1', before:0}, 'B', 'new2', 1, true, 'new2', 1, false, true],    // 改字 → 全新一次
+  [{q:'   ', token:'t1', before:0}, 'A', 'new3', 2, true, 'new3', 2, false, true],  // 没记着有效的一条
+];
+let bad = 0;
+for (const [pending, typed, fresh, count, bound, wantToken, wantBefore, wantReuse, wantBound] of cases) {
+  const got = planAttempt(pending, typed, fresh, count, bound);
+  if (got.token !== wantToken || got.before !== wantBefore || got.reuse !== wantReuse
+      || got.bound !== wantBound) {
+    bad++; console.log('FAIL', JSON.stringify([pending, typed, fresh, count, bound]), JSON.stringify(got));
+  }
+}
+console.log(bad === 0 ? 'TABLE_OK' : 'TABLE_BAD');
+"""
+        proc = self.run_in_node(script)
+        self.assertIn("TABLE_OK", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_the_epoch_stamp_rule_table(self):
+        """发送时该往那条记录里盖哪个「数据代号」。
+
+        【为什么要盖】盖的是【发出去那一刻】这份数据的代号。以后刷新时一比，
+        对不上就说明这条记录指的是已经被删掉的那份数据（见下面那张表）。
+        【为什么重发不重盖】重发还是同一次尝试，它指的还是原来那份数据 ——
+        顺手盖成这一页的代号，就等于用一次重发把「中间被清空过」这件事抹掉了。
+        """
+        script = self.recovery_logic() + """
+const cases = [
+  // pending, 这次打的字, 新 id, 条数, 现在绑着吗, 这一页的代号, 期望 epoch, 期望 reuse
+  [null, 'A', 'new1', 0, false, 'E1', 'E1', false],                             // 第一次发：盖这一页的代号
+  [null, 'A', 'new1', 0, false, undefined, '', false],                          // 拿不到代号（老服务端）→ 空串
+  [{q:'A', token:'t1', before:0, epoch:'E1'}, 'A', 'new2', 1, false, 'E1', 'E1', true],
+  [{q:'A', token:'t1', before:0, epoch:'E1'}, 'A', 'new2', 1, false, 'E9', 'E1', true],  // 重发不重盖
+  [{q:'A', token:'t1', before:0}, 'A', 'new2', 1, false, 'E9', 'E9', true],          // 老记录没盖过 → 补上这一页的
+  [{q:'A', token:'t1', before:0, epoch:'E1'}, 'B', 'new3', 1, false, 'E9', 'E9', false], // 改了字 → 全新一次，盖新的
+];
+let bad = 0;
+for (const [pending, typed, fresh, count, bound, page, wantEpoch, wantReuse] of cases) {
+  const got = planAttempt(pending, typed, fresh, count, bound, page);
+  if (got.epoch !== wantEpoch || got.reuse !== wantReuse) {
+    bad++; console.log('FAIL', JSON.stringify([pending, typed, page]), JSON.stringify(got));
+  }
+}
+console.log(bad === 0 ? 'TABLE_OK' : 'TABLE_BAD');
+"""
+        proc = self.run_in_node(script)
+        self.assertIn("TABLE_OK", proc.stdout, proc.stdout + proc.stderr)
+
+    def test_the_data_epoch_rule_table(self):
+        """「数据代号对不上」这条规则单独过一遍判定表。
+
+        【它要挡住的是哪条路】用户在这个标签页问了一句（那条记录盖着代号 E1），
+        然后在【别的标签页】里把数据全删了 ——
+          · 删除会换掉代号（E1 → E2），而代号在 cookie 里，两个标签页共用一份；
+          · 那个一次性的「刚清空过」信号被删数据那个标签页用掉了；
+          · 用户随后又拿一张新码【重新绑回来】，于是「绑定没了」这条线索也补了回去；
+          · 这时候旧标签页才刷新 —— 条数是 0、当初的基准也是 0，看不出任何变化。
+        上面每一条都绕开了老线索，只有代号对不上还认得出：这条问题指的是已经被删掉的那份数据。
+        """
+        script = self.recovery_logic() + """
+const cases = [
+  // 服务端回显, pending, 条数, 刚清空过, 还绑着吗, 服务端当前的代号, 期望 restore, clear, answered
+  // —— 代号一样：照旧（这是绝大多数刷新）
+  ['', {q:'问出去的问题', before:0, epoch:'E1'}, 0, false, true, 'E1', '问出去的问题', false, false],
+  // —— 对不上：丢掉。条数一样、绑定还在，老线索全都说不出话
+  ['', {q:'删掉之前问出去的', before:0, epoch:'E1'}, 0, false, true, 'E2', null, true, false],
+  // —— 对不上，而且条数还「变多了」（删完又问了新的）：也不能说「已经答完了」，
+  //     那份回答根本不在，说了就是撒谎
+  ['', {q:'删掉之前问出去的', before:0, epoch:'E1'}, 3, false, true, 'E2', null, true, false],
+  // —— 对不上，而且条数会「变短」（老线索本来也认得出）：还是丢掉，且不解释
+  ['', {q:'删掉之前问出去的', before:3, epoch:'E1'}, 0, false, true, 'E2', null, true, false],
+  // —— 对不上，人还是匿名的（没绑过）：照样丢掉
+  ['', {q:'删掉之前问出去的', before:0, epoch:'E1'}, 0, false, false, 'E2', null, true, false],
+  // —— 两个信号同时到：丢掉（和只给一次性信号时同一个结果）
+  ['', {q:'删掉之前问出去的', before:0, epoch:'E1'}, 0, true, true, 'E2', null, true, false],
+  // —— 服务端这次回显了这条问题（出错分支），但代号对不上：照样丢掉。
+  //     丢掉的只是那个身份牌照；它的回答已经没了，服务端那边也不会再把它当成「答过了」
+  ['服务端回显了', {q:'删掉之前问出去的', before:0, epoch:'E1'}, 0, false, true, 'E2', null, true, false],
+  // —— 两头都得有值才比：老记录没盖过代号 → 退回老线索
+  ['', {q:'问出去的问题', before:0}, 0, false, true, 'E2', '问出去的问题', false, false],
+  // —— 这一页给不出代号（老服务端 / 会话确认不了的那一页）→ 退回老线索，不拿「空 vs 有」当证据
+  ['', {q:'问出去的问题', before:0, epoch:'E1'}, 0, false, true, '', '问出去的问题', false, false],
+];
+let bad = 0;
+for (const [echo, pending, count, wiped, bound, live, wantRestore, wantClear, wantAnswered] of cases) {
+  const got = planPendingRestore(echo, pending, count, wiped, bound, live);
+  if (got.restore !== wantRestore || got.clear !== wantClear || got.answered !== wantAnswered) {
+    bad++; console.log('FAIL', JSON.stringify([echo, pending, count, wiped, bound, live]), JSON.stringify(got));
+  }
+}
+console.log(bad === 0 ? 'TABLE_OK' : 'TABLE_BAD');
+"""
+        proc = self.run_in_node(script)
+        self.assertIn("TABLE_OK", proc.stdout, proc.stdout + proc.stderr)
+
+    # ---------- D. 真实链路：本机假上游（不联网、不用真密钥） ----------
+
+    def test_a_fake_upstream_answer_still_goes_through(self):
+        """先证明这套假上游能跑通正常路径，否则下面的失败场景可能只是假上游坏了。"""
+        self.use_fake_upstream("ok", timeout=REAL_UPSTREAM_TIMEOUT_SECONDS)
+        resp = self.ask(tutor.app.test_client(), "假上游正常问题")
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(len(self.all_rows()), 2)
+
+    def test_a_slow_but_alive_upstream_still_answers(self):
+        self.use_fake_upstream("slow", timeout=REAL_UPSTREAM_TIMEOUT_SECONDS)
+        self.assertEqual(self.ask(tutor.app.test_client(), "假上游慢问题").status_code, 302)
+
+    def test_a_hung_upstream_becomes_a_retryable_503_page(self):
+        """上游一直不吭声 → 客户端的 deadline 到点 → 一个可以重试的 503 页面。
+
+        【这个超时值为什么不能小】见 HUNG_UPSTREAM_TIMEOUT_SECONDS 上面那段：
+        子进程冷启动约 2 秒。给 2 秒的话，子进程常常还没连上就被杀掉，
+        上游一次请求都收不到 —— 那时断言会红在「0 != 1」上，而真正的原因在别处。
+        """
+        upstream = self.use_fake_upstream("hang", timeout=HUNG_UPSTREAM_TIMEOUT_SECONDS)
+        before = self.all_rows()
+        resp = self.ask(tutor.app.test_client(), "会超时的问题")
+        html = resp.get_data(as_text=True)
+
+        # 【先确认这一次真的测到了「超时」】上游收到过请求，才谈得上「超时把它放弃」
+        self.assertTrue(
+            upstream.arrived.is_set(),
+            "假上游一次请求都没收到：模型子进程还没连上就被 %d 秒的 deadline 杀掉了。"
+            "这台机器上 worker 冷启动（Python + import openai）实测约 2 秒，"
+            "deadline 必须明显大于它，否则测的是启动速度，不是超时处理。"
+            % HUNG_UPSTREAM_TIMEOUT_SECONDS)
+        self.assertEqual(upstream.requests, 1, "只该打上游一次")
+
+        self.assertEqual(resp.status_code, 503)
+        self.assertIn(tutor.MODEL_UNAVAILABLE_MESSAGE, html)      # 说清了「约半分钟后再试」
+        self.assertIn('value="会超时的问题"', html)                # 文字没丢
+        self.assertIn('data-model-budget-seconds="%d"'
+                      % tutor.MODEL_REQUEST_TIMEOUT_SECONDS, html)
+        self.assertEqual(self.all_rows(), before)                  # 历史没被写脏
+        self.assertFalse(tutor._lock.locked())                     # 锁回来了
+        self.assertGreater(tutor._model_retry_after, time.monotonic())   # 冷却开了
+        # 出错页的横幅必须露出来（没有 hidden），文案就是服务端给的那一句
+        self.assertIn('id="error-banner" role="alert">', html)
+
+    def test_an_upstream_503_becomes_the_same_retryable_page(self):
+        upstream = self.use_fake_upstream("status503", timeout=REAL_UPSTREAM_TIMEOUT_SECONDS)
+        resp = self.ask(tutor.app.test_client(), "上游 503 的问题")
+        html = resp.get_data(as_text=True)
+        self.assertEqual(resp.status_code, 503)
+        self.assertIn(tutor.MODEL_UNAVAILABLE_MESSAGE, html)
+        self.assertIn('value="上游 503 的问题"', html)
+        self.assertEqual(upstream.requests, 1)
+
+    def test_the_cooldown_blocks_a_second_question_without_touching_the_upstream(self):
+        upstream = self.use_fake_upstream("status503", timeout=REAL_UPSTREAM_TIMEOUT_SECONDS)
+        self.ask(tutor.app.test_client(), "第一次")
+        before = upstream.requests
+        second = self.ask(tutor.app.test_client(), "冷却期内的问题")
+        self.assertEqual(second.status_code, 503)
+        self.assertIn(tutor.MODEL_UNAVAILABLE_MESSAGE, second.get_data(as_text=True))
+        self.assertEqual(upstream.requests, before, "冷却期内不该再打上游")
+        self.assertEqual(self.used_today(), 1, "冷却期内不该再扣额度")
+
+    def used_today(self):
+        """今天已经扣过几次额度 —— 就是「到底问过模型几次」的权威口径。"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute("SELECT used FROM api_usage WHERE day = ?",
+                               (tutor._utc_day(),)).fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
+    def test_a_double_submit_is_blocked_and_keeps_the_text(self):
+        """第一台还卡在半路时，第二台再点发送：被锁挡下，而且【没有多花一次模型调用】。
+
+        【为什么这里用 gate 而不是 hang】这一条本来靠「假上游装死 + 客户端超时」来
+        制造并发，但那要拿秒数当节拍器：子进程冷启动约 2 秒，超时也是 2 秒，
+        谁先谁后全看机器忙不忙 —— 测试会红，红得还不是被测的东西。
+        改成 gate 之后：上游收下请求后【等测试放行】，第一个请求确定性地卡住，
+        第二个请求一定撞上锁。不依赖任何秒数。
+        """
+        upstream = self.use_fake_upstream("gate", timeout=30)
+        results = []
+        first = tutor.app.test_client()
+        thread = threading.Thread(target=lambda: results.append(
+            self.ask(first, "第一台设备的问题")))
+        thread.start()
+        try:
+            self.assertTrue(upstream.arrived.wait(15), "第一个请求没有到达上游")
+            second = self.ask(tutor.app.test_client(), "第二台设备的问题")
+            html = second.get_data(as_text=True)
+            self.assertIn(tutor.LOCKED_MESSAGE, html)
+            self.assertIn('value="第二台设备的问题"', html)       # 第二台也没丢字
+        finally:
+            upstream.release.set()                                # 放第一个请求走完
+            thread.join(30)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(results[0].status_code, 302)             # 第一个正常答完了
+        # 【用额度口径证明「只问过一次」】第二个请求在拿到锁之前就被挡下了，
+        # 所以它连额度都不该占 —— 这才是「同一个问题没被问两遍」的权威证据
+        # （比数假上游收到的请求数稳：worker 可能还没连上就被超时杀掉）。
+        self.assertEqual(self.used_today(), 1, "重复点击不该多花一次模型调用")
+        self.assertEqual(upstream.requests, 1)
+        self.assertEqual(len(self.all_rows()), 2)                 # 历史里只有一问一答
+
+    # ---------- E. 「结果未知」：响应丢了、用户又发一次，不能变成两次调用 ----------
+    #
+    # 【这一组要解决的场景】第一次已经答完、答案也写进库了，只是响应在回程丢了。
+    # 这时服务端的锁【早就释放】了，第二次发送畅通无阻 —— 原来的设计挡不住它：
+    # 多花一次额度，历史里多出一对一模一样的问答，用户自己还看不出来。
+    # 现在靠 attempt 令牌挡住：同一个身份牌的第二次，不再调模型，直接把他送回有答案的那一页。
+    #
+    # 【这一组为什么用打桩的模型客户端，而不是本机假上游】
+    # 要证明的是「模型被调用了几次」，而 FakeClient 正好把每一次 create() 都记在 calls 里 ——
+    # 又准又稳。真子进程那一层由上面 D 组和下面浏览器那一组覆盖：
+    # 那几条要证明的是「超时/上游报错长什么样」，本来就得走真链路。
+    # （之前这里用假上游，会跟着「子进程冷启动快不快」一起抖，那不是被测的东西。）
+
+    def test_a_resend_of_the_same_attempt_does_not_call_the_model_twice(self):
+        client = tutor.app.test_client()
+        first = self.ask_with_attempt(client, "会重复的问题", "attempt-aaaaaaaa")
+        self.assertEqual(first.status_code, 302)
+        self.assertEqual(self.used_today(), 1)
+
+        again = self.ask_with_attempt(client, "会重复的问题", "attempt-aaaaaaaa")
+
+        self.assertEqual(again.status_code, 302, "照常把他送回有答案的那一页")
+        self.assertEqual(len(self.fake.calls), 1, "同一次尝试不该再问一次模型")
+        self.assertEqual(self.used_today(), 1, "同一次尝试不该再扣一次额度")
+        self.assertEqual(len(self.all_rows()), 2, "历史里不该多出一对一模一样的问答")
+
+    def test_asking_the_same_text_twice_on_purpose_is_still_two_questions(self):
+        """【连着两次问一模一样的话】是正常的用法，不能被令牌误伤：
+        那是两次不同的尝试，页面会给新的身份牌。"""
+        client = tutor.app.test_client()
+        self.ask_with_attempt(client, "再讲一遍", "attempt-11111111")
+        second = self.ask_with_attempt(client, "再讲一遍", "attempt-22222222")
+        self.assertEqual(second.status_code, 302)
+        self.assertEqual(len(self.fake.calls), 2)
+        self.assertEqual(self.used_today(), 2)
+        self.assertEqual(len(self.all_rows()), 4)
+
+    def test_an_attempt_that_failed_is_not_remembered(self):
+        """失败的那次不能被记住 —— 否则用户就再也问不出这条问题了。
+
+        只有「真的答完并写进库」才值得记。超时/上游报错都没产生回答，
+        用户带着同一个身份牌再试一次，必须照常给他答案。
+        """
+        client = tutor.app.test_client()
+        real_create = self.fake.chat.completions.create
+
+        def failed(*args, **kwargs):
+            raise RuntimeError("假的上游炸了")
+
+        self.fake.chat.completions.create = failed
+        first_try = self.ask_with_attempt(client, "第一次失败的问题", "attempt-bbbbbbbb")
+        self.assertEqual(first_try.status_code, 503)
+        self.assertEqual(self.all_rows(), [])
+        self.assertEqual(self.fake.calls, [], "这一路根本没答出来")
+
+        tutor._model_retry_after = 0.0        # 模拟冷却时间已经过去，无需真的等待
+        self.fake.chat.completions.create = real_create
+        retried = self.ask_with_attempt(client, "第一次失败的问题", "attempt-bbbbbbbb")
+
+        self.assertEqual(retried.status_code, 302)
+        self.assertEqual(len(self.all_rows()), 2)
+        self.assertEqual(len(self.fake.calls), 1, "同一个身份牌重试，必须照常问一次模型")
+
+    def test_a_token_from_another_session_does_not_silence_that_user(self):
+        """身份牌只挡它自己那一次：另一个浏览器拿着同一个 id 来问，照常回答。"""
+        self.ask_with_attempt(tutor.app.test_client(), "甲的问题", "attempt-shared00")
+        other = self.ask_with_attempt(tutor.app.test_client(), "乙的问题", "attempt-shared00")
+        self.assertEqual(other.status_code, 302)
+        self.assertEqual(len(self.fake.calls), 2)
+        self.assertEqual(len(self.all_rows()), 4)
+
+    def test_a_bogus_attempt_id_is_ignored_instead_of_breaking_the_page(self):
+        """页面没跑脚本、或者有人乱塞一个超长字符串时：当作「没带」，一切照旧。"""
+        for bogus in ("x" * 500, "带有中文和空格 的", "<script>", "  ", "", None):
+            self.assertEqual(tutor._read_attempt_id(bogus), "")
+        self.assertEqual(tutor._read_attempt_id("abc-123_XYZ"), "abc-123_XYZ")
+
+        before = dict(tutor._completed_attempts)
+        resp = self.ask_with_attempt(tutor.app.test_client(), "带着怪牌的问题", "x" * 500)
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(len(self.fake.calls), 1, "照常回答，不受影响")
+        self.assertEqual(tutor._completed_attempts, before, "怪值不该被塞进内存")
+
+    def test_the_memory_of_finished_attempts_is_bounded(self):
+        """这份记忆有上限、也会过期 —— 不能变成一个只涨不落的口袋。"""
+        tutor._completed_attempts.clear()
+        limit = tutor.COMPLETED_ATTEMPT_MAX
+        for i in range(limit + 20):
+            question = "问题%05d" % i
+            message_id = tutor.save_exchange("s", question, "回答")
+            tutor._remember_answered_attempt("s", "t%05d" % i, message_id, question)
+        self.assertEqual(len(tutor._completed_attempts), limit, "超上限要先丢最旧的")
+        self.assertFalse(tutor._attempt_already_answered("s", "t00000", "问题00000"))
+        last = limit + 19
+        self.assertTrue(tutor._attempt_already_answered(
+            "s", "t%05d" % last, "问题%05d" % last))
+
+        tutor._completed_attempts.clear()
+        question = "过期测试的问题"
+        message_id = tutor.save_exchange("s", question, "回答")
+        tutor._remember_answered_attempt("s", "old", message_id, question)
+        recorded = tutor._completed_attempts[("s", "old")]
+        tutor._completed_attempts[("s", "old")] = (
+            time.monotonic() - tutor.COMPLETED_ATTEMPT_TTL_SECONDS - 1,
+            recorded[1], recorded[2])
+        self.assertFalse(tutor._attempt_already_answered("s", "old", question), "过期的不算数")
+        self.assertEqual(tutor._completed_attempts, {}, "过期的那条该被顺手清掉")
+
+
+# =====================================================================
+# 清空个人数据 × 尝试身份牌
+#
+# 【为什么单开一组】身份牌是内存里的一句断言：「(这个会话, 这个 id) 问过的问题已经答完了」。
+# 这句话有两个前提，任何一个破掉都会【静默吃掉用户的问题】——不是报错，是假装答过了：
+#
+#   ① 那份回答【还在库里】。清空个人数据会把消息整行删掉，而删除流程碰不到内存里的记录。
+#      删完之后用户再发一次同一条问题，就会被判成「答过了」，直接送回首页 ——
+#      首页上什么都没有，问题就这么没了。（这个会话不会被轮换，所以键还对得上，
+#      见 _ensure_session_id 与 profile_store.clear_all_data 的顺序。）
+#   ② 是【同一条问题】。同一个身份牌配上另一条文字（页面出 bug、或有人手搓请求），
+#      那是新问题，绝不能吞掉。
+#
+# 这两条现在都靠「记下用户消息的主键 + 问题摘要」来保证，见 app.py 的
+# _attempt_already_answered。下面每一条测试都对着其中一个前提。
+# =====================================================================
+
+class TestDeletedDataAndAttemptToken(ChatTestCase):
+
+    def bind(self, code="erase-code-1"):
+        self.make_invite(code)
+        client = tutor.app.test_client()
+        self.enter_invite(client, code)
+        return client
+
+    def delete(self, client, confirm="yes", csrf=None):
+        """提交「清空全部个人数据」表单（和 TestDeleteAllData 里那个同款）。"""
+        if csrf is None:
+            csrf = self.csrf_token(client, "/profile")
+        data = {"csrf_token": csrf}
+        if confirm is not None:
+            data["confirm"] = confirm
+        return client.post("/profile/delete", data=data)
+
+    def ask_with_attempt(self, client, question, attempt):
+        return client.post("/", data={"question": question, "attempt": attempt})
+
+    @staticmethod
+    def body_of(client):
+        html = client.get("/").get_data(as_text=True)
+        start = html.index("<body")
+        return html[start:html.index(">", start)]
+
+    # ---------- 前提①：回答已经被删掉，身份牌就该作废 ----------
+
+    def test_a_token_from_before_the_deletion_cannot_swallow_a_new_question(self):
+        """【核心】删完数据再用同一个身份牌问同一条问题：必须照常得到回答。
+
+        这里刻意走完整条真实路径（真的提问、真的删除、再真的提问），
+        因为要确认的正是「删除之后那个身份牌在内存里还对不对得上」。
+        """
+        client = self.bind()
+        sid = self.session_id_of(client)
+        self.assertEqual(
+            self.ask_with_attempt(client, "删之前问过的问题", "attempt-del000001").status_code, 302)
+        self.assertEqual(len(self.all_rows()), 2)
+        self.assertTrue(tutor._attempt_already_answered(
+            sid, "attempt-del000001", "删之前问过的问题"), "答完了就该认得出来")
+
+        self.assertEqual(self.delete(client).status_code, 302)
+        self.assertEqual(self.all_rows(), [], "数据该被清空了")
+        self.assertIsNone(self.learner_id_of(client), "绑定该没了")
+
+        # 【这一步是整条测试的要害】删除删的是绑定行，不是「作废标记」，
+        # 所以这个浏览器的会话【不会】被轮换 —— 内存里那个 (会话, 身份牌) 键依然对得上。
+        # 也就是说：能救场的只有「那条回答还在不在库里」这一查。
+        self.assertEqual(self.session_id_of(client), sid, "删除不该换掉这个浏览器的会话")
+        self.assertIn((sid, "attempt-del000001"), tutor._completed_attempts,
+                      "身份牌还在内存里（删除流程不该去动它）")
+
+        again = self.ask_with_attempt(client, "删之前问过的问题", "attempt-del000001")
+
+        self.assertEqual(again.status_code, 302)
+        self.assertEqual(len(self.fake.calls), 2, "回答已经不在了，这次必须真的再问一次模型")
+        self.assertEqual(len(self.all_rows()), 2, "新的一问一答该写进去")
+        self.assertIn("删之前问过的问题", [row[2] for row in self.all_rows()])
+
+    def test_the_token_stops_counting_when_the_answer_row_is_gone(self):
+        """直接盯住机制本身：那一行消息没了，身份牌立刻不算数。"""
+        client = tutor.app.test_client()
+        client.get("/")                      # 先走一次首页，这个浏览器才会有会话 ID
+        sid = self.session_id_of(client)
+        question_id = tutor.save_exchange(sid, "会被删掉的问题", "会被删掉的回答")
+        tutor._remember_answered_attempt(sid, "attempt-gone00001", question_id,
+                                         "会被删掉的问题")
+        self.assertTrue(tutor._attempt_already_answered(
+            sid, "attempt-gone00001", "会被删掉的问题"))
+
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
+        finally:
+            conn.close()
+
+        self.assertFalse(tutor._attempt_already_answered(
+            sid, "attempt-gone00001", "会被删掉的问题"), "回答没了就不能再当成答过了")
+        self.assertNotIn((sid, "attempt-gone00001"), tutor._completed_attempts,
+                         "作废的那条该顺手清掉")
+
+    def test_a_broken_check_never_swallows_the_question(self):
+        """查库失败时按「没答过」处理 —— 宁可多问一次模型，也不能吞掉用户的问题。"""
+        client = tutor.app.test_client()
+        client.get("/")                      # 先走一次首页，这个浏览器才会有会话 ID
+        sid = self.session_id_of(client)
+        question_id = tutor.save_exchange(sid, "已有的问题", "已有的回答")
+        tutor._remember_answered_attempt(sid, "attempt-boom00001", question_id, "已有的问题")
+
+        real_connect = tutor._connect
+
+        def boom(*args, **kwargs):
+            raise sqlite3.OperationalError("内部细节-查不动了-7a1c")
+
+        tutor._connect = boom
+        try:
+            self.assertFalse(tutor._attempt_already_answered(
+                sid, "attempt-boom00001", "已有的问题"))
+        finally:
+            tutor._connect = real_connect
+
+    # ---------- 前提②：同一个身份牌配上另一条问题 ----------
+
+    def test_the_same_token_with_a_different_question_is_answered_not_swallowed(self):
+        """【核心】换个问题就是新问题 —— 身份牌一样也不行。"""
+        client = tutor.app.test_client()
+        self.assertEqual(
+            self.ask_with_attempt(client, "第一句", "attempt-mix000001").status_code, 302)
+
+        second = self.ask_with_attempt(client, "第二句（完全不同的内容）", "attempt-mix000001")
+
+        self.assertEqual(second.status_code, 302)
+        self.assertEqual(len(self.fake.calls), 2, "另一条问题必须照常回答")
+        self.assertEqual(len(self.all_rows()), 4)
+        self.assertIn("第二句（完全不同的内容）", [row[2] for row in self.all_rows()])
+
+    def test_the_same_question_with_extra_whitespace_is_still_the_same_attempt(self):
+        """只有两端空白不同时，仍然是同一条问题（页面和服务端都是先 strip 再比）。"""
+        client = tutor.app.test_client()
+        self.assertEqual(
+            self.ask_with_attempt(client, "  前后有空格的问题  ", "attempt-space0001").status_code,
+            302)
+
+        again = self.ask_with_attempt(client, "前后有空格的问题", "attempt-space0001")
+
+        self.assertEqual(again.status_code, 302)
+        self.assertEqual(len(self.fake.calls), 1, "两端空白不算另一条问题")
+        self.assertEqual(len(self.all_rows()), 2)
+
+    # ---------- 删除给页面的一次性信号 ----------
+
+    def test_the_deletion_signal_is_sent_once_and_only_once(self):
+        """删除成功后要告诉下一个页面「刚清空过」；而且只生效一次。"""
+        client = self.bind()
+        self.assertIn('data-just-deleted="false"', self.body_of(client), "平时不该有这个信号")
+
+        self.assertEqual(self.delete(client).status_code, 302)
+
+        self.assertIn('data-just-deleted="true"', self.body_of(client), "删除后那一次要给")
+        self.assertIn('data-just-deleted="false"', self.body_of(client), "再刷一次就没了")
+
+    def test_a_rejected_deletion_does_not_clear_the_pending_question(self):
+        """删除没成功（没勾确认框）→ 不能发那个信号。
+
+        发错了的后果是：用户那条「还没答完」的问题被白白丢掉，
+        而他的数据根本还在。
+        """
+        client = self.bind()
+        self.assertEqual(self.delete(client, confirm=None).status_code, 200)
+        self.assertIn('data-just-deleted="false"', self.body_of(client))
+        self.assertIsNotNone(self.learner_id_of(client), "数据不该被动过")
+
+    def test_the_data_epoch_changes_only_when_the_data_is_really_erased(self):
+        """「这份数据的代号」只在数据真的被删掉时换一个，换过之后就不许再变。
+
+        【为什么这一位这么要紧】它是「暂存的那条问题属于哪一份数据」的凭据（见 index.html）：
+          · 删除没成功却换了 → 用户那条还没答完的问题被白白作废；
+          · 删成功了却不换，或者**重新绑一张码就换回去** → 那句已经被删掉的问题
+            过一会儿又冒回输入框里，而它所指向的回答早就不存在了。
+        上面那个「重新绑回去」不能只看一次性信号和绑定状态 —— 它俩恰恰在
+        「别的标签页删了、重新绑上、旧标签页才刷新」这条路上都被绕开了。
+        """
+        client = self.bind()
+        first = self.epoch_of(client)
+        self.assertRegex(first, r"^[0-9a-f]{32}$", "代号该是 32 位十六进制")
+
+        # ① 删除被挡下的那一次：一个字节都不许动
+        self.assertEqual(self.delete(client, confirm=None).status_code, 200)
+        self.assertIn('data-just-deleted="false"', self.body_of(client))
+        self.assertEqual(self.epoch_of(client), first, "删除没成功，不该换代号")
+
+        # ② 真的删掉了：必须换一个新的
+        self.assertEqual(self.delete(client).status_code, 302)
+        second = self.epoch_of(client)
+        self.assertNotEqual(second, first, "数据被清空了，代号必须换")
+        self.assertEqual(self.epoch_of(client), second, "换过之后要稳定下来，不能每次都换")
+
+        # ③ 【关键的一条】重新拿一张新码绑回来：代号不许被换回去。
+        #    换回去了，「这份数据被清空过」在旧标签页眼里就消失了。
+        self.make_invite("rebind-code")
+        self.enter_invite(client, "rebind-code")
+        self.assertIsNotNone(self.learner_id_of(client), "该重新绑上了")
+        self.assertEqual(self.epoch_of(client), second, "重新绑定不许把代号换回去")
+
+    def epoch_of(self, client):
+        """首页上那个「这份数据的代号」。"""
+        found = re.search(r'data-data-epoch="([^"]*)"', self.body_of(client))
+        self.assertIsNotNone(found, "首页没有下发数据代号")
+        return found.group(1)
+
+    # ---------- 响应乱序：迟到的 Set-Cookie 不许把代号盖回去 ----------
+
+    def test_the_epoch_is_not_carried_in_the_session_cookie(self):
+        """【结构性的一条】代号不在会话 cookie 里 —— 这是它不能被盖回去的原因。
+
+        放进去就等于把「代号是不是旧的」交给浏览器手里那份 cookie 说了算，
+        而 cookie 会被**迟到的响应**整个覆盖（见下一条）。所以这里直接盯住结构：
+        签名过的会话里不许有它。
+        """
+        client = self.bind()
+        self.assertRegex(self.epoch_of(client), r"^[0-9a-f]{32}$")
+
+        with client.session_transaction() as sess:
+            self.assertNotIn("data_epoch", sess,
+                             "代号不该放在会话 cookie 里（会被迟到的响应盖回旧值）")
+
+    def test_a_late_response_from_before_the_deletion_cannot_roll_the_epoch_back(self):
+        """【响应乱序，用户点名的那条】删除之前就发出去、删除之后才回来的那个响应，
+        不能把代号盖回旧值。
+
+        【旧响应能改的只有它自己那份 cookie】所以这里就拿【删除之前的那份 cookie】
+        当迟到的 Set-Cookie 用 —— 那正是它落地时会发生的事（这条测试里就是把它塞回浏览器）。
+
+        路上每一步都是用户那条路：数据被清空（代号换掉）→ 拿新码重新绑上
+        （「绑定没了」这条线索被补回来）→ 然后旧 cookie 才盖回来。
+        这时候绑定是新的、历史是 0 条、一次性信号也用掉了 —— 要是代号被盖回去，
+        四条线索就全都不作声，用户那句已经删掉的问题又会被当成「还没答完」放回输入框。
+        """
+        old = self.bind()
+        self.ask(old, "删除之前问过的话")
+        before = self.epoch_of(old)
+        stale = old.get_cookie("session")                   # 删除之前的那份 cookie（旧响应手里那份）
+        self.assertIsNotNone(stale)
+        sid = self.session_id_of(old)
+
+        self.assertEqual(self.delete(old).status_code, 302)  # 数据被清空
+        rotated = self.epoch_of(old)
+        self.assertNotEqual(rotated, before, "数据被清空了，代号必须换")
+
+        self.make_invite("rebind-after-wipe")                # 用户拿新码重新绑上
+        self.enter_invite(old, "rebind-after-wipe")
+        self.assertIsNotNone(self.learner_id_of(old))
+        self.assertEqual(self.epoch_of(old), rotated, "重新绑定不许把代号换回去")
+
+        # ---- 迟到的那个响应到了：它带来的那份 cookie 被浏览器照单收下 ----
+        late = tutor.app.test_client()
+        late.set_cookie("session", stale.value)
+
+        self.assertEqual(self.session_id_of(late), sid, "迟到的那份 cookie 还是同一个会话")
+        self.assertNotIn("删除之前问过的话", self.body_of(late), "数据确实已经删掉了")
+        self.assertEqual(self.epoch_of(late), rotated,
+                         "迟到的响应把代号盖回旧值了 —— 那句已经删掉的问题会因此复活")
+
+        # 【最后一句是给「下一次刷新」的】cookie 被盖过之后，再打开一次仍然必须是新代号：
+        # 代号只由服务端按会话读出来，浏览器手里那份是什么都改不动它。
+        self.assertEqual(self.epoch_of(late), rotated, "再刷新一次又回退了")
+
+
+# =====================================================================
+# 在【真实浏览器】里跑这个页面
+#
+# 【为什么要单开一组】上面那些断言都是「读页面文本」：文本对不代表脚本在浏览器里
+# 真的跑得起来，更不代表定时器到点后界面真的能被收回来。这一组补的就是这一段。
+#
+# 【怎么做到不装任何东西】只借本机 Chrome 自己的两个开关：
+#   · --dump-dom            跑完把最终 DOM 打到标准输出
+#   · --virtual-time-budget 把计时器快进（本来要等四十几秒的看门狗，这里一秒跑完）
+# 中间放一个转发代理：请求转给真的 Flask（真的会话 cookie、真的临时库），
+# 顺手把页面里那两个 CDN 的 <script> 去掉 —— 测试不出网，也不受 CDN 抖动牵连。
+# 需要时再往页面末尾追加一小段【测试自己的】脚本：替用户点一次发送、把输入框清空，
+# 或者把当前 DOM 的状态塞进 <title>（DOM 里读的是属性值，改过 property 的要这样才读得到）。
+# =====================================================================
+
+BROWSER_CANDIDATES = (
+    r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+    r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+    "/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+)
+
+
+def find_browser():
+    """找本机的 Chrome/Edge；找不到就返回 None（那一组测试会跳过）。"""
+    for path in BROWSER_CANDIDATES:
+        if os.path.exists(path):
+            return path
+    for name in ("chrome", "chromium", "google-chrome", "msedge"):
+        found = shutil.which(name)
+        if found:
+            return found
+    return None
+
+
+# ---------- 测试注入的几段脚本（属于测试，不属于产品） ----------
+
+# 【几个探针共用的一小段】把页面当前状态读出来。
+# DOM 转出来的 HTML 里看不到 property 的改动（比如脚本写进去的 input.value），
+# 所以只能这样读，再塞进 <title> 交回给测试。
+# 抽出来放一处，是因为会话存储那个键名在几个探针里都要写 —— 两边写岔了不会报错，
+# 只会让某一条测试悄悄不再检查任何东西。
+BROWSER_SNAPSHOT_FN = r"""
+function snapshot() {
+  var q = document.getElementById('question-input');
+  var b = document.getElementById('error-banner');
+  var a = document.getElementById('error-action');
+  var t = document.getElementById('error-text');
+  var btn = document.getElementById('send-button');
+  var pending = null;
+  try { pending = window.sessionStorage.getItem('ai-tutor-pending-question-v2'); }
+  catch (e) { pending = 'ERROR'; }
+  return {
+    value: q ? q.value : null, readOnly: q ? q.readOnly : null,
+    button: btn ? btn.textContent : null,
+    bannerHidden: b ? b.hidden : null, banner: t ? t.textContent : '',
+    actionHidden: a ? a.hidden : null, pending: pending
+  };
+}
+"""
+
+BROWSER_PROBE_JS = r"""
+(function () {
+  __SNAPSHOT__
+  var token = '';
+  try { token = newAttemptId(); } catch (e) { token = 'ERR'; }
+  function stage() { try { return STAGE_EXPR; } catch (e) { return 'probe'; } }
+  function full() {
+    var out = snapshot();
+    out.token = token;
+    out.stage = stage();
+    // 页面那段脚本到底有没有跑起来：这几个函数是它声明的，读得到就说明整段都活着
+    out.logic = (typeof planPendingRestore === 'function') && (typeof planAttempt === 'function')
+                && (typeof newAttemptId === 'function') && (typeof releaseComposer === 'function');
+    return out;
+  }
+  function report() {
+    // 两条路都发：一条塞进 <title>（按虚拟时间跑、最后 dump DOM 那种用得上），
+    // 一条用图片探针回传给测试代理（按真实时间跑、要等某个阶段完成那种用得上）。
+    document.title = 'PROBE' + JSON.stringify(full());
+    try {
+      var img = new Image();
+      img.src = '/__report?' + encodeURIComponent(JSON.stringify(full()));
+    } catch (e) { /* 探针发不出去不该影响页面 */ }
+  }
+  report();
+  setTimeout(report, REPORT_AFTER_MS);
+})();
+"""
+
+# 替用户点一次「发送」。只点一次：点完在 sessionStorage 里留个记号，
+# 免得重定向回来之后又被点一次（那样会变成没完没了地提问）。
+BROWSER_SUBMIT_ONCE_JS = r"""
+(function () {
+  var KEY = '__ai_tutor_test_submitted';
+  try {
+    if (window.sessionStorage.getItem(KEY)) return;
+    window.sessionStorage.setItem(KEY, '1');
+  } catch (e) { return; }
+  setTimeout(function () { document.getElementById('ask-form').requestSubmit(); }, 0);
+})();
+"""
+
+# 【把导航按住】只让页面自己的 submit 处理器跑完，请求一个字节都不发出去。
+# 对页面来说，这和「请求发出去了、但永远回不来」是同一件事：界面停在等待状态，
+# 唯一能结束它的是看门狗。
+BROWSER_BLOCK_SUBMIT_JS = r"""
+document.getElementById('ask-form').addEventListener('submit', function (event) {
+  event.preventDefault();
+});
+document.getElementById('question-input').value = '被卡住的问题';
+setTimeout(function () { document.getElementById('ask-form').requestSubmit(); }, 0);
+"""
+
+# 替用户把输入框清干净（连同浏览器会发的那一个 input 事件），然后跳到测试自己的
+# /__probe 页 —— 那一页会把 sessionStorage 里的东西印在标题上。
+BROWSER_CLEAR_THEN_CHECK_JS = r"""
+(function () {
+  var q = document.getElementById('question-input');
+  q.value = '';
+  q.dispatchEvent(new Event('input', { bubbles: true }));
+  window.location.replace('/__probe');
+})();
+"""
+
+# 用户改了草稿（但没发出去），然后刷新页面。只做一次，免得刷新回来又刷新。
+BROWSER_EDIT_DRAFT_THEN_RELOAD_JS = r"""
+(function () {
+  var KEY = '__ai_tutor_test_edited';
+  try {
+    if (window.sessionStorage.getItem(KEY)) return;
+    window.sessionStorage.setItem(KEY, '1');
+  } catch (e) { return; }
+  var q = document.getElementById('question-input');
+  q.value = '我改了一半的新问题';
+  q.dispatchEvent(new Event('input', { bubbles: true }));
+  window.location.reload();
+})();
+"""
+
+# 【真刀真枪那一版】真发一次请求（它会卡在服务端），然后盯着横幅：
+# 一看门狗到点把横幅露出来，就立刻把这个状态回传给测试。
+# 用 <img> 而不是 fetch：这是测试自己的探针，页面那边一个字的网络代码都没有。
+BROWSER_LIVE_PROBE_JS = r"""
+(function () {
+  var KEY = '__ai_tutor_test_submitted';
+  var sent = false;
+  __SNAPSHOT__
+  function send() {
+    if (sent) return;
+    sent = true;
+    var img = new Image();
+    img.src = '/__report?' + encodeURIComponent(JSON.stringify(snapshot()));
+  }
+  try {
+    if (!window.sessionStorage.getItem(KEY)) {
+      window.sessionStorage.setItem(KEY, '1');
+      document.getElementById('question-input').value = '卡在路上的问题';
+      setTimeout(function () { document.getElementById('ask-form').requestSubmit(); }, 0);
+    }
+  } catch (e) { /* 无痕模式之类，忽略 */ }
+  setInterval(function () {
+    var banner = document.getElementById('error-banner');
+    if (banner && !banner.hidden) send();
+  }, 200);
+})();
+"""
+
+# 【用户原话里那个场景，端到端跑一遍】
+#   第一次发送 → 服务端答完了、写进库了，但响应被代理吃掉（对他就是「响应丢了」）
+#   → 看门狗到点 → 他再按一次发送 → 页面沿用同一个身份牌 → 服务端认出是同一次尝试。
+# 注入的脚本负责这两次「按发送」和把结果回传（页面那边一个字的网络代码都没有）。
+BROWSER_LIVE_RESEND_JS = r"""
+(function () {
+  var KEY = '__ai_tutor_test_resend';
+  var resending = false;
+  __SNAPSHOT__
+  function report(stage) {
+    var img = new Image();
+    img.src = '/__report?' + encodeURIComponent(JSON.stringify(
+      Object.assign(snapshot(), { stage: stage })));
+  }
+  try {
+    if (!window.sessionStorage.getItem(KEY)) {
+      window.sessionStorage.setItem(KEY, '1');
+      document.getElementById('question-input').value = '会重复的问题';
+      setTimeout(function () { document.getElementById('ask-form').requestSubmit(); }, 0);
+    }
+  } catch (e) { /* 忽略 */ }
+  var timer = setInterval(function () {
+    var banner = document.getElementById('error-banner');
+    if (!banner || banner.hidden || resending) return;
+    resending = true;
+    clearInterval(timer);
+    report('stalled');                       // 看门狗到点了：结果未知
+    setTimeout(function () {
+      document.getElementById('ask-form').requestSubmit();   // 用户又按了一次发送
+      setTimeout(function () { report('resent'); }, 2500);
+    }, 200);
+  }, 200);
+})();
+"""
+
+# 【真的删一遍】注入的脚本按顺序做四件事，每一步都是真表单、真跳转（不是 fetch）：
+#   ① 首页 → 邀请码页；② 填码并提交（绑定）；③ 回到首页 → 档案页；
+#   ④ 在档案页勾上复选框、提交「清空全部个人数据」。
+# （③ 之所以要绕一下：绑定成功后应用按 PRG 把浏览器送回首页，不是档案页。）
+# 删除成功后应用会重定向回首页，而首页这一次带着「刚清空过」的一次性信号 ——
+# 那条待确认的问题必须就此消失，不能再冒回输入框里。
+BROWSER_DELETE_FLOW_JS = r"""
+(function () {
+  var STEP_KEY = '__ai_tutor_test_step';
+  var CODE = '__INVITE_CODE__';
+  function step() {
+    try { return window.sessionStorage.getItem(STEP_KEY) || 'start'; }
+    catch (e) { return 'start'; }
+  }
+  function setStep(value) {
+    try { window.sessionStorage.setItem(STEP_KEY, value); } catch (e) {}
+  }
+  function wipeForm() {
+    return document.querySelector('form[action="/profile/delete"]');
+  }
+  function submitWipe() {
+    var wipe = wipeForm();
+    var confirmBox = wipe && wipe.querySelector('input[name="confirm"]');
+    if (!wipe || !confirmBox) return false;
+    confirmBox.checked = true;            // 没勾上的复选框根本不会被提交
+    setStep('done');
+    wipe.submit();
+    return true;
+  }
+  var current = step();
+  if (current === 'start') {
+    setStep('invite');
+    window.location.replace('/invite');
+  } else if (current === 'invite') {
+    var invite = document.querySelector('form[action="/invite"]');
+    var field = invite && invite.querySelector('input[name="invite_code"]');
+    if (!invite || !field) return;
+    field.value = CODE;
+    setStep('goto-profile');
+    invite.submit();
+  } else if (current === 'goto-profile') {
+    // 绑好之后落在首页：这里没得删，去档案页
+    if (!submitWipe()) {
+      setStep('profile');
+      window.location.replace('/profile');
+    }
+  } else if (current === 'profile') {
+    submitWipe();
+  }
+})();
+"""
+
+# 【用户点名的那条路，端到端跑一遍】顺序一步不少：
+#   ① 旧标签页真的发一条问题出去（响应被代理吃掉 —— 对他就是「结果未知」）。
+#      这一发，页面自己就把那条「待确认的问题」写进 sessionStorage，带着它当时看到的数据代号；
+#   ② 另一个标签页去：输码绑定 → 档案页 → 清空全部个人数据 → 再拿【第二张】码重新绑回来。
+#      删数据那一步会把数据代号换掉，同时把「刚清空过」那个一次性信号用掉（跳回首页的那一页读走了它）；
+#   ③ 旧标签页这时才刷新。
+#
+# 【为什么非要开第二个标签页】cookie 是两个标签页共用一份（数据代号就在 cookie 里），
+# sessionStorage 却各是各的（那条待确认的问题在 sessionStorage 里）。只有真的开两个，
+# 「一个标签页删、另一个标签页过一会儿才刷新」才成立 —— 那也正是这条路走不通的地方。
+# 【两个标签页怎么对齐】localStorage 同源共用：另一个标签页走完写一个记号，旧标签页等它。
+# 这是【测试自己的约定】，产品代码里一个字节都没有。
+BROWSER_CROSS_TAB_DELETE_JS = r"""
+(function () {
+  var ROLE = '__ai_tutor_test_role';     // 这个【标签页】扮谁（sessionStorage：各是各的）
+  var HANDOFF = '__ai_tutor_test_handoff';       // 「下一个新开的标签页去删数据」（localStorage：共用）
+  var PHASE = '__ai_tutor_test_phase';   // 旧标签页走到哪一步了（它自己的标签页里）
+  var FLOW = '__ai_tutor_test_flow';     // 另一个标签页走到哪一步了（它自己的标签页里）
+  var DONE = '__ai_tutor_test_done';     // 另一个标签页：整个流程走完了（这个要共用）
+  var FIRST = '__INVITE_FIRST__';
+  var SECOND = '__INVITE_SECOND__';
+  __SNAPSHOT__
+
+  // 【角色必须按标签页分】可是 window.open 开出来的标签页并不干净：
+  // 浏览器会把【开它的那个标签页】的 sessionStorage 复制一份过去（同源下如此），
+  // 所以「sessionStorage 里没有角色 = 我是新来的」这个判断不成立 —— 复制过来的那份里就有。
+  // 于是改成交接：旧标签页开新标签页之前，先往共享的 localStorage 里放一个记号；
+  // 谁看到这个记号谁就是「去删数据的那一个」，看到就用掉（只够一个标签页用）。
+  function role() {
+    try {
+      if (window.localStorage.getItem(HANDOFF) === '1') {
+        window.localStorage.removeItem(HANDOFF);
+        window.sessionStorage.setItem(ROLE, 'flow-tab');
+        return 'flow-tab';
+      }
+      var mine = window.sessionStorage.getItem(ROLE);
+      if (!mine) { mine = 'old-tab'; window.sessionStorage.setItem(ROLE, mine); }
+      return mine;
+    } catch (e) { return 'old-tab'; }
+  }
+  function store(key, value) {
+    try {
+      if (value === undefined) return window.localStorage.getItem(key);
+      window.localStorage.setItem(key, value);
+      return value;
+    } catch (e) { return null; }
+  }
+  function mine(key, value) {
+    try {
+      if (value === undefined) return window.sessionStorage.getItem(key);
+      window.sessionStorage.setItem(key, value);
+      return value;
+    } catch (e) { return null; }
+  }
+  function facts(stage) {
+    var out = snapshot();
+    out.stage = stage;
+    out.epoch = document.body.dataset ? (document.body.dataset.dataEpoch || null) : null;
+    out.bound = document.body.dataset ? (document.body.dataset.learnerBound || null) : null;
+    out.count = document.body.dataset ? (document.body.dataset.userCount || null) : null;
+    return out;
+  }
+  function report(stage) {
+    document.title = 'PROBE' + JSON.stringify(facts(stage));
+    try {
+      var img = new Image();
+      img.src = '/__report?' + encodeURIComponent(JSON.stringify(facts(stage)));
+    } catch (e) { /* 探针发不出去不该影响这一页 */ }
+  }
+  function formFor(action) { return document.querySelector('form[action="' + action + '"]'); }
+
+  // 【每一步都别悄悄卡住】找不到该有的东西就回传一个 'stuck'（带上停在哪一步），
+  // 测试那边一眼看得出是流程断了，而不是「断言莫名失败」。
+  function stuck(where) { report('stuck:' + where); }
+
+  if (role() === 'old-tab') {
+    // ---------- 旧标签页 ----------
+    var phase = mine(PHASE);
+    if (phase === 'reloading') {
+      // 刷新之后：这里就是那条路的终点 —— 输入框里该是什么都没有
+      report('after');
+      return;
+    }
+    if (phase === null) {
+      mine(PHASE, 'sent');
+      document.getElementById('question-input').value = '删掉之前问出去的问题';
+      setTimeout(function () {
+        document.getElementById('ask-form').requestSubmit();   // 页面在这里记下那条待确认的问题
+        report('sent');
+        // 等那条记录落进 sessionStorage，再开另一个标签页去删数据。
+        // 开之前先把「下一个新标签页扮什么」放进共享的 localStorage（见上面 role 的说明）。
+        setTimeout(function () {
+          store(HANDOFF, '1');
+          window.open('/invite', '_blank');
+        }, 1500);
+      }, 0);
+    }
+    // 刚发出去、或者已经在等：都盯着另一个标签页，看它有没有把流程走完。
+    // 【就在这一页里等，不刷新】—— 要的就是「旧标签页一直停在原地」这个状态。
+    var waited = 0;
+    var timer = setInterval(function () {
+      waited += 200;
+      if (store(DONE) === '1') {
+        clearInterval(timer);
+        mine(PHASE, 'reloading');
+        window.location.replace('/');          // ← 这就是「旧标签页刷新」
+      } else if (waited >= 45000) {
+        clearInterval(timer);
+        report('timeout');
+      }
+    }, 200);
+    report('waiting');
+    return;
+  }
+
+  // ---------- 另一个标签页：绑定 → 删数据 → 重新绑定 ----------
+  var flow = mine(FLOW);
+  if (flow === null) { flow = 'invite-first'; mine(FLOW, flow); }
+  if (flow === 'invite-first') {
+    var first = formFor('/invite');
+    var field = first && first.querySelector('input[name="invite_code"]');
+    if (!field) { stuck('invite-first'); return; }
+    field.value = FIRST;
+    mine(FLOW, 'to-profile');
+    first.submit();
+  } else if (flow === 'to-profile') {
+    mine(FLOW, 'wipe');
+    window.location.replace('/profile');
+  } else if (flow === 'wipe') {
+    var wipe = formFor('/profile/delete');
+    var box = wipe && wipe.querySelector('input[name="confirm"]');
+    if (!wipe || !box) { stuck('wipe'); return; }
+    box.checked = true;                    // 没勾上的复选框根本不会被提交
+    mine(FLOW, 'to-rebind');
+    wipe.submit();                         // 删完跳回首页：那个一次性信号在【这一页】被用掉
+  } else if (flow === 'to-rebind') {
+    report('wiped');                       // 数据没了，代号也换了（这一页带着「刚清空过」的信号）
+    mine(FLOW, 'invite-second');
+    window.location.replace('/invite');
+  } else if (flow === 'invite-second') {
+    var second = formFor('/invite');
+    var field2 = second && second.querySelector('input[name="invite_code"]');
+    if (!field2) { stuck('invite-second'); return; }
+    field2.value = SECOND;
+    mine(FLOW, 'finish');
+    second.submit();
+  } else if (flow === 'finish') {
+    report('rebound');                     // 重新绑上了：绑定这条线索又被补了回来
+    store(DONE, '1');                      // 告诉旧标签页：可以刷新了
+  }
+})();
+"""
+
+# 预置 sessionStorage 之后立刻跳回首页：用来模拟「刷新时手上还留着一条没确认的问题」。
+BROWSER_SEED_PAGE = """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
+<title>SEED</title></head><body><script>
+try { window.sessionStorage.setItem('ai-tutor-pending-question-v2', __PAYLOAD__); }
+catch (e) { document.title = 'SEED-ERROR'; }
+window.location.replace('/');
+</script></body></html>"""
+
+# 把 sessionStorage 里的东西印在标题上，供测试直接读。
+BROWSER_STORAGE_PROBE_PAGE = """<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">
+<title>STORAGE</title></head><body><script>
+var out;
+try { out = window.sessionStorage.getItem('ai-tutor-pending-question-v2'); }
+catch (e) { out = 'ERROR'; }
+document.title = 'STORAGE:' + (out === null ? 'NONE' : out);
+</script></body></html>"""
+
+_ONE_PIXEL_GIF = (b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!"
+                  b"\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00"
+                  b"\x00\x02\x02D\x01\x00;")
+
+
+class BrowserHarness:
+    """「用真的浏览器打开这一页」这件事，收在这一个小工具里。
+
+    它起两个本机服务：真的 Flask（werkzeug 的多线程服务器，真的 socket）
+    和前面那个转发代理。代理同时负责计数：浏览器到底发过几个 POST，一目了然。
+    """
+
+    def __init__(self, testcase, inject="", seed=None, swallow_posts=False, stage="'probe'"):
+        self.browser = find_browser()
+        # 几个探针都留了一个 __SNAPSHOT__ 的位置，在这儿统一填上共用那一段，
+        # 免得每个调用点都要记着替换。stage 是探针回传时带上的「现在到哪一步了」。
+        self.inject = (inject.replace("__SNAPSHOT__", BROWSER_SNAPSHOT_FN)
+                             .replace("STAGE_EXPR", stage))
+        self.seed = seed
+        # 【把 POST 的响应吃掉】服务端照常处理、照常写库，只是那份响应不回给浏览器。
+        # 对用户来说，这就是「我发出去了，但再也等不到回应」。
+        #   True  = 每一个 POST 都吃掉；
+        #   整数 N = 只吃前 N 个 —— 一个页面里要有「一次丢掉响应的提问」+「几次正常的表单提交」
+        #            时用得上（比如 cross-tab 那条：旧标签页那一次提问要丢，
+        #            另一个标签页的输码 / 删除不能丢）。判定看的是【顺序】，不是秒数。
+        self.swallow_posts = swallow_posts
+        self.swallowed = 0               # 已经吃掉几个了（只在 _lock 里读写）
+        self.posts = []                  # 浏览器真的发出去的 POST 路径
+        self.post_bodies = []            # POST 的表单内容（用来核对身份牌是不是同一个）
+        self.hits = []                   # 所有请求
+        self.reports = []                # 注入的探针回传的结果
+        self.proc = None
+        self.profiles = []
+        self._lock = threading.Lock()
+
+        from werkzeug.serving import make_server      # Flask 自带的服务器，不用额外装
+        self.app_server = make_server("127.0.0.1", 0, tutor.app, threaded=True)
+        # 收工时会 kill 浏览器，正在处理的请求会撞上一个「连接被重置」。
+        # 那是收尾的正常现象，不是测试失败 —— 别把栈打到测试输出里去。
+        self.app_server.handle_error = lambda *args, **kwargs: None
+        self.app_server.log = lambda *args, **kwargs: None
+        threading.Thread(target=self.app_server.serve_forever, daemon=True).start()
+        self.app_port = self.app_server.server_address[1]
+
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_GET(self):
+                outer._handle(self, "GET")
+
+            def do_POST(self):
+                outer._handle(self, "POST")
+
+            def log_message(self, *args):
+                pass                     # 别把代理的请求日志刷到测试输出里
+
+        class QuietServer(http.server.ThreadingHTTPServer):
+            def handle_error(self, request, client_address):
+                pass                     # 同上：收尾时被重置的连接不必打印
+
+        self.proxy = QuietServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=self.proxy.serve_forever, daemon=True).start()
+        self.port = self.proxy.server_address[1]
+        testcase.addCleanup(self.stop)
+
+    @property
+    def origin(self):
+        return "http://127.0.0.1:%d" % self.port
+
+    def stop(self):
+        if self.proc is not None:
+            try:
+                self.proc.kill()
+                self.proc.wait(timeout=10)
+            except Exception:
+                pass
+            self.proc = None
+        for server in (self.proxy, self.app_server):
+            try:
+                server.shutdown()
+                server.server_close()
+            except Exception:
+                pass
+        for profile in self.profiles:
+            shutil.rmtree(profile, ignore_errors=True)
+
+    # ---------- 代理 ----------
+
+    def _send(self, handler, status, content_type, body):
+        handler.send_response(status)
+        handler.send_header("Content-Type", content_type)
+        handler.send_header("Content-Length", str(len(body)))
+        handler.end_headers()
+        handler.wfile.write(body)
+
+    def _handle(self, handler, method):
+        path = handler.path
+        with self._lock:
+            self.hits.append((method, path))
+            if method == "POST":
+                self.posts.append(urllib.parse.urlsplit(path).path)
+
+        if path.startswith("/__report"):
+            self._record_report(path)
+            self._send(handler, 200, "image/gif", _ONE_PIXEL_GIF)
+            return
+        if path.startswith("/__probe"):
+            self._send(handler, 200, "text/html; charset=utf-8",
+                       BROWSER_STORAGE_PROBE_PAGE.encode("utf-8"))
+            return
+        if path.startswith("/__seed"):
+            payload = json.dumps(json.dumps(self.seed or {}, ensure_ascii=False),
+                                 ensure_ascii=False)
+            page = BROWSER_SEED_PAGE.replace("__PAYLOAD__", payload)
+            self._send(handler, 200, "text/html; charset=utf-8", page.encode("utf-8"))
+            return
+
+        length = int(handler.headers.get("Content-Length") or 0)
+        body = handler.rfile.read(length) if length else None
+        if method == "POST":
+            with self._lock:
+                self.post_bodies.append((body or b"").decode("utf-8", "replace"))
+        status, headers, payload = self._forward(handler, method, path, body)
+        if method == "POST" and self._swallow_this_one():
+            return                       # 响应留在代理这里：浏览器那边就是「永远等不到」
+        ctype = ""
+        keep = []
+        for name, value in headers:
+            low = name.lower()
+            if low == "content-type":
+                ctype = value
+            if low in ("content-length", "connection", "transfer-encoding",
+                       "content-encoding", "date", "server"):
+                continue
+            keep.append((name, value))
+        if "text/html" in ctype:
+            payload = self._rewrite(payload.decode("utf-8")).encode("utf-8")
+            ctype = "text/html; charset=utf-8"
+        handler.send_response(status)
+        handler.send_header("Content-Type", ctype or "application/octet-stream")
+        for name, value in keep:
+            if name.lower() != "content-type":
+                handler.send_header(name, value)
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
+
+    def _swallow_this_one(self):
+        """这一个 POST 的响应要不要吃掉。True 全吃；N 只吃前 N 个。"""
+        if self.swallow_posts is True:
+            return True
+        if not isinstance(self.swallow_posts, int) or isinstance(self.swallow_posts, bool):
+            return False
+        with self._lock:
+            if self.swallowed >= self.swallow_posts:
+                return False
+            self.swallowed += 1
+            return True
+
+    def _forward(self, handler, method, path, body):
+        """把请求原样转给真的 Flask —— cookie 要带上，不然会话就不是同一个了。"""
+        headers = {}
+        for name, value in handler.headers.items():
+            if name.lower() in ("host", "connection", "content-length", "accept-encoding"):
+                continue
+            headers[name] = value
+        conn = http.client.HTTPConnection("127.0.0.1", self.app_port, timeout=120)
+        try:
+            conn.request(method, path, body=body, headers=headers)
+            response = conn.getresponse()
+            return response.status, response.getheaders(), response.read()
+        finally:
+            conn.close()
+
+    def _rewrite(self, html):
+        # 去掉两个 CDN 的脚本：测试不出网。页面本来就写了「取不到就跳过」。
+        html = re.sub(r'<script src="https://cdn\.jsdelivr\.net/[^"]*"></script>\s*', "", html)
+        if self.inject:
+            html = html.replace("</body>", "<script>" + self.inject + "</script></body>")
+        return html
+
+    def _record_report(self, path):
+        query = urllib.parse.urlsplit(path).query
+        try:
+            data = json.loads(urllib.parse.unquote(query))
+        except Exception:
+            data = {"unparsed": urllib.parse.unquote(query)}
+        with self._lock:
+            self.reports.append(data)
+
+    # ---------- 开浏览器 ----------
+
+    def _chrome_args(self, url, extra=()):
+        profile = tempfile.mkdtemp(prefix="ai_tutor_chrome_")
+        self.profiles.append(profile)
+        return ([self.browser, "--headless=new", "--disable-gpu", "--no-first-run",
+                 "--no-default-browser-check", "--disable-extensions",
+                 # cross-tab 那条要用 window.open 开第二个标签页：脚本不是用户点的，
+                 # 拦不拦是浏览器说了算，所以这里明确关掉。
+                 "--disable-popup-blocking",
+                 "--user-data-dir=" + profile] + list(extra) + [url])
+
+    def open_virtual(self, path="/", budget_ms=8000, timeout=90, report_after_ms=0):
+        """打开一个页面，让计时器按【虚拟时间】快进，跑完把最终 DOM 交回来。"""
+        self.inject = self.inject.replace("REPORT_AFTER_MS", str(report_after_ms))
+        args = self._chrome_args(self.origin + path,
+                                 ["--virtual-time-budget=%d" % budget_ms, "--dump-dom"])
+        proc = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                              errors="replace", timeout=timeout)
+        return proc.stdout or ""
+
+    def open_live(self, path="/", wait_seconds=30, until_stage=None):
+        """打开页面，用【真实时间】跑：等注入的探针回传结果再回来。
+
+        【为什么不用虚拟时间】实测 headless Chrome 在「有请求挂着没回来」时会把
+        虚拟时钟按住（一直挂到真实超时），所以「请求真的卡住」这一种只能用真实时间。
+
+        until_stage：等哪一步的回传才算数（探针会分几步回传）。
+        """
+        self.inject = self.inject.replace("REPORT_AFTER_MS", "0")
+        self.proc = subprocess.Popen(self._chrome_args(self.origin + path),
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self.reports and (until_stage is None or any(
+                        report.get("stage") == until_stage for report in self.reports)):
+                    break
+            time.sleep(0.1)
+        with self._lock:
+            return list(self.reports), list(self.posts)
+
+    def attempt_tokens(self):
+        """从浏览器真的发出去的 POST 里，把身份牌抠出来。"""
+        tokens = []
+        for body in list(self.post_bodies):
+            fields = urllib.parse.parse_qs(body)
+            tokens.append((fields.get("attempt") or [""])[0])
+        return tokens
+
+
+class TestWaitingStateInRealBrowser(ChatTestCase):
+    """真实浏览器里的等待 / 重发行为（本机没有 Chrome/Edge 就整组跳过）。
+
+    【这一组能证明什么】
+      · 页面那段内联脚本在真浏览器里真的跑起来了（不只是「文本看着对」）；
+      · 刷新/重新打开时，那条还没确认的问题会不会回到输入框 —— 真的 sessionStorage、
+        真的页面跳转、真的服务端历史；
+      · 用户把输入框清空 / 改了草稿之后刷新，分别会发生什么；
+      · 真的把个人数据删掉一遍（真邀请码表单 + 真档案页 + 真删除表单）之后，
+        那条待确认的问题不会又冒回输入框（test_a_pending_question_...）；
+      · 在别的标签页里删掉时也认得出 —— 一次性信号被那个标签页用掉了，
+        还有「历史变短了」和「绑定没了」两条耐久的线索（..._does_not_survive_... 两条）；
+      · 把那条路整条走完（..._does_not_revive_across_a_delete_and_a_rebind）：真的开两个标签页 ——
+        一个发问、另一个删数据（信号被它用掉）**再重新绑一张码**，然后第一个标签页才刷新。
+        老线索在这条路上被逐个绕开，认得出的是「数据代号对不上」；
+      · 看门狗到点后：界面被收回、说清「结果未知」、给出手动刷新入口，
+        而且浏览器【一个多余的请求都没发】；
+      · 用户原话里那个场景端到端跑一遍（test_a_lost_response_resend_...）：
+        真浏览器、真表单、真服务端、真模型客户端。第一次的响应被代理吃掉之后，
+        用户再按一次发送 —— 模型只被调用了一次，两次 POST 带的是同一个身份牌。
+
+    【这一组证明不了什么（验证边界）】
+      · 「请求真的发出去、卡在网络上」这一种在 --virtual-time-budget 下跑不起来：
+        只要有请求挂着没回来，Chrome 就会暂停虚拟时钟（实测会一直挂到真实超时）。
+        所以那条按虚拟时间跑的看门狗用例（test_the_watchdog_releases_...）是用
+        「把表单导航按住、一个字节都不发」来模拟的 —— 对页面来说同样是永远等不到回应，
+        但不等于「服务端正在处理」。真正在跑的那两条（..._is_really_still_out_there /
+        ..._a_lost_response_resend_...）用的是真实时间、真请求，不存在这个折扣。
+      · 删除那一条走的是页面自己那两个表单，但「点」是注入脚本代点的：不是真鼠标。
+      · 多标签页：只有 ..._does_not_revive_across_a_delete_and_a_rebind 那一条真的开了两个标签页，
+        走的也是「一个标签页在删、另一个在等」这种【先后关系】；两个标签页同时提问、
+        真的互相抢那把锁，这里没有覆盖（两个进程共用一把锁那部分在 Python 那一组）。
+        同一个会话里「另一个标签页先答完了」会怎样，只由判定表里「条数变多 → 认定答过了」那一条覆盖。
+      · 那条两标签页的用例里，「第二个标签页」是注入脚本用 window.open 开的（不是真鼠标点了链接），
+        两个标签页之间靠 localStorage 对齐 —— 那是测试自己的约定，产品代码里没有这种代码。
+      · 真机上人手点击、切后台、断网重连这些浏览器特性没有覆盖。
+      · 浏览器用的是本机的 Chrome/Edge；没装（或装在别处）就整组跳过。
+    """
+
+    # 探针回传时用的「阶段」表达式（见各条用例）。
+    # 【一律读服务端渲染出来的事实，不用客户端自己设的标记】踩过一次：
+    # 注入脚本是在【同一个页面】上先把标记改成「完成了」再去提交的，
+    # 于是探针立刻回传「完成」，测试在流程真的跑完之前就断言了。
+    STAGE_ANSWERED = "document.body.dataset.userCount === '1' ? 'after' : 'before'"
+    STAGE_WIPED = "document.body.dataset.justDeleted === 'true' ? 'done' : 'before'"
+
+    def browser(self, inject="", seed=None, swallow_posts=False, stage="'probe'"):
+        if find_browser() is None:
+            self.skipTest("本机没有 Chrome/Edge，跳过真实浏览器测试")
+        return BrowserHarness(self, inject=inject, seed=seed,
+                              swallow_posts=swallow_posts, stage=stage)
+
+    @staticmethod
+    def probe(dom):
+        """把注入的探针写进 <title> 的那段 JSON 读回来。"""
+        found = re.search(r"<title>PROBE(\{.*?\})</title>", dom, re.S)
+        if found is None:
+            raise AssertionError("页面里没有探针结果，DOM 开头是：\n" + dom[:400])
+        return json.loads(html_module.unescape(found.group(1)))
+
+    # ---------- A. 页面脚本在真浏览器里是活的 ----------
+
+    def test_the_page_script_runs_in_a_real_browser(self):
+        harness = self.browser(inject=BROWSER_PROBE_JS)
+        state = self.probe(harness.open_virtual("/", budget_ms=4000))
+
+        self.assertTrue(state["logic"], "页面里的判断函数没找着：那段脚本没跑起来")
+        self.assertRegex(state["token"], r"^[0-9a-f]{32}$", "身份牌该是 32 位十六进制")
+        self.assertEqual(state["value"], "")
+        self.assertFalse(state["readOnly"])
+        self.assertIn("发送", state["button"])
+        self.assertTrue(state["bannerHidden"], "没出错时横幅该是藏着的")
+        self.assertIsNone(state["pending"], "什么都没发过，不该有待确认的记录")
+        self.assertEqual(harness.posts, [])
+        self.assertTrue(all(method == "GET" for method, _ in harness.hits),
+                        "只是打开一次页面，不该发出别的请求：%r" % (harness.hits,))
+
+    # ---------- B. 刷新之后问题文字还在不在（真的 sessionStorage、真的跳转） ----------
+
+    def test_a_staged_question_comes_back_after_a_real_reload(self):
+        """还没被服务端记下来的那条：刷新后回到输入框，并说清「结果未知」。"""
+        harness = self.browser(inject=BROWSER_PROBE_JS,
+                               seed={"q": "还没答完的问题", "token": "seedtoken0000001",
+                                     "before": 0, "stalled": True})
+        state = self.probe(harness.open_virtual("/__seed", budget_ms=6000))
+
+        self.assertEqual(state["value"], "还没答完的问题")
+        self.assertFalse(state["bannerHidden"])
+        self.assertIn("没有】记录", state["banner"])
+        self.assertIn("不会自动重发", state["banner"])
+        # 这一页就是刚刷新出来的，服务端的话已经是最新的 —— 不必再劝他刷新一次
+        self.assertTrue(state["actionHidden"])
+        # 【身份牌必须留着】这条重发还是同一次尝试，服务端才挡得住第二次调用
+        self.assertIn("seedtoken0000001", state["pending"])
+
+    def test_a_question_that_was_really_answered_is_not_pushed_back(self):
+        """真的提交一次、真的让假上游回答、真的写进临时库，再跟着 302 回到首页。
+
+        对页面来说：上次那条在服务端【有】记录了 —— 就不该再塞回输入框，
+        也不该劝用户再发一次（那才是重复调用）。
+
+        【为什么这一条按真实时间跑】它中间有一次真的请求在飞。
+        headless Chrome 按虚拟时间跑的时候，对「有请求挂着没回来」的处理很别扭
+        （见类注释里的边界说明），所以这里改成：让它真跑，等页面自己回传「答完回来了」。
+        """
+        upstream = self.use_fake_upstream("ok", timeout=REAL_UPSTREAM_TIMEOUT_SECONDS)
+        harness = self.browser(inject=BROWSER_SUBMIT_ONCE_JS + BROWSER_PROBE_JS,
+                               seed={"q": "真的问过的问题", "token": "seedtoken0000002",
+                                     "before": 0, "stalled": True},
+                               stage=self.STAGE_ANSWERED)
+
+        reports, _ = harness.open_live("/__seed", wait_seconds=40, until_stage="after")
+
+        self.assertIn("after", [r.get("stage") for r in reports],
+                      "页面没有回传「答完回来了」：%r" % (reports,))
+        state = [r for r in reports if r.get("stage") == "after"][-1]
+        self.assertEqual(upstream.requests, 1, "应该真的问过一次模型")
+        self.assertEqual(state["value"], "", "已经答过了，不该再塞回输入框")
+        self.assertIsNone(state["pending"], "待确认的记录该被清掉")
+        self.assertIn("已经答完了", state["banner"])
+        self.assertEqual(len(self.all_rows()), 2)
+
+    def test_editing_the_draft_after_a_stall_does_not_hide_the_unsent_question(self):
+        """用户改了草稿（没发出去）然后刷新，两件事必须分清楚：
+
+        · 没发出去的改动会丢 —— 浏览器不会替保存草稿，这一点我们改变不了；
+        · 但【真正要紧的那条】（已经发出去、结果还未知）必须回来，
+          而且带着原来的身份牌回来 —— 这样他要再发一次也不会变成第二次调用。
+        """
+        harness = self.browser(inject=BROWSER_EDIT_DRAFT_THEN_RELOAD_JS + BROWSER_PROBE_JS,
+                               seed={"q": "已经发出去的问题", "token": "seedtoken0000004",
+                                     "before": 0, "stalled": True})
+        state = self.probe(harness.open_virtual("/__seed", budget_ms=10000))
+
+        self.assertEqual(state["value"], "已经发出去的问题", "回来的该是发出去的那条")
+        self.assertIn("seedtoken0000004", state["pending"], "身份牌要留着")
+        self.assertFalse(state["bannerHidden"], "该跟他说清这条结果未知")
+
+    def test_clearing_the_box_drops_the_staged_question(self):
+        """用户把输入框清干净 = 这条问题不要了：刷新时不该再塞回来。"""
+        harness = self.browser(inject=BROWSER_CLEAR_THEN_CHECK_JS,
+                               seed={"q": "被用户删掉的问题", "token": "seedtoken0000003",
+                                     "before": 0, "stalled": True})
+        dom = harness.open_virtual("/__seed", budget_ms=8000)
+        self.assertIn("STORAGE:NONE", dom, "清空输入框之后，暂存的那条该被丢掉")
+
+    def test_a_staged_question_does_not_survive_a_deletion_in_another_tab(self):
+        """【跨标签页那一种】在别的标签页里把数据删了，这个标签页过一会儿才刷新。
+
+        那时候首页那次「刚清空过」的一次性信号早被别的标签页用掉了，所以这一条靠的是
+        另一条更耐久的规则：历史【变短了】—— 消息只会被删、不会凭空少，
+        条数变小只有一种解释：那些记录被清空了。暂存记录里记着
+        「我发出去的时候有 3 条用户消息」，现在一条都没有，这条问题就不该再放回输入框。
+        """
+        harness = self.browser(inject=BROWSER_PROBE_JS,
+                               seed={"q": "别的标签页删掉之前的问题", "token": "seedtoken0000006",
+                                     "before": 3, "stalled": True})
+        state = self.probe(harness.open_virtual("/__seed", budget_ms=6000))
+
+        self.assertEqual(state["value"], "", "历史变短了 = 那些记录被清空了，不该放回输入框")
+        self.assertIsNone(state["pending"], "那条记录该被丢掉")
+        self.assertTrue(state["bannerHidden"], "这件事不必再向他解释一句")
+
+    def test_a_staged_question_does_not_survive_losing_the_binding(self):
+        """【跨标签页的另一种情形】暂存的时候历史里本来就什么都没有（基准是 0），
+        所以「历史变短了」这条看不出来 —— 但删除必然解绑，靠这一位仍然认得出。
+
+        这一页既没有那个一次性信号，历史条数也没变（都是 0），
+        它认得出来只可能是因为「原先绑着学习者、现在不绑了」。
+        """
+        harness = self.browser(inject=BROWSER_PROBE_JS,
+                               seed={"q": "解绑之前问出去的问题", "token": "seedtoken0000007",
+                                     "before": 0, "bound": True, "stalled": True})
+        state = self.probe(harness.open_virtual("/__seed", budget_ms=6000))
+
+        self.assertEqual(state["value"], "", "绑定没了 = 他的数据被清空过，不该放回输入框")
+        self.assertIsNone(state["pending"], "那条记录该被丢掉")
+
+    def test_a_pending_question_does_not_come_back_after_deleting_all_data(self):
+        """【核心】真的把个人数据删掉之后，浏览器里那条「待确认的问题」不许再冒出来。
+
+        这一条里全是真操作：真浏览器、真邀请码表单、真档案页、真删除表单，
+        以及服务端那次「刚清空过」的一次性信号。跑完之后输入框必须是空的、
+        浏览器里那条记录必须没了 —— 用户刚说过「全部删掉」。
+        """
+        self.make_invite("browser-erase")
+        harness = self.browser(
+            inject=BROWSER_DELETE_FLOW_JS.replace("__INVITE_CODE__", "browser-erase")
+                   + BROWSER_PROBE_JS,
+            seed={"q": "删除前留下的问题", "token": "seedtoken0000005",
+                  "before": 0, "stalled": True},
+            stage=self.STAGE_WIPED)
+
+        reports, posts = harness.open_live("/__seed", wait_seconds=40, until_stage="done")
+
+        # 【先确认这条测试真的删掉了东西】不然下面几条断言可能只是「什么都没发生」
+        self.assertIn("done", [r.get("stage") for r in reports],
+                      "删除流程没有走完：%r" % ([r.get("stage") for r in reports],))
+        self.assertIn("/profile/delete", posts, "删除表单没有真的提交")
+        self.assertEqual(self.count_rows("learner_sessions"), 0, "会话绑定该被删掉")
+        self.assertEqual(self.count_rows("learners"), 0, "学习者身份该被删掉")
+
+        state = [r for r in reports if r.get("stage") == "done"][-1]
+        self.assertEqual(state["value"], "", "刚删过数据，那条问题不该再放回输入框")
+        self.assertIsNone(state["pending"], "待确认的记录该被丢掉")
+        self.assertTrue(state["bannerHidden"], "这件事不必再向他解释一句")
+
+    def test_a_staged_question_does_not_revive_across_a_delete_and_a_rebind(self):
+        """【用户点名的那条路，一步都不少】删除数据 → 另一个标签页用掉一次性信号 →
+        重新绑定 → 旧标签页刷新。
+
+        【为什么这条非单独测不可】前面两条跨标签页的用例各只借了一条老线索，
+        而这条路会把它们**逐个绕开**：
+          · 那个一次性的「刚清空过」信号 —— 被删数据那个标签页回首页时用掉了；
+          · 「历史变短了」—— 暂存的时候基准就是 0（那是这个浏览器的第一句、回答还没落地），
+            删完还是 0，两头一模一样，看不出任何变化；
+          · 「绑定没了」—— 用户随后拿第二张码**重新绑了回来**，这条线索也被补了回去。
+        只剩「数据代号对不上」还认得出：这条记录指的是已经被删掉的那份数据。
+
+        全部是真操作：两个真标签页、真 cookie（代号在里面，两个标签页共用）、真 sessionStorage、
+        真邀请码表单、真档案页、真删除表单、真模型客户端（打本机假上游，不联网、不用真密钥）。
+        """
+        self.make_invite("browser-first")
+        self.make_invite("browser-second")
+        harness = self.browser(
+            inject=BROWSER_CROSS_TAB_DELETE_JS.replace("__INVITE_FIRST__", "browser-first")
+                                           .replace("__INVITE_SECOND__", "browser-second"),
+            # 只吃掉【第一个】POST 的响应：就是旧标签页那一次提问（他要的就是「结果未知」）。
+            # 另一个标签页的输码 / 删除必须拿到响应，否则它根本走不下去。
+            swallow_posts=1)
+
+        reports, posts = harness.open_live("/", wait_seconds=120, until_stage="after")
+
+        stages = [r.get("stage") for r in reports]
+        self.assertIn("rebound", stages, "另一个标签页没走完「删数据 + 重新绑定」：%r" % (reports,))
+        self.assertIn("after", stages, "旧标签页刷新那一步没有回传：%r" % (reports,))
+        sent = [r for r in reports if r.get("stage") == "sent"][-1]
+        final = [r for r in reports if r.get("stage") == "after"][-1]
+
+        # 【先确认这条路真的走过了】不然下面那几条断言可能只是「什么都没发生」
+        self.assertIn("/profile/delete", posts, "删除表单没有真的提交")
+        self.assertEqual(self.count_rows("messages"), 0, "聊天记录该被删干净了")
+        self.assertEqual(final["count"], "0", "刷新的时候历史确实是空的")
+        self.assertEqual(final["bound"], "true", "用户重新绑上了 —— 「绑定没了」这条线索被补了回来")
+        self.assertNotEqual(final["epoch"], sent["epoch"],
+                            "数据被清空了，代号必须换一个（下面那条断言认的就是它）")
+
+        # 【要测的那件事】那句已经被删掉的问题，绝不能又冒回输入框
+        self.assertEqual(final["value"], "", "刚被删掉的那句问题又冒回输入框了")
+        self.assertIsNone(final["pending"], "那条待确认的记录该被丢掉")
+        self.assertTrue(final["bannerHidden"], "这件事不必再向他解释一句")
+
+    def count_rows(self, table):
+        """临时库里某张表现在有几行（表名由调用点写死，不来自外部输入）。"""
+        conn = sqlite3.connect(self.db_path)
+        try:
+            return conn.execute("SELECT COUNT(*) FROM " + table).fetchone()[0]
+        finally:
+            conn.close()
+
+    # ---------- C. 看门狗到点：收回界面、不重发 ----------
+
+    def test_the_watchdog_releases_the_page_without_sending_anything(self):
+        """界面收得回来、话说明白、手动刷新入口露出来 —— 而且一个请求都没多发。"""
+        tutor.MODEL_REQUEST_TIMEOUT_SECONDS = 5          # 页面上显示成「预算 5 秒」
+        tutor.MODEL_STALL_MARGIN_SECONDS = 2             # 看门狗 7 秒后到点
+        harness = self.browser(inject=BROWSER_BLOCK_SUBMIT_JS + BROWSER_PROBE_JS)
+        state = self.probe(harness.open_virtual("/", budget_ms=12000, report_after_ms=9000))
+
+        self.assertFalse(state["bannerHidden"], "看门狗到点后横幅该露出来")
+        self.assertIn("结果未知", state["banner"])
+        self.assertFalse(state["actionHidden"], "「刷新看看结果」该露出来")
+        self.assertFalse(state["readOnly"], "输入框该能再编辑了")
+        self.assertIn("发送", state["button"])
+        self.assertEqual(state["value"], "被卡住的问题", "用户打的字不该丢")
+        self.assertIn('"stalled":true', state["pending"].replace(" ", ""),
+                      "该把这条记成「结果未知」，刷新时才解释得清")
+        # 【红线】整个过程浏览器一个 POST 都没发出去 —— 看门狗不会自己重发
+        self.assertEqual(harness.posts, [])
+
+    def test_the_watchdog_fires_while_the_request_is_really_still_out_there(self):
+        """真刀真枪那一版：请求真的发出去、真的卡在服务端，看门狗照样只收界面。
+
+        【和上一条的区别】这一条不按虚拟时间跑：请求是真的、卡住是真的、
+        七秒也是真的。页面在看门狗到点后主动把状态回传给测试（用测试注入的探针）。
+        """
+        upstream = self.use_fake_upstream("gate", timeout=30)   # 卡在服务端，一直不答
+        tutor.MODEL_REQUEST_TIMEOUT_SECONDS = 5                 # 页面上显示成「预算 5 秒」
+        tutor.MODEL_STALL_MARGIN_SECONDS = 2                    # 看门狗 7 秒后到点
+        harness = self.browser(inject=BROWSER_LIVE_PROBE_JS)
+
+        reports, posts = harness.open_live("/", wait_seconds=40)
+
+        self.assertTrue(reports, "探针没有回传：看门狗可能压根没到点，或者脚本没跑起来")
+        state = reports[0]
+        self.assertTrue(upstream.arrived.wait(5), "请求应该真的发到了上游并被卡住")
+        self.assertIn("结果未知", state["banner"])
+        self.assertFalse(state["actionHidden"])
+        self.assertFalse(state["readOnly"], "界面该被收回来了")
+        self.assertIn("发送", state["button"])
+        self.assertEqual(state["value"], "卡在路上的问题")
+        self.assertEqual(posts, ["/"], "看门狗不该自己再发一次（只该有用户那一次）")
+        upstream.release.set()          # 放它走完，别留一个半截的请求在后台
+        time.sleep(0.5)
+
+    def test_a_lost_response_resend_in_a_real_browser_still_calls_the_model_once(self):
+        """【这一轮要解决的场景，端到端跑一遍】
+
+        流程全部是真的：真浏览器、真表单、真服务端、真模型客户端（打本机假上游）。
+          · 第一次发送：服务端答完了、写进库了，但响应被代理吃掉 —— 对他就是「丢了」；
+          · 看门狗到点：说清「结果未知」，不自动重发；
+          · 他再按一次发送：页面沿用【同一个身份牌】；
+          · 服务端认出这是同一次尝试：不再调模型、不再扣额度，把已有的回答还给他。
+
+        【证明的落点】模型只被调用了一次（upstream.requests == 1）、库里只有一对问答，
+        而浏览器确实发过两次 POST，且两次带的身份牌一模一样。
+        """
+        upstream = self.use_fake_upstream("gate", timeout=30)
+        tutor.MODEL_REQUEST_TIMEOUT_SECONDS = 5
+        tutor.MODEL_STALL_MARGIN_SECONDS = 2                    # 看门狗 7 秒后到点
+        harness = self.browser(inject=BROWSER_LIVE_RESEND_JS, swallow_posts=True)
+
+        # 第一次请求一发到上游，就放行 —— 让「服务端答完但响应丢了」真的发生
+        threading.Thread(target=lambda: (upstream.arrived.wait(20), upstream.release.set()),
+                         daemon=True).start()
+        reports, posts = harness.open_live("/", wait_seconds=60, until_stage="resent")
+
+        stages = [report.get("stage") for report in reports]
+        self.assertIn("resent", stages, "重发那一步没有回传：%r" % (reports,))
+        state = [r for r in reports if r.get("stage") == "resent"][0]
+
+        self.assertTrue(upstream.arrived.is_set(), "第一次请求应该真的发出去了")
+        self.assertEqual(upstream.requests, 1, "同一次尝试不该再问一次模型")
+        self.assertEqual(len(self.all_rows()), 2, "库里只该有一对问答")
+        self.assertEqual(posts, ["/", "/"], "浏览器应该发过两次：用户第一次 + 他后来的重发")
+        tokens = harness.attempt_tokens()
+        self.assertEqual(len(tokens), 2)
+        self.assertRegex(tokens[0], r"^[0-9a-f]{32}$")
+        self.assertEqual(tokens[0], tokens[1],
+                         "重发必须沿用同一个身份牌，服务端才认得出是同一次尝试")
+        self.assertIn(tokens[1], state["pending"], "身份牌该一直留在页面上")
+        self.assertIn("结果未知", state["banner"])
 
 
 if __name__ == "__main__":

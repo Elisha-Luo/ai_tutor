@@ -22,6 +22,7 @@ import hashlib      # 算 HMAC 摘要用（SHA-256）
 import hmac         # 常数时间比较 + HMAC，都是标准库，不用额外装包
 import secrets      # 密码学安全的随机源，用来生成邀请码
 import sqlite3      # 只有一处用到：认出「摘要撞了」这个异常（见 create_invite）
+import uuid         # 清空数据时轮换「数据代号」用的随机串
 from datetime import datetime, timezone   # 记时间
 
 
@@ -162,7 +163,7 @@ def _quoted(values):
 
 
 def ensure_schema(conn):
-    """把档案相关的四张表建好（已存在就什么都不做）。"""
+    """把档案相关的几张表（含清空数据要用的 session_epochs）建好；已存在就什么都不做。"""
     with conn:                                        # with conn = 事务：中间出错自动回滚
         # ---------- 邀请码 ----------
         # 【只存摘要，不存明文】code_digest 是 HMAC-SHA256 的结果。
@@ -224,6 +225,29 @@ def ensure_schema(conn):
                             conn.execute("PRAGMA table_info(learner_sessions)")}
         if "revoked_at" not in existing_columns:
             conn.execute("ALTER TABLE learner_sessions ADD COLUMN revoked_at TEXT")
+
+        # ---------- 数据代号 ----------
+        # 一个浏览器会话一行，记着「它名下这一份数据是哪一份」（值是一个随机串，
+        # 不含任何用户内容）。页面拿它判断「那条还没确认的问题是不是已经被删掉了」——
+        # 完整理由见 app.py 的 _data_epoch()：它【必须落在库里】，放在签名 cookie 里
+        # 会被迟到的响应盖回旧值。
+        #
+        # 【为什么建在这里】清空数据时要【在同一个事务里】把它轮换掉（见 clear_all_data
+        # 第 ③ 步），而那个事务也归这一层管 —— schema 和写它的代码放一起才不会漂。
+        # 这一层只建表，不负责「没有这一行就新建一行」（那是 app.py 每次渲染时做的）。
+        #
+        # 【当前实现的保留范围】「清空全部个人数据」会轮换代号，但不会删除这张表的行。
+        # 因而每个来过的会话会留一行（sid + 一个随机串 + 时间）：不含聊天正文，
+        # 但 sid 是可关联同一浏览器的假名标识，不能说成「没有身份信息」。
+        # 这里记录的是当前方案，不声称「保留这一行」是唯一可行的实现；
+        # 以后若改用删行后重建，须另行验证删除与迟到响应的并发行为。
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS session_epochs ("
+            "    session_id TEXT PRIMARY KEY,"
+            "    data_epoch TEXT NOT NULL,"
+            "    rotated_at TEXT NOT NULL"
+            ")"
+        )
 
         # ---------- 偏好 ----------
         # 【learner_id 就是主键】一个学习者只有一行偏好。
@@ -530,11 +554,12 @@ def clear_all_data(conn, learner_id):
     顺序是设计文档第 13 节定的：
       ① 找出全部会话（**含已失效的绑定** —— 少了这一步就会漏记录）
       ② 删这些会话的 messages
-      ③ 删偏好
-      ④ 作废他名下的邀请码
-      ⑤ 删会话绑定
-      ⑥ 删学习者
-    ②依赖①的结果，⑤又把①的线索抹掉 —— 所以顺序错了就删不干净。
+      ③ 轮换这些会话的「数据代号」（见 app.py 的 _data_epoch）
+      ④ 删偏好
+      ⑤ 作废他名下的邀请码
+      ⑥ 删会话绑定
+      ⑦ 删学习者
+    ②③依赖①的结果，⑥又把①的线索抹掉 —— 所以顺序错了就删不干净。
     任何一步抛异常，整体 ROLLBACK，绝不能留下「删了一半」的状态。
 
     【为什么用 BEGIN IMMEDIATE】和兑换邀请码同一个道理：
@@ -543,7 +568,7 @@ def clear_all_data(conn, learner_id):
     if learner_id is None:
         return None
 
-    stats = {"sessions": 0, "messages": 0, "preferences": 0,
+    stats = {"sessions": 0, "messages": 0, "preferences": 0, "epochs": 0,
              "invites": 0, "sessions_deleted": 0, "learners": 0}
 
     conn.execute("BEGIN IMMEDIATE")
@@ -562,24 +587,46 @@ def clear_all_data(conn, learner_id):
                 (learner_id,),
             ).rowcount
 
-        # ③ 偏好
+        # ③ 把他的会话的「数据代号」换掉。
+        #    【为什么在这里，而不是回到 app.py 里再写一次】
+        #    因为「数据没了」和「代号变了」必须是同一件事：分开写的话，中间出一次错就会
+        #    留下「数据还在、代号先换了」—— 用户那条还没答完的问题会被白白作废。
+        #    放在同一个事务里就只有两种结局：要么两件都成，要么两件都没发生。
+        #    【为什么轮换所有会话，含已失效的】他名下每一台设备都要认得出「数据清空过」，
+        #    不管那台设备的绑定是不是已经作废了。
+        #    【为什么当前选择轮换而不是删行】删除事务一提交，各关联会话就已有新代号，
+        #    后续页面只需读取，不必先重建。删行后重建也可能得到不同值，但那是另一种
+        #    尚未按迟到响应与并发请求验证的方案，不能在这里说它必然不可行。
+        #    【还没有这一行的会话】用一条 insert 补上：值同样是新的随机串，
+        #    和「轮换」在这个用途上没有区别（页面只比「对不对得上」）。
+        for session_id in sessions:
+            conn.execute(
+                "INSERT INTO session_epochs (session_id, data_epoch, rotated_at) "
+                "VALUES (?, ?, ?) "
+                "ON CONFLICT(session_id) DO UPDATE SET "
+                "data_epoch = excluded.data_epoch, rotated_at = excluded.rotated_at",
+                (session_id, uuid.uuid4().hex, _now()),
+            )
+            stats["epochs"] += 1
+
+        # ④ 偏好
         stats["preferences"] = conn.execute(
             "DELETE FROM learner_preferences WHERE learner_id = ?", (learner_id,)
         ).rowcount
 
-        # ④ 作废他名下的全部邀请码（改成 revoked，不删行）
+        # ⑤ 作废他名下的全部邀请码（改成 revoked，不删行）
         stats["invites"] = conn.execute(
             "UPDATE invites SET status = ?, revoked_at = ? "
             "WHERE learner_id = ? AND status != ?",
             (INVITE_REVOKED, _now(), learner_id, INVITE_REVOKED),
         ).rowcount
 
-        # ⑤ 会话绑定（这时候已经没有用了）
+        # ⑥ 会话绑定（这时候已经没有用了）
         stats["sessions_deleted"] = conn.execute(
             "DELETE FROM learner_sessions WHERE learner_id = ?", (learner_id,)
         ).rowcount
 
-        # ⑥ 学习者本人
+        # ⑦ 学习者本人
         stats["learners"] = conn.execute(
             "DELETE FROM learners WHERE id = ?", (learner_id,)
         ).rowcount

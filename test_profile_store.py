@@ -509,6 +509,20 @@ class TestClearAllData(StoreTestCase):
                 "INSERT INTO messages (session_id, role, content, created_at) VALUES (?,?,?,?)",
                 (session_id, "user", text, "2026-01-01T00:00:00"))
 
+    def epoch_of(self, session_id):
+        """某个会话当前的「数据代号」（没有这一行就返回 None）。"""
+        row = self.conn.execute(
+            "SELECT data_epoch FROM session_epochs WHERE session_id = ?",
+            (session_id,)).fetchone()
+        return row[0] if row else None
+
+    def put_epoch(self, session_id, value="代号-老的值"):
+        """先给某个会话放一个代号 —— 正常是 app.py 每次渲染时放的，这里直接摆好。"""
+        with self.conn:
+            self.conn.execute(
+                "INSERT OR REPLACE INTO session_epochs (session_id, data_epoch, rotated_at) "
+                "VALUES (?, ?, ?)", (session_id, value, "2026-01-01T00:00:00"))
+
     # ---------- 该删的一条不漏 ----------
 
     def test_it_deletes_everything_in_scope(self):
@@ -655,17 +669,20 @@ class TestClearAllData(StoreTestCase):
     # ---------- 事务边界 ----------
 
     def test_a_failure_halfway_rolls_everything_back(self):
-        """【核心】第三步失败（用触发器故意让它炸）→ 前两步必须一起回滚。
+        """【核心】中间某一步失败（用触发器故意让它炸）→ 前面几步必须一起回滚。
 
         【为什么值得这么测】「删了一半」是最糟的结果：用户以为删干净了，
         实际聊天记录还在，而偏好已经没了 —— 数据处于谁都说不清的状态。
+        故意把失败点放在④（偏好），也就是【代号已经在③换过之后】——
+        这样「数据没删成、代号却换了」这种半截状态也会被这条测试抓住。
         """
         learner = self.make_learner()
         profile_store.link_session(self.conn, learner, "device-1")
         profile_store.save_preferences(self.conn, learner, "b2", False, "en_only", "brief")
         self.chat("device-1")
+        self.put_epoch("device-1", "代号-删除之前的")
 
-        # 装一个「删偏好就报错」的触发器，把失败点精确地放在③
+        # 装一个「删偏好就报错」的触发器，把失败点精确地放在④（代号是在③轮换的）
         with self.conn:
             self.conn.execute(
                 "CREATE TRIGGER boom BEFORE DELETE ON learner_preferences "
@@ -674,7 +691,7 @@ class TestClearAllData(StoreTestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             profile_store.clear_all_data(self.conn, learner)
 
-        # ①②已经执行过了，但必须被整体撤销
+        # ①②③已经执行过了，但必须被整体撤销
         self.assertEqual(self.count("messages"), 1, "聊天记录被删了却没回滚")
         self.assertEqual(self.count("learner_preferences"), 1, "偏好被删了却没回滚")
         self.assertEqual(self.count("learner_sessions"), 1)
@@ -682,6 +699,82 @@ class TestClearAllData(StoreTestCase):
         self.assertEqual(
             self.conn.execute("SELECT status FROM invites").fetchone()[0],
             profile_store.INVITE_BOUND, "邀请码被作废了却没回滚")
+        # 【代号也一样】数据还在，代号就不许换 —— 换了等于把用户那条还没答完的
+        # 问题白白作废，而他的数据其实一条没少。
+        self.assertEqual(self.epoch_of("device-1"), "代号-删除之前的",
+                         "数据没删成，代号却被换掉了")
+
+    # ---------- 数据代号：必须和「数据没了」是同一件事 ----------
+
+    def test_it_rotates_the_data_epoch_of_every_session(self):
+        """【核心】删除成功 → 他名下每一个会话的代号都换掉，包括已经被作废过的旧设备。
+
+        【为什么非换不可】页面靠它认出「那条还没确认的问题指的是已经被删掉的数据」。
+        别的标签页删完、这个标签页过一会儿才刷新，或者用户删完又拿新码绑回来，
+        认的都是它。
+        【为什么已作废的也要换】那台设备上的页面同样会带着一条待确认的问题，
+        它的用户同样说过「全部删掉」。
+        """
+        learner = self.make_learner()
+        profile_store.link_session(self.conn, learner, "device-1")
+        self.put_epoch("device-1", "device-1-老代号")
+        # 另一个会话：作废过（拿新码重新进来就换了一台），但关联还挂在同一个人名下
+        profile_store.link_session(self.conn, learner, "device-old")
+        self.put_epoch("device-old", "device-old-老代号")
+        profile_store.revoke_invite(self.conn, "c1", PEPPER)          # device-old 失去访问权
+        profile_store.link_session(self.conn, learner, "device-2")    # 后来在另一台设备上又进来了
+        self.put_epoch("device-2", "device-2-老代号")
+        # 别人的会话：一个字都不许动
+        other_learner = self.make_learner("c2")
+        profile_store.link_session(self.conn, other_learner, "someone-else")
+        self.put_epoch("someone-else", "别人的代号")
+
+        stats = profile_store.clear_all_data(self.conn, learner)
+
+        self.assertEqual(stats["epochs"], 3, "该轮换他名下【全部】会话，含已作废的那个")
+        for session_id, old in (("device-1", "device-1-老代号"),
+                                ("device-old", "device-old-老代号"),
+                                ("device-2", "device-2-老代号")):
+            self.assertNotEqual(self.epoch_of(session_id), old, session_id + " 的代号没换")
+            # 【轮换，不是删掉】这一行要留着，而且值是新的 ——
+            # 下一台打开的页面按会话读出来，还是那个新值
+            self.assertRegex(self.epoch_of(session_id), r"^[0-9a-f]{32}$")
+        self.assertEqual(self.epoch_of("someone-else"), "别人的代号",
+                         "别人的代号不该被动")
+
+    def test_it_rotates_twice_without_sticking(self):
+        """清空 → 这个浏览器拿新码重新绑回来（同一个人？不是，是另一个人）→ 再清空。
+
+        两次都要换出【不同的】值。「换过一次就固定了」会漏掉第二次删除：
+        那时候用户手上那条待确认的问题指的是第二次被删掉的数据，代号没再换就认不出来。
+        """
+        learner = self.make_learner()
+        profile_store.link_session(self.conn, learner, "device-1")
+        self.put_epoch("device-1", "第一次之前")
+
+        profile_store.clear_all_data(self.conn, learner)
+        first = self.epoch_of("device-1")
+
+        # 同一个浏览器（同一个 session_id）拿一张全新的码重新进来
+        profile_store.create_invite(self.conn, "fresh-code", PEPPER)
+        _outcome, fresh = self.redeem("fresh-code")
+        profile_store.link_session(self.conn, fresh, "device-1")
+        profile_store.clear_all_data(self.conn, fresh)
+        second = self.epoch_of("device-1")
+
+        self.assertNotEqual(first, "第一次之前")
+        self.assertNotEqual(second, first, "第二次清空没有换代号")
+
+    def test_a_session_without_an_epoch_gets_one_when_cleared(self):
+        """会话还没有代号（页面还没渲染过）→ 清空时补一个，而不是报错。"""
+        learner = self.make_learner()
+        profile_store.link_session(self.conn, learner, "brand-new")
+        self.assertIsNone(self.epoch_of("brand-new"))
+
+        stats = profile_store.clear_all_data(self.conn, learner)
+
+        self.assertEqual(stats["epochs"], 1)
+        self.assertRegex(self.epoch_of("brand-new"), r"^[0-9a-f]{32}$")
 
     def test_clearing_an_unknown_learner_changes_nothing(self):
         """编号不存在 → 什么都不做，也不报错（更不能顺手把额度清了）。"""

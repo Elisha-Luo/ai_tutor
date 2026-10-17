@@ -225,6 +225,7 @@ a { color: var(--accent); }
 .msg.ai .bubble a { text-underline-offset: 2px; }
 .error, .status { margin: 0 34px 11px; padding: 11px 14px; border-radius: 7px; font-size: 13px; line-height: 1.6; }
 .error { border: 1px solid #eacbca; background: var(--danger-soft); color: var(--danger); }
+.error-action { margin-left: 6px; color: inherit; font-weight: 600; text-underline-offset: 2px; white-space: nowrap; }
 .status { display: none; border: 1px solid #c8e3db; background: var(--accent-soft); color: var(--accent-dark); }
 #pending { display: none; }
 .dots { display: flex; gap: 5px; align-items: center; padding: 18px 20px; }

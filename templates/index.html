@@ -7,7 +7,33 @@
   <title>AI 学习助手</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='ui.css') }}">
 </head>
-<body class="chat-page">
+{# 【交给客户端的六件事实】页面脚本自己算不出这些，只能由服务端下发：
+     1) 服务端预算：看门狗必须比它晚动手，否则会抢在正常回答前面报错；
+     2) 等待余量：和预算是配套的两个数字，页面不另写；
+     3) 用户消息条数：刷新后判断「刚才那条到底被记下来没有」。
+        用【条数】而不是「最后一条的文字」——连着问两次同样的话时，
+        文字一样、条数却会多，只看文字会认错；
+        但它有个照不到的地方：暂存时基准是 0（第一句、回答还没落地），
+        数据被清空之后还是 0，两头一样，看不出任何变化；
+     4) 刚刚清空过个人数据：这一位是一次性信号。它说明「那条待确认的问题所指的回答
+        已经不存在了」，页面要把那条记录丢掉，绝不能下次打开又把它放回输入框。
+        【一次性的代价】它只够走一趟 —— 删除后跳回来的那一页（或者别的标签页，
+        或者用户重新输码那次跳转）先读到就先用掉了；
+     5) 这份数据的代号：删除时换掉，之后每个页面都给。它不靠条数、也不靠绑定，
+        所以「别的标签页删了 → 这个标签页过一会儿才刷新」照样认得出，
+        连「删完又拿新码绑回来」也挡得住。页面把发出去时看到的代号记在那条记录里，
+        下次一对就知道这份数据是不是被整体清空过（见 planPendingRestore 的说明）；
+     6) 这个会话还绑着学习者吗：删除必然解绑（匿名访客没有数据可删），
+        所以「原先绑着、现在不绑了」也是一条耐久证据。
+        【但它不是最后一道】用户完全可以再拿一张新码绑回来，那时它就说不清了 ——
+        那条路的兜底是第 5 位。 #}
+<body class="chat-page"
+      data-model-budget-seconds="{{ model_timeout_seconds }}"
+      data-stall-margin-seconds="{{ stall_margin_seconds }}"
+      data-user-count="{{ user_message_count }}"
+      data-just-deleted="{{ 'true' if just_deleted else 'false' }}"
+      data-data-epoch="{{ data_epoch }}"
+      data-learner-bound="{{ 'true' if learner_bound else 'false' }}">
   <div class="workspace{% if history %} in-chat{% endif %}">
     <aside class="workspace-rail" aria-label="学习导航">
       <a class="brand" href="{{ url_for('index') }}" aria-label="AI 学习助手首页">
@@ -75,15 +101,20 @@
         </div>
       </main>
 
-      {% if error %}
-      <div class="error" role="alert">{{ error }}</div>
-      {% endif %}
+      {# 【为什么常驻】客户端检测到「等待超时」时也要往这里写一句话；
+         没有 error 时用 hidden 藏起来，视觉行为与原来一致。
+         里面的那个链接是【手动】的：结果不明时，用户点它自己去刷新看一眼。
+         这里不提供任何「再发一次」的按钮 —— 重发是用户的决定，不是页面的建议。 #}
+      <div class="error" id="error-banner" role="alert"{% if not error %} hidden{% endif %}><span id="error-text">{{ error }}</span><a class="error-action" id="error-action" href="{{ url_for('index') }}" hidden>刷新看看结果 <span aria-hidden="true">↗</span></a></div>
       <div class="status" id="status" role="status" aria-live="polite">正在思考，请稍候。不用重复发送。</div>
 
       <div class="composer-wrap">
         <form class="composer" method="POST" id="ask-form">
           <label class="sr-only" for="question-input">输入你的英语问题</label>
           <input type="text" name="question" id="question-input" placeholder="输入你的英语问题，或粘贴一个句子…" value="{{ question }}" autocomplete="off">
+          {# 这次「发送」的身份牌，由脚本在提交前填上（见 attempt 那一段）。
+             浏览器没跑脚本时它是空的，服务端就当作「没带」，一切照旧。 #}
+          <input type="hidden" name="attempt" id="attempt-input" value="">
           <button type="submit" id="send-button">发送 <span aria-hidden="true">↗</span></button>
         </form>
         <p class="composer-note">回答仅供学习参考；重要内容请再核对。</p>
@@ -107,9 +138,174 @@
     const form = document.getElementById('ask-form');
     const input = document.getElementById('question-input');
     const button = document.getElementById('send-button');
+    const buttonLabel = button.innerHTML;   // 「发送 ↗」，等待结束后原样还原
     const pending = document.getElementById('pending');
     const status = document.getElementById('status');
     let sending = false;
+    let watchdog = null;
+
+    // 服务端预算 / 等待余量都由模板下发（两个数字是一套的，页面不另写）。
+    const BUDGET_SECONDS = Number(document.body.dataset.modelBudgetSeconds) || 30;
+    const STALL_MARGIN_SECONDS = Number(document.body.dataset.stallMarginSeconds) || 15;
+    const STALL_SECONDS = BUDGET_SECONDS + STALL_MARGIN_SECONDS;
+    // 服务端这次渲染时，历史里有几条用户消息。刷新后拿它跟「我发出去时的条数」比。
+    const SERVER_USER_COUNT = Number(document.body.dataset.userCount) || 0;
+    // 刚刚清空过个人数据（一次性信号，服务端只在删除后的那一次渲染里给 true）。
+    const JUST_DELETED = document.body.dataset.justDeleted === 'true';
+    // 这份数据的代号：数据被整体清空时服务端会换一个（见模板顶部第 5 条）。
+    // 老服务端、或者会话状态确认不了的那一页可能给不出 —— 那就当空串，「对不上」这条规则不作声。
+    const DATA_EPOCH = document.body.dataset.dataEpoch || '';
+    // 这个会话现在还绑着学习档案吗（删除必然解绑，见模板顶部第 6 条）。
+    const LEARNER_BOUND = document.body.dataset.learnerBound === 'true';
+    const PENDING_KEY = 'ai-tutor-pending-question-v2';
+
+    // recovery-logic:start
+    // ===== 这一段里全是【纯函数】：页面关于「等待/重发」的判断都在这里，
+    //       不碰 DOM、不碰网络，所以可以原样抠出来在 node 里跑判定表。 =====
+
+    // 【这一次点「发送」，算不算「同一次尝试」】
+    //   pending  ：上次真的发出去、但还没得到确认的那一条
+    //   typed    ：这次要发的文字
+    //   newToken ：如果这是全新的一次尝试，调用方刚生成好的随机 id
+    //   userCount：服务端这次渲染时，历史里有几条用户消息
+    //   bound    ：服务端这次渲染时，这个会话还绑着学习档案吗
+    //   epoch    ：这一页拿到的「数据代号」（见模板顶部第 5 条）
+    //
+    // 文字（去掉两端空白后）和上次那条一模一样 → 沿用同一个 attempt id：这是【重发】。
+    // 服务端于是能把这次重发认出来 —— 要么还没答完（被锁挡住），要么已经答完（直接看回答），
+    // 两种情况下都不会再调一次模型、也不会多扣一次额度。
+    // 改了字就是另一回事：那是另一条问题，算全新的一次尝试，给一个新 id。
+    function planAttempt(pending, typed, newToken, userCount, bound, epoch) {
+      const text = (typed || '').trim();
+      const live = (typeof epoch === 'string') ? epoch : '';
+      const previous = (pending && typeof pending.q === 'string') ? pending.q.trim() : '';
+      if (previous && previous === text && pending.token) {
+        // 【重发沿用原来的代号，不盖成这一页的】那条记录指的是「发出去那一刻的那份数据」；
+        // 万一中间被清空过，这个对不上必须留着 —— 要是重发一次就顺手洗干净，
+        // 下次刷新它就成了一条「看起来很正常」的记录，那句早被删掉的问题又会冒回输入框。
+        const stamped = (typeof pending.epoch === 'string' && pending.epoch) ? pending.epoch : live;
+        return { q: text, token: pending.token, before: Number(pending.before) || 0,
+                 stalled: pending.stalled === true, bound: pending.bound === true,
+                 epoch: stamped, reuse: true };
+      }
+      return { q: text, token: newToken, before: Number(userCount) || 0,
+               stalled: false, bound: bound === true, epoch: live, reuse: false };
+    }
+
+    // 【刷新之后：把问题放回输入框，还是认定「其实已经答过了」】
+    //   serverEchoed   ：服务端这次渲染已把问题回显进输入框（出错分支会回显）
+    //   pending        ：见上
+    //   serverUserCount：服务端这次渲染的用户消息条数
+    //   justDeleted    ：服务端说「刚刚清空过个人数据」
+    //   learnerBound   ：服务端说「这个会话现在还绑着学习档案」
+    //   serverEpoch    ：服务端这一页给出的「数据代号」
+    //
+    // 判断「有没有被记下来」用的是【条数变化】，不是文字比对（原因见 planAttempt 与模板顶部）。
+    // 拿不准的时候一律按「还没答完」处理 —— 让文字留在用户手上，让他自己决定要不要再发；
+    // 绝不反过来把没答完的说成「答过了」，那样会把他打的字悄悄丢掉。
+    //
+    // 【清空过数据有两个判死的口子，都要有 —— 因为「删除」这件事本身不留下痕迹】
+    //   ① 服务端说「刚刚清空过」—— 一次性的，直接判死。这是最常见的那条路：
+    //      用户在本标签页删完，跟着重定向回到首页。
+    //   ② 数据代号【对不上】—— 这条记录写下去之后，这份数据被整体清空过。
+    //      它是①的耐久版本，而且不靠任何别的线索：刷新还在、各标签页共用一份、
+    //      重新拿张码绑回来也换不回去。别的标签页删掉、这个标签页过一会儿才刷新，
+    //      认的就是它。
+    // 【两条老线索还在，但只是补充】它们各有一个照不到的地方，所以才需要②：
+    //   ③ 历史【变短了】—— 消息只会被删、不会凭空少，所以条数变小只有一种解释：
+    //      那些记录被清空了。可是「暂存时基准本来就是 0」（第一次提问、回答还没落地）
+    //      的时候，删完还是 0，这条线索根本不存在。
+    //   ④ 原先绑着学习档案、现在不绑了 —— 删除必然解绑（匿名访客根本没有数据可删）。
+    //      可是用户删完完全可能【再拿一张新码绑回来】，那时它也说不出话了。
+    //   （②之所以先判、③④之所以只是补充：③④都可能被正常的操作绕开，
+    //     而②对不上就只有一个解释。真判死的时候连「已经答完了」这句都不说 ——
+    //     那份回答已经不在了，说了就是撒谎。）
+    function planPendingRestore(serverEchoed, pending, serverUserCount, justDeleted, learnerBound,
+                                serverEpoch) {
+      if (justDeleted) return { restore: null, clear: true, answered: false };
+      if (!pending || !(pending.q || '').trim()) return { restore: null, clear: false, answered: false };
+      // 两头都要有值才比：老记录没记过代号、或者这一页给不出代号（老服务端、
+      // 会话状态确认不了的那一页），那就退回③④，不拿「空 vs 有」当证据。
+      const stamped = (typeof pending.epoch === 'string') ? pending.epoch.trim() : '';
+      const live = (typeof serverEpoch === 'string') ? serverEpoch.trim() : '';
+      if (stamped && live && stamped !== live) {
+        return { restore: null, clear: true, answered: false };
+      }
+      if ((serverEchoed || '').trim()) return { restore: null, clear: false, answered: false };
+      if (pending.bound === true && learnerBound === false) {
+        return { restore: null, clear: true, answered: false };
+      }
+      const count = Number(serverUserCount);
+      const before = Number(pending.before);
+      if (count < before) return { restore: null, clear: true, answered: false };
+      if (count > before) return { restore: null, clear: true, answered: true };
+      return { restore: pending.q, clear: false, answered: false };
+    }
+    // recovery-logic:end
+
+    function notice(text, offerRefresh) {
+      const banner = document.getElementById('error-banner');
+      const label = document.getElementById('error-text');
+      const action = document.getElementById('error-action');
+      if (!banner) return;
+      if (label) label.textContent = text; else banner.textContent = text;
+      if (action) action.hidden = !offerRefresh;
+      banner.hidden = false;
+    }
+
+    // ---------- 「我刚发出去的那一条」记在哪 ----------
+    // 存在 sessionStorage：只属于这一个标签页，关掉就没了，也不会传到服务端去。
+    // 无痕模式、或者浏览器不让存，读写都会抛异常 —— 那就当作「没有这条记忆」，
+    // 页面照样能用，只是刷新后少一层提示。
+    function readPending() {
+      try {
+        const raw = window.sessionStorage.getItem(PENDING_KEY);
+        return raw ? JSON.parse(raw) : null;
+      } catch (e) { return null; }
+    }
+
+    function writePending(record) {
+      try { window.sessionStorage.setItem(PENDING_KEY, JSON.stringify(record)); } catch (e) { /* 存不了就算了 */ }
+    }
+
+    function dropPending() {
+      try { window.sessionStorage.removeItem(PENDING_KEY); } catch (e) { /* 同上 */ }
+    }
+
+    // 这次尝试的身份牌：32 位十六进制随机数。
+    // crypto.randomUUID 只在 https / localhost 下才有，所以留两级退路，
+    // 免得在别的地方整段脚本直接报错、连带等待状态也收不回来。
+    function newAttemptId() {
+      try {
+        if (window.crypto && window.crypto.randomUUID) {
+          return window.crypto.randomUUID().replace(/-/g, '');
+        }
+      } catch (e) { /* 往下退 */ }
+      try {
+        const buf = new Uint8Array(16);
+        window.crypto.getRandomValues(buf);
+        let out = '';
+        for (let i = 0; i < buf.length; i++) out += ('0' + buf[i].toString(16)).slice(-2);
+        return out;
+      } catch (e) { /* 再往下退 */ }
+      let out = '';
+      for (let i = 0; i < 32; i++) out += Math.floor(Math.random() * 16).toString(16);
+      return out;
+    }
+
+    // 【把界面从「思考中」放回来】只动界面，不碰请求：
+    // 这里不会重发、也不会中止那次已经发出去的 POST（浏览器表单导航没法中止）。
+    function releaseComposer() {
+      if (watchdog !== null) { window.clearTimeout(watchdog); watchdog = null; }
+      sending = false;
+      input.readOnly = false;
+      input.classList.remove('waiting');
+      button.disabled = false;
+      button.innerHTML = buttonLabel;
+      pending.style.display = 'none';
+      status.style.display = 'none';
+    }
+
     if (window.matchMedia('(min-width: 901px)').matches) input.focus();
 
     document.querySelectorAll('.starter').forEach(function (starter) {
@@ -120,12 +316,60 @@
       });
     });
 
+    // 【用户把输入框清空 = 这条问题不要了】刷新时不要再把它塞回来。
+    // 只在用户真的动了输入框时才触发：脚本自己写 input.value 不会触发 input 事件，
+    // 所以下面「把问题放回输入框」那一步不会被自己踩掉。
+    input.addEventListener('input', function () {
+      if (input.value.trim() === '') dropPending();
+    });
+
+    // 【页面一加载，先跟服务端对一次账】
+    // 上次那条问题，服务端到底记下来没有？只有服务端知道，所以以它这次渲染的条数为准。
+    (function reconcilePending() {
+      const pending = readPending();
+      const plan = planPendingRestore(input.value, pending, SERVER_USER_COUNT,
+                                      JUST_DELETED, LEARNER_BOUND, DATA_EPOCH);
+      if (plan.clear) dropPending();
+      if (plan.answered) {
+        // 只有「当时报过等待超时」（stalled）才需要解释一句；正常答完的那次不用打扰用户。
+        if (pending && pending.stalled === true) {
+          notice('上次那条问题其实已经答完了 —— 答案就在上面的历史里，不用再发一次。');
+        }
+      } else if (plan.restore !== null) {
+        input.value = plan.restore;
+        notice('上次那条问题在服务端还【没有】记录：那次发送可能没送到，也可能当时就中断了。' +
+               '结果未知，所以这里不会自动重发。文字已经放回输入框 —— 要再试一次的话，' +
+               '同一条问题的重发按同一次尝试处理，不会重复回答。');
+        input.focus();
+        input.setSelectionRange(input.value.length, input.value.length);
+      }
+    })();
+
+    // 【从前进/后退缓存里回来】页面还停在「思考中」的样子，但那次请求早已不可知。
+    // 和看门狗一样：只把界面收回来，绝不自己重发。
+    window.addEventListener('pageshow', function (event) {
+      if (event.persisted && sending) {
+        const pending = readPending();
+        if (pending) { pending.stalled = true; writePending(pending); }
+        releaseComposer();
+        notice('这一页是从浏览器缓存里恢复的，刚才那次提问的结果无法确认。' +
+               '文字仍在输入框里；要看结果的话请刷新页面 —— 这里不会自动重发。', true);
+      }
+    });
+
     form.addEventListener('submit', function (event) {
       if (sending) {
         event.preventDefault();
         return;
       }
       sending = true;
+      // 【记下「这一条我是以什么身份发出去的」】文字 + 这次尝试的 id + 我看到的条数。
+      // 响应丢了、或者页面被刷新之后，就靠这三样东西跟服务端对账：
+      // 这条到底答完没有、要不要把文字放回输入框、重发会不会变成两次调用。
+      const attempt = planAttempt(readPending(), input.value, newAttemptId(),
+                                  SERVER_USER_COUNT, LEARNER_BOUND, DATA_EPOCH);
+      writePending(attempt);
+      document.getElementById('attempt-input').value = attempt.token;
       input.readOnly = true;  // disabled inputs are omitted from the POST body.
       input.classList.add('waiting');
       button.disabled = true;
@@ -133,6 +377,19 @@
       pending.style.display = 'flex';
       status.style.display = 'block';
       box.scrollTop = box.scrollHeight;
+      // 【看门狗】服务端在预算内一定会给出一个页面（成功 / 错误的渲染）。
+      // 超过「预算 + 余量」还没换页，只可能是请求根本没回来：这时把界面放回来。
+      // 【这里不重发】—— 那次 POST 可能仍在服务端跑着（客户端没法中止它），
+      // 也可能早就答完了、只是响应丢了。两种情况下「再发一次」都可能变成第二次调用，
+      // 所以这里只把「结果未知」说清楚，并给一个手动刷新的入口让用户自己去看。
+      watchdog = window.setTimeout(function () {
+        const waiting = readPending();
+        if (waiting) { waiting.stalled = true; writePending(waiting); }
+        releaseComposer();
+        notice('等了 ' + STALL_SECONDS + ' 秒还没有结果：这一条可能已经在服务端答完了' +
+               '（只是响应没回来），也可能没有 —— 结果未知，这里不会替你猜、也不会自动重发。' +
+               '点「刷新看看结果」：答完了就直接看回答，没答完你的问题会留在输入框里。', true);
+      }, STALL_SECONDS * 1000);
     });
   </script>
 </body>

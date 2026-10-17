@@ -4,6 +4,7 @@
 import os                                           # 读环境变量、拼路径
 import uuid                                         # 生成随机的「会话 ID」
 import time                                         # 给每个请求计时（日志里要记耗时）
+import hashlib                                      # 尝试令牌只记问题的【摘要】，不记原文
 import hmac                                         # CSRF token 用常数时间比较，别用 == 比
 import secrets                                      # 生成 CSRF token 用的密码学安全随机源
 import sqlite3                                      # Python 自带的轻量数据库，不用额外安装任何东西
@@ -208,6 +209,13 @@ MODEL_REQUEST_TIMEOUT_SECONDS = _read_positive_int(
     "MODEL_REQUEST_TIMEOUT_SECONDS", 30, minimum=5, maximum=60)
 MODEL_RETRY_COOLDOWN_SECONDS = 30
 
+# 【页面上那个「等太久」的看门狗，比服务端预算多等多久】
+# 服务端在 MODEL_REQUEST_TIMEOUT_SECONDS 之内【一定会】给出一个页面（成功或错误）。
+# 所以页面只要多等一段余量还没换页，就只可能是「请求根本没回来」。
+# 这两个数字是配套的：余量必须明显大于「服务端处理完 + 响应在路上」的时间，
+# 否则看门狗会抢在正常回答前面报错。它由服务端交给页面，页面不另写一个数字。
+MODEL_STALL_MARGIN_SECONDS = 15
+
 # 请求体大小上限（64 KB）。
 # 【它和 MAX_QUESTION_LENGTH 管的不是一回事】
 # MAX_QUESTION_LENGTH 管「问题有多少个字」，但要先把请求体读进来才知道有多少字。
@@ -339,6 +347,136 @@ client = BoundedModelClient(api_key=API_KEY, base_url=BASE_URL,
 _lock = threading.Lock()
 _model_retry_after = 0.0                            # 只在持锁期间读写；故障后暂停新模型请求
 
+# 【防止重复提问的第二道防线：尝试令牌】—— 补上那把锁够不着的那一块。
+#
+# 【锁挡不住的场景】用户的请求已经发到服务端、模型也答完了、库也写好了，
+# 偏偏响应在回程路上丢了（断网、切后台、隧道抖动）。这时锁早就释放了，
+# 用户看到页面还停在「思考中」，再点一次「发送」——第二次会畅通无阻地再问一遍：
+# 多花一次额度，历史里多出一对一模一样的问答，而且他自己完全看不出来。
+#
+# 【怎么挡】页面每次点「发送」都带一个随机的 attempt id（同一个问题重发时沿用同一个）。
+# 只有【真的答完并写进库】的那次尝试才会被记下来。于是：
+#   · 这个 attempt 已经答完了 → 不再调模型，直接把他已经有答案的那个页面还给他；
+#   · 这个 attempt 没答完（失败、没到、或者还在跑）→ 照常处理，不耽误他拿到答案。
+# 「连着问两次一模一样的问题」不受影响：那是两次【不同】的尝试，页面会给新的 id。
+#
+# 【记下来的不止「发生过」这三笔，还有两个凭据】见 _attempt_already_answered：
+#   · 那条问题文字的摘要 —— 同一个身份牌配上【另一条问题】时，那是新问题，绝不吞掉；
+#   · 那条用户消息在库里的 id —— 回答已经不在了（比如刚清空过个人数据），身份牌就作废。
+# 少了这两样，身份牌会变成一句无法反驳的断言：「我答过了」，哪怕回答早就被删了。
+#
+# 【为什么放在内存里，不写进数据库】它只是「刚刚这几分钟发生过什么」的短期记忆，
+# 天然会过期；写进库反而要改表结构。内存的前提是【单进程】——这一点和上面那把锁
+# 完全一样，部署方式就是 --workers 1。进程重启会丢，这是可以接受的：
+# 重启后用户的页面也早就是旧页面了，而且这条只是第二道防线，
+# 客户端还有一道（刷新后看历史里到底有没有这一条）。
+ATTEMPT_ID_MAX_LENGTH = 64
+ATTEMPT_ID_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+COMPLETED_ATTEMPT_TTL_SECONDS = 1800               # 半小时：用户重发基本都在这之内
+COMPLETED_ATTEMPT_MAX = 200                        # 内存里的条数上限，超了就丢最旧的
+_completed_attempts = {}                           # (会话, attempt) -> (时刻, 消息id, 问题摘要)
+                                                   # 只在持锁期间读写
+
+
+def _read_attempt_id(raw):
+    """把表单里的 attempt 收拾成一个可信的短 id；不合格就当没带。
+
+    【为什么要挑字符】这个值会被当作字典的键长期留在内存里。不设上限的话，
+    别人可以直接 POST 一个几 MB 的字符串来占内存。所以只接受长度和字符集
+    都在预期内的一小段文本，其余一律当作「没带」——宁可少挡一次，不可留个洞。
+    """
+    if not isinstance(raw, str):
+        return ""
+    token = raw.strip()
+    if not 0 < len(token) <= ATTEMPT_ID_MAX_LENGTH:
+        return ""
+    for char in token:
+        if char not in ATTEMPT_ID_CHARS:
+            return ""
+    return token
+
+
+def _question_digest(question):
+    """问题文字的摘要。【只记摘要，不记原文】—— 内存里不该留下一份用户说过的话。
+
+    这里不需要防碰撞攻击：摘要只跟同一条问题自己比，
+    对不上就当成新问题去正常回答（方向是安全的）。
+    """
+    return hashlib.sha256(question.encode("utf-8")).hexdigest()
+
+
+def _forget_stale_attempts(now):
+    """清掉过期的记忆。过期的东西再也不会被问到，留着只是占内存。"""
+    for key in [k for k, record in _completed_attempts.items()
+                if now - record[0] > COMPLETED_ATTEMPT_TTL_SECONDS]:
+        _completed_attempts.pop(key, None)
+
+
+def _answered_message_exists(message_id):
+    """那条「用户消息」现在还在不在库里。只有它还在，身份牌才算数。
+
+    【为什么非查不可】「清空全部个人数据」会把消息整行删掉，而身份牌记在内存里，
+    删除流程碰不到它。只凭内存说话的话：用户删完数据、又发一次同一条问题，
+    就会被判成「这次已经答过了」—— 直接把他送回首页，可首页上什么都没有，
+    问题就这么被静默吃掉了（而且这个 sid 不会轮换，所以键还对得上，见 _ensure_session_id）。
+    查一次主键，代价极小：只有重发、而且身份牌本来就对得上时才走到这里。
+
+    【读库失败一律按「查不到」算】宁可多问一次模型，也不能吞掉用户的问题。
+    """
+    conn = None
+    try:
+        conn = _connect()                 # 连不上也要算「查不动」，不能让它冒出去
+        row = conn.execute(
+            "SELECT 1 FROM messages WHERE id = ? AND role = 'user'", (message_id,)
+        ).fetchone()
+        return row is not None
+    except Exception as exc:
+        log_event("attempt_check_failed", error_type=type(exc).__name__)
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _attempt_already_answered(sid, attempt, question):
+    """这次尝试是不是【已经答完、而且那份回答现在还在库里】。只在持锁期间调用。
+
+    三个条件缺一不可，每一个都对应一种「不能吞掉用户问题」的场合：
+      · 记过这个身份牌     —— 没记过就是第一次发，照常处理；
+      · 是【同一条问题】   —— 同一个身份牌配了别的文字（页面出 bug、或者有人手搓请求），
+                              那是新问题，照常处理；
+      · 回答【还在库里】   —— 已经不在了（清空过个人数据），身份牌跟着作废，照常处理。
+    """
+    if not attempt:
+        return False
+    now = time.monotonic()
+    _forget_stale_attempts(now)
+    key = (sid, attempt)
+    record = _completed_attempts.get(key)
+    if record is None:
+        return False
+    _recorded_at, message_id, digest = record      # 时间戳只给「过期清理」用，这里不看
+    if digest != _question_digest(question):
+        log_event("attempt_text_mismatch")
+        return False
+    if not _answered_message_exists(message_id):
+        log_event("attempt_answer_missing")
+        _completed_attempts.pop(key, None)
+        return False
+    return True
+
+
+def _remember_answered_attempt(sid, attempt, message_id, question):
+    """把这次尝试记下来。只在【答案真的写进库之后】调用，且只在持锁期间。"""
+    if not attempt:
+        return
+    now = time.monotonic()
+    _forget_stale_attempts(now)
+    _completed_attempts[(sid, attempt)] = (now, message_id, _question_digest(question))
+    while len(_completed_attempts) > COMPLETED_ATTEMPT_MAX:
+        _completed_attempts.pop(next(iter(_completed_attempts)), None)   # dict 保序：先丢最旧的
+
 
 # ===================== 数据库相关的三个函数 =====================
 
@@ -360,6 +498,11 @@ def init_db():
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id)"
             )
+            # 【数据代号表 session_epochs】由 profile_store.ensure_schema 建（在下面那一行）——
+            # 因为「删除数据时轮换代号」这件事发生在 clear_all_data 那个事务里，
+            # 读写和建表放在同一处才不会漂。它为什么必须落在库里（不能放在 cookie 里），
+            # 见 app.py 的 _data_epoch()。
+            #
             # 【每日额度表】一天一行，记这一天已经用掉多少次模型调用。
             #
             # 【为什么存在数据库里，而不是放在内存的一个变量里】
@@ -436,22 +579,29 @@ def load_recent_messages(session_id, limit=None):
 
 
 def save_exchange(session_id, question, answer):
-    """把「一问一答」两条一起写进数据库。"""
+    """把「一问一答」两条一起写进数据库。返回【用户那条消息的 id】。
+
+    【为什么要返回 id】调用方（提问路径）拿它当「这次尝试的凭据」存进内存：
+    以后要判断「这份回答还在不在」时，就查这一行的主键在不在。
+    表用的是 AUTOINCREMENT，id 不会被回收再利用 —— 所以「查不到」就一定是真没了。
+    """
     now = datetime.now().isoformat(timespec="seconds")   # 比如 2026-09-15T14:04:02
     conn = _connect()
     try:
         with conn:                                    # 用事务包住两条插入：要么都成功，要么都不写。
                                                       # 避免出现「只有问题没有回答」这种半截记录
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
                 (session_id, "user", question, now),
             )
+            question_id = cursor.lastrowid
             conn.execute(
                 "INSERT INTO messages (session_id, role, content, created_at) VALUES (?, ?, ?, ?)",
                 (session_id, "assistant", answer, now),
             )
     finally:
         conn.close()
+    return question_id
 
 
 def _utc_day(now=None):
@@ -691,11 +841,118 @@ def _ensure_session_id():
     return session["sid"]
 
 
-def _render(sid, question="", error="", status=200):
-    """渲染首页。把「读历史 + 传参数」收在一处，几个分支共用。"""
-    return render_template("index.html", history=load_history(sid),
+def _data_epoch(session_id):
+    """这个浏览器名下这一份数据的代号。**只在数据真的被清空时**换一个。
+
+    【它是干什么用的】页面上会存一条「已经发出去、但还没得到确认」的问题
+    （见 templates/index.html 里那段说明）。那条记录指的是**某一份数据**：
+    它说的那个回答，当时是记在这个浏览器名下的。数据被整体清空之后，这条记录
+    就该就地作废 —— 否则用户刚说完「全部删掉」，过一会儿刷新，那句问题又冒回输入框里，
+    而它所指向的回答早就不存在了。
+
+    【为什么不能只看「历史条数」和「还绑着没绑着」】两条老线索都会被绕开：
+      · 条数 —— 暂存的时候基准是 0（那是这个浏览器问的第一句、回答还没落地），
+        删完还是 0，两头一样。「变短了」这条线索在这种情形下不存在。
+      · 绑定 —— 删除必然解绑，但用户完全可以**再拿一张新码重新绑定**。
+        一旦重新绑上，「原先绑着、现在不绑了」也就认不出来了。
+      · 那个一次性的 just_deleted 信号只发给删除之后的**下一个页面**。
+        同一台浏览器的**别的标签页**（或者用户重新输码那一次跳转）会先把它用掉，
+        这个标签页过一会儿才刷新时，信号早没了。
+
+    【代号为什么兜得住】它换的时刻就是「数据被清空」那一刻（在清空那个事务里一起提交，
+    见 profile_store.clear_all_data），而且：
+      · **存在库里**，不在 cookie 里 —— 每次渲染都从这里读，见下面「为什么不能放 cookie」；
+      · **不是一次性的** —— 谁先读到都行，读几次都一样；
+      · **和绑定无关** —— 重新绑上也不会把它换回去。
+    页面把「发出去的时候看到的代号」记在那条记录里；下次打开一比对，对不上就说明
+    这条记录指的是已经被删掉的那份数据，直接丢掉（见 index.html 里的 planPendingRestore）。
+
+    【为什么不能放在会话 cookie 里 —— 这是踩过的坑】
+    放 cookie 里的话，代号就只能靠「浏览器手里的那份 cookie 是最新的」成立。
+    可是**响应会乱序到达**：删除之前就发出去的那个请求（比如一次很慢的提问，
+    或者另一个标签页正在渲染的那一页），手里拿的是【删除之前的】cookie，
+    它的 Set-Cookie 一落地，就把刚换好的新代号盖回成旧值。
+    结果：代号退回旧值、绑定已经是新的（重绑过）、历史条数是 0、一次性信号也用掉了 ——
+    四条线索全都不作声，那句已经被删掉的问题又冒回输入框。
+    也不能靠「关掉会话 cookie 的自动刷新」了事：那只堵住一种写法，
+    更早发出、更晚返回的写请求照样能把整份 cookie 盖回去。
+    放进库里就没有这个问题：**代号只由服务端在渲染时按 session_id 读出来**，
+    迟到的请求能改的只有它自己那个 cookie，改不动这一行。
+
+    【为什么不存在「被旧写入盖回去」】整张表只有两个写入口：这里（只在没有这一行时
+    新建一个全新的随机串）和 clear_all_data（整个事务里轮换）。两边都写不出一个旧值，
+    迟到的请求也不碰这张表。
+
+    【并发新建】两个请求同时给一个新会话建行：用 INSERT OR IGNORE 加一次回读，
+    以先写进去的那个为准 —— 两边拿到的是同一个代号，不会各拿一个。
+
+    【它照不到的一件事，说清楚】「删除之前就已经渲染好、删除之后才显示出来」的那个页面
+    —— 那一页上的所有事实都是旧的（代号、条数、绑定），代号当然也是旧的。
+    那是浏览器自己决定「先显示哪一页」的顺序，服务端管不着。影响也仅限于那一页：
+    它按当时的事实把问题放回输入框（和删除之前的行为一模一样），
+    用户下一次打开（或刷新）就会拿到新代号，那条记录随即作废。
+    页面里没有任何网络代码去和服务端复核 —— 这是刻意的，见 index.html 的说明。
+    """
+    conn = _connect()
+    try:
+        row = conn.execute(
+            "SELECT data_epoch FROM session_epochs WHERE session_id = ?", (session_id,)
+        ).fetchone()
+        if row is None:
+            with conn:                                # 事务：要么插进去，要么别人已经插了
+                conn.execute(
+                    "INSERT OR IGNORE INTO session_epochs (session_id, data_epoch, rotated_at) "
+                    "VALUES (?, ?, ?)",
+                    (session_id, uuid.uuid4().hex, datetime.now().isoformat(timespec="seconds")),
+                )
+            row = conn.execute(
+                "SELECT data_epoch FROM session_epochs WHERE session_id = ?", (session_id,)
+            ).fetchone()
+        return row[0]
+    finally:
+        conn.close()
+
+
+def _render(sid, question="", error="", status=200, just_deleted=False):
+    """渲染首页。把「读历史 + 传参数」收在一处，几个分支共用。
+
+    【为什么要把服务端预算也传给页面】页面上那个「等待超时」的看门狗必须比服务端
+    的硬超时【晚】才动手 —— 否则它会在服务端还在正常处理时就抢先报错。
+    预算是可配置的（MODEL_REQUEST_TIMEOUT_SECONDS），所以让模板拿到真值，
+    而不是在脚本里另写一个数字。等待余量（MODEL_STALL_MARGIN_SECONDS）同理，
+    两个数字是一套的，分开写迟早会漂。
+
+    【为什么还要告诉页面「历史里有几条用户消息」】
+    页面刷新之后要回答一个问题：「我刚发的那条，服务端到底记下来没有？」
+    靠【条数】判断，不能靠文字：用户完全可能连着问两次一模一样的问题，
+    那时最后一条消息的文字一样，条数却会多 —— 只看文字就会认错。
+    条数由服务端数出来（不是页面自己数 DOM），页面只负责比较前后两个数。
+
+    【为什么还要说「刚刚清空过个人数据」「这个会话还绑着学习者吗」「这份数据的代号」】
+    清空之后历史是空的，页面上什么都看不出来 —— 但用户浏览器里可能还留着一条
+    「结果未知、暂时没答完」的问题（见 index.html 里那段说明）。那条问题必须就此作废：
+    它说的那份回答已经不存在了。页面靠四件事认出这件事：
+      · 代号对不上    —— 删除时换掉的「数据代号」（见 _data_epoch）。这是**最硬**的一条：
+                        刷新还在、各标签页共用、重新绑上也换不回去。别的标签页删完、
+                        这个标签页过一会儿才刷新，靠的就是它；
+      · just_deleted  —— 一次性的信号，本标签页删完跟着重定向回来的那条路；
+      · 条数变少      —— 没有信号或旧暂存记录没有代号时仍可用的补充线索，见模板里的规则；
+                         已关联的其他设备会话也会在删除事务中轮换代号，不能笼统说它们不会变；
+      · 绑定没了      —— 删除必然解绑（匿名访客根本没有数据可删），所以「原先绑着、
+                        现在不绑了」也是一条耐久证据 —— 但它挡不住「删完又用新码绑回来」。
+    """
+    history = load_history(sid)
+    learner_id = _learner_id_for(sid)
+    return render_template("index.html", history=history,
                            question=question, error=error,
-                           learner_id=_learner_id_for(sid)), status
+                           model_timeout_seconds=MODEL_REQUEST_TIMEOUT_SECONDS,
+                           stall_margin_seconds=MODEL_STALL_MARGIN_SECONDS,
+                           user_message_count=sum(1 for msg in history
+                                                  if msg["role"] == "user"),
+                           just_deleted=just_deleted,
+                           data_epoch=_data_epoch(sid),
+                           learner_bound=learner_id is not None,
+                           learner_id=learner_id), status
 
 
 # ===================== CSRF 保护 =====================
@@ -914,12 +1171,26 @@ def index():                                          # 用户每次打开页面
 
     question = ""                                     # 学生这次问的话
     error = ""                                        # 要显示给用户的错误提示
+    just_deleted = False
+
+    if request.method == "GET":
+        # 【刚刚清空过个人数据】这是给页面用的一次性信号（见 profile_delete）。
+        # 读到就抹掉：只生效这一次，否则以后每次刷新都会被当成「刚删过」。
+        # 页面拿到它会做一件事：把存在浏览器里的那条「待确认的问题」丢掉 ——
+        # 用户刚说了「全部删掉」，那条问题绝不能过一会儿又从输入框里冒出来。
+        # 【为什么要先判存在再 pop】直接 pop 的话，Flask 认为会话每次都被改过了，
+        # 于是每个页面都要重发一遍 cookie（内容没变）。没必要。
+        if "data_just_deleted" in session:
+            just_deleted = bool(session.pop("data_just_deleted"))
 
     if request.method == "POST":
         # 【超大的请求已经在更早的地方被拦掉了】
         # 请求体超过 MAX_CONTENT_LENGTH 的会被上面的 413 处理函数接走，根本走不到这里。
         # 所以到这一步，question 一定是「装得进内存」的。
         question = request.form.get("question", "").strip()
+        # 这一次「发送」的身份牌（见 _completed_attempts 的说明）。
+        # 老页面、或者浏览器没跑脚本时不会带这个字段，那就当作没带，一切照旧。
+        attempt = _read_attempt_id(request.form.get("attempt", ""))
 
         # 【第一道关：空问题】空字符串在 Python 里算 False。
         # 空输入不检索、不调模型、不写库、【也不消耗额度】。
@@ -942,6 +1213,14 @@ def index():                                          # 用户每次打开页面
             # try ... finally：不管中间成功还是失败，最后都必须把锁还回去。
             # 失败时忘了还锁的话，这把锁就永远拿不回来了，之后所有提问都会被拒绝。
             try:
+                # 【这次尝试是不是已经答完了】（第二道防线，见 _completed_attempts）
+                # 放在冷却判断【之前】：已经答完的问题随时可以拿出来看，
+                # 不能被「服务刚刚出过错、先歇半分钟」这条规矩连坐。
+                # 这里不占额度、不调模型、不写库 —— 只是把已经存在的那个页面还给他。
+                if _attempt_already_answered(sid, attempt, question):
+                    log_event("duplicate_attempt_suppressed")
+                    return redirect(url_for("index"))
+
                 if time.monotonic() < _model_retry_after:
                     log_event("model_cooldown")
                     return _render(sid, question=question,
@@ -1042,7 +1321,12 @@ def index():                                          # 用户每次打开页面
                 # 【标记跟着档案的语言偏好走】选了全英文的人，标签也用英文
                 # （默认和中文模式下还是原来那句中文，行为零变化）
                 answer = format_answer_with_sources(result, general_answer_marker(preferences))
-                save_exchange(sid, question, answer)
+                question_id = save_exchange(sid, question, answer)
+
+                # 【答完并入库了，才把这次尝试记下来】顺序不能反：
+                # 先记后写的话，万一写库失败，用户再发一次就会被告知「已经答过了」，
+                # 而历史里其实什么都没有 —— 那等于把他的问题吃掉了。
+                _remember_answered_attempt(sid, attempt, question_id, question)
 
                 # 【日志只记统计量】决策、引用数、耗时、上下文的条数和字符数。
                 # 上下文【只记这两个数字】，历史正文一个字都不许进日志 ——
@@ -1084,7 +1368,7 @@ def index():                                          # 用户每次打开页面
                 _lock.release()                                              # 无论成功还是出错，都把锁还回去
 
     # 渲染页面。历史每次都从数据库读，所以重启程序也不会丢。
-    return _render(sid, question=question, error=error)
+    return _render(sid, question=question, error=error, just_deleted=just_deleted)
 
 
 # ===================== 管理入口：发码 / 撤销 =====================
@@ -1455,6 +1739,20 @@ def profile_delete():
     log_event("profile_deleted",
               deleted_sessions=stats["sessions"],
               deleted_messages=stats["messages"])
+
+    # 【给下一个页面的一次性信号】告诉它「刚刚有人清空过数据」。
+    # 页面用这个信号把浏览器里那条「待确认的问题」丢掉：那条记录指的是刚刚被删掉的回答，
+    # 留着它，用户下次打开首页就会看见自己刚删掉的那句问题又冒回输入框里。
+    # 放在 session 里（跟着重定向走一趟），index() 读到就抹掉，只生效一次。
+    session["data_just_deleted"] = True
+
+    # 【代号在哪里换】不在这里 —— 它在清空数据那个事务里换，和「消息真的被删掉」
+    # 一起提交（见 profile_store.clear_all_data 里的第 ③ 步）。两点原因：
+    #   · 分开做的话，中间出一次错就会留下「数据还在、代号先换了」——
+    #     用户那条还没答完的问题被白白作废，而他的数据其实没事；
+    #   · 而且它必须落在库里，不能放在这个 cookie 里。放 cookie 里的话，
+    #     删除之前就发出去、还在路上的那个响应会把刚换好的新代号盖回旧值 ——
+    #     详见 _data_epoch 那段说明。
 
     # 这个浏览器现在已经不是那位学习者了（绑定被删），回首页就是匿名状态。
     return redirect(url_for("index"))
