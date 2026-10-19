@@ -386,6 +386,55 @@ class TestDecisionBoundaryPrompt(RagTestCase):
         self.assertNotIn("询问课程的业务事实，而资料里没有记录", self.system_prompt())
 
 
+# ===================== 5b-1. 作文任务跨轮续接 =====================
+# 这些测试只证明规则和两轮对话确实发给模型，及 general_answer 的结构能通过校验；
+# 假客户端不会判断写作任务，不能据此声称真实模型已不再拒答。
+class TestWritingTaskContinuationPrompt(RagTestCase):
+    def sent_messages(self):
+        self.fake.reply = json.dumps({
+            "decision": "general_answer", "answer": "An English essay draft.",
+            "citations": [],
+        }, ensure_ascii=False)
+        previous = [
+            {"role": "user", "content": "我给你一个作文题目，你可以写出来吗？"},
+            {"role": "assistant", "content": "可以，把题目发给我，我来写一篇。"},
+        ]
+        result, diagnostic = rag.generate_answer_with_context_and_profile(
+            "以圣经中的摩西为题，介绍他是谁、做过什么、有什么影响。",
+            [dict(c) for c in CHUNKS], previous, None, self.fake, MODEL)
+        self.assertEqual(len(self.fake.calls), 1)
+        return result, diagnostic, self.fake.calls[0]["messages"]
+
+    def test_writing_topic_and_followup_are_explicitly_in_scope(self):
+        _, _, messages = self.sent_messages()
+        system = messages[0]["content"]
+        self.assertIn("写作任务按任务判断，不按题材判断", system)
+        self.assertIn("用户请你写作文、文章或范文", system)
+        self.assertIn("人物、历史、文化、宗教等题材本身不是拒答理由", system)
+        self.assertIn("这一轮用户接着给题目或写作要点", system)
+        self.assertIn("不要因为这一轮没再写「英文作文」几个字，就改判 refuse", system)
+        self.assertNotIn("摩西", system, "事故题目不能被写进 system 提示词")
+
+    def test_the_actual_second_turn_contains_the_promise_and_topic(self):
+        _, _, messages = self.sent_messages()
+        user = messages[1]["content"]
+        self.assertLess(user.index("我给你一个作文题目"), user.index("可以，把题目发给我"))
+        self.assertLess(user.index("可以，把题目发给我"), user.index("圣经中的摩西"))
+        self.assertIn("正在继续什么任务", messages[0]["content"])
+
+    def test_draft_default_does_not_weaken_safety_or_citations(self):
+        result, diagnostic, messages = self.sent_messages()
+        system = messages[0]["content"]
+        self.assertIn("直接给可修改的初稿", system)
+        self.assertIn("作文正文用英文", system)
+        self.assertIn("先前的承诺不能越过这些边界", system)
+        self.assertIn("general_answer 尤其要注意", system)
+        self.assertIn("绝对不要】用你自己的知识去编造课程的业务事实", system)
+        self.assertEqual(diagnostic, rag.DIAG_OK)
+        self.assertEqual(result["decision"], "general_answer")
+        self.assertEqual(result["citations"], [])
+
+
 # ===================== 5b-2. 教学准确性提示词 =====================
 #
 # 【这一组能守住什么、守不住什么 —— 必须说清楚，别读错】
