@@ -435,6 +435,96 @@ class TestWritingTaskContinuationPrompt(RagTestCase):
         self.assertEqual(result["citations"], [])
 
 
+# ===================== 5b-1a. 短篇英文作文的质量指导 =====================
+# 只验证写作规则确实进入实际发送的 system 消息，及原有安全边界仍在。
+# 假客户端不会写作文；这些绿灯不能证明真实文章质量提高。
+class TestEssayQualityGuidancePrompt(RagTestCase):
+    def sent_system(self):
+        self.fake.reply = json.dumps({
+            "decision": "general_answer", "answer": "A short draft.", "citations": [],
+        })
+        result, diagnostic = rag.generate_answer_with_diagnostics(
+            "请写一篇关于校园图书馆的短篇英文说明文。", [], self.fake, MODEL)
+        self.assertEqual(diagnostic, rag.DIAG_OK)
+        self.assertEqual(result["decision"], "general_answer")
+        self.assertEqual(len(self.fake.calls), 1)
+        return self.fake.calls[0]["messages"][0]["content"]
+
+    def test_guidance_is_scoped_to_essay_requests_and_delivers_the_draft(self):
+        system = self.sent_system()
+        self.assertIn("只在用户要求写作文、文章或范文时", system)
+        self.assertIn("先交成稿", system)
+        self.assertIn("不要用写作模板或写作建议代替正文", system)
+        self.assertIn("作文正文用英文", system)
+
+    def test_quality_requires_distinct_paragraphs_and_supported_points(self):
+        system = self.sent_system()
+        self.assertIn("各段承担不同任务", system)
+        self.assertIn("说明文、叙事文与议论文的写法可以不同", system)
+        self.assertIn("具体、可信的事例或细节支撑", system)
+        self.assertIn("它如何说明该观点", system)
+        self.assertIn("不能核实的广泛影响不要写成确定事实", system)
+
+    def test_self_check_does_not_replace_essay_or_append_padding(self):
+        system = self.sent_system()
+        self.assertIn("交稿前自查，不展示清单", system)
+        self.assertIn("只输出完成的作文", system)
+        self.assertIn("用户同时要求讲解时，才在正文后简短说明写法", system)
+        self.assertIn("不要为凑延伸而在作文后硬塞无关的固定搭配", system)
+
+    def test_explicit_word_limit_overrides_profile_and_reference_length(self):
+        """只证明字数优先级进入 system 消息，不证明真实模型能数准词。"""
+        system = self.sent_system()
+        section = system.split("【英文作文专用：", 1)[1].split("输出要求：", 1)[0]
+        word_rule = section.split("- 【指定字数优先】", 1)[1].split("\n- 【", 1)[0]
+        self.assertIn("词数范围或上限", word_rule)
+        self.assertIn("按英文单词数自查", word_rule)
+        self.assertIn("删改到范围内", word_rule)
+        self.assertIn("档案选「详细」", word_rule)
+        self.assertIn("参考范文只供学习写法", word_rule)
+        self.assertIn("没指定字数时才使用短篇范文的默认长度", word_rule)
+
+    def test_explicit_range_adds_a_concrete_target_only_to_this_user_request(self):
+        self.fake.reply = json.dumps({
+            "decision": "general_answer", "answer": "A short draft.", "citations": [],
+        })
+        question = "Write an English essay of 140–190 words about schools."
+        rag.generate_answer_with_diagnostics(question, [], self.fake, MODEL)
+        system, user = [m["content"] for m in self.fake.calls[0]["messages"]]
+        self.assertIn(question, user)
+        self.assertIn("题目要求 140–190 个英文词", user)
+        self.assertIn("正文写到约 150 词", user)
+        self.assertNotIn("正文写到约 150 词", system)
+        self.fake.calls.clear()
+        rag.generate_answer_with_diagnostics(
+            "How can I improve my essay?", [], self.fake, MODEL)
+        self.assertNotIn("字数执行提醒", self.fake.calls[0]["messages"][1]["content"])
+
+    def test_essay_only_output_overrides_generic_extensions(self):
+        """只证明作文专用优先级下发，不证明模型真的只交正文。"""
+        system = self.sent_system()
+        section = system.split("【英文作文专用：", 1)[1].split("输出要求：", 1)[0]
+        delivery_rule = section.split("- 【只交用户要的成稿】", 1)[1].split("\n- 【", 1)[0]
+        self.assertIn("answer 字段只放作文正文", delivery_rule)
+        self.assertIn("不加开场白、未要求的标题、写法解析", delivery_rule)
+        self.assertIn("优先于上面的「适合时补 1–2 条延伸」", delivery_rule)
+        self.assertIn("用户同时要求讲解时，才在正文后简短说明写法", delivery_rule)
+        self.assertIn("不要因此删掉作文必需的例子和细节", delivery_rule)
+
+    def test_essay_fix_does_not_embed_the_exploratory_test_prompt(self):
+        system = self.sent_system()
+        for text in ("Teenagers are too young", "technology, the environment", "140–190"):
+            self.assertNotIn(text, system)
+
+    def test_writing_guide_is_not_a_factual_or_citable_source(self):
+        system = self.sent_system()
+        self.assertIn("不是课程事实或可引用的资料", system)
+        self.assertIn("四分类、课程业务事实和引用规则仍照常适用", system)
+        self.assertIn("citations 必须是空数组 []", system)
+        self.assertIn("绝对不许自己编造文件名或标题", system)
+        self.assertNotIn("摩西", system, "具体验收题不能被写进 system 提示词")
+
+
 # ===================== 5b-2. 教学准确性提示词 =====================
 #
 # 【这一组能守住什么、守不住什么 —— 必须说清楚，别读错】

@@ -41,6 +41,11 @@ class BoundedModelClient:
         self.chat = self
         self.completions = self
 
+    def with_timeout(self, timeout):
+        """Use a shorter deadline for a follow-up call; do not mutate the first client."""
+        return BoundedModelClient(api_key=self._api_key, base_url=self._base_url,
+                                  timeout=timeout)
+
     def create(self, *, model, messages):
         self.last_error_code = None
         payload = json.dumps({
@@ -109,7 +114,8 @@ def _worker():
         with OpenAI(api_key=payload["api_key"], base_url=payload["base_url"],
                     timeout=payload["timeout"], max_retries=0) as client:
             response = client.chat.completions.create(
-                model=payload["model"], messages=payload["messages"])
+                model=payload["model"], messages=payload["messages"],
+                response_format={"type": "json_object"})
             content = response.choices[0].message.content
         result = {"ok": True, "content": content}
     except Exception as exc:

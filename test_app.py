@@ -117,7 +117,10 @@ class FakeCompletions:
         self.owner = owner                  # 回头去主人那里记一笔「我被调用过」
     def create(self, model, messages, **kwargs):
         self.owner.calls.append({"model": model, "messages": messages})   # 记下调用参数，方便断言
-        return FakeResponse(self.owner.reply)
+        reply = self.owner.replies.pop(0) if self.owner.replies else self.owner.reply
+        if isinstance(reply, BaseException):
+            raise reply
+        return FakeResponse(reply)
 
 class FakeChat:
     def __init__(self, owner):
@@ -127,7 +130,13 @@ class FakeClient:
     def __init__(self):
         self.calls = []                     # 每次被调用都记在这里，用来证明「调了几次」「传了什么」
         self.reply = rag_reply()            # 默认返回一个合法的 RAG 结果
+        self.replies = []                    # 可选：逐次返回不同草稿，离线测一次改写
+        self.rewrite_timeouts = []
         self.chat = FakeChat(self)
+
+    def with_timeout(self, timeout):
+        self.rewrite_timeouts.append(timeout)
+        return self
 
 
 # ===================== 测试基类 =====================
@@ -727,6 +736,182 @@ class TestRagPipeline(ChatTestCase):
         self.assertEqual(self.all_rows(), [], "检索异常时不该写数据库")
         self.assertFalse(tutor._lock.locked(), "出错后锁必须被释放")
         self.assertEqual(len(self.fake.calls), 0, "检索都失败了，不该再去调模型")
+
+
+# ===================== 5c-1. 作文明确字数的可见校验 =====================
+
+class TestEssayWordRangeWarning(ChatTestCase):
+    """真实网页流程 + 假模型：字数补救至多一次，不合格稿不交付。"""
+
+    TASK = "Write an English opinion essay of 140–190 words about teenagers teaching adults."
+
+    def test_slightly_long_second_draft_can_drop_one_optional_sentence(self):
+        import writing_limits
+        from test_writing_limits import SECOND_DRAFT_FROM_LIVE_RETEST
+
+        first = "first " * 225
+        second = SECOND_DRAFT_FROM_LIVE_RETEST
+        self.fake.replies = [
+            rag_reply(decision="general_answer", answer=first, citations=[]),
+            rag_reply(decision="general_answer", answer=second, citations=[]),
+        ]
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            response = self.ask(tutor.app.test_client(), self.TASK)
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(len(self.fake.calls), 2)
+        saved = self.all_rows()[1][2]
+        self.assertNotIn(first.strip(), saved)
+        self.assertNotIn("Word-count warning", saved)
+        self.assertNotIn("字数提醒", saved)
+        self.assertIn("Technology is the clearest example.", saved)
+        self.assertIn("Environmental awareness is another area.", saved)
+        self.assertIn("A third area is communication.", saved)
+        expected = writing_limits.trim_optional_essay_sentence(
+            second, writing_limits.WordRangeCheck(140, 190, 201))
+        self.assertIn(expected, saved)
+        self.assertTrue(140 <= writing_limits.count_english_words(expected) <= 190)
+        events = "\n".join(captured.output)
+        self.assertIn("essay_rewrite_sentence_trimmed", events)
+        self.assertIn("essay_rewrite_accepted", events)
+        self.assertNotIn("Teenagers are often dismissed", events)
+
+    def test_over_limit_draft_is_rejected_without_saving_it(self):
+        draft = "word " * 225
+        self.fake.reply = rag_reply(decision="general_answer", answer=draft, citations=[])
+        c = tutor.app.test_client()
+        with self.assertLogs("ai_tutor", level="INFO") as captured:
+            response = self.ask(c, self.TASK)
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(len(self.fake.calls), 2, "改写最多只可补调用一次")
+        self.assertEqual(self.all_rows(), [], "不合格稿不能写入历史")
+        html = response.get_data(as_text=True)
+        self.assertIn("这次未能生成符合 140–190 英文词要求的作文", html)
+        self.assertIn(self.TASK, html, "问题应保留在输入框，便于用户自己决定是否重试")
+        self.assertNotIn(draft.strip(), html, "不合格稿不能伪装成成品")
+        self.assertEqual(self.fake.rewrite_timeouts and len(self.fake.rewrite_timeouts), 1)
+        events = "\n".join(captured.output)
+        self.assertIn("essay_rewrite_rejected", events)
+        self.assertIn("stage=word_range", events)
+        self.assertIn("rewrite_word_actual=225", events)
+        self.assertIn("rewrite_identical=True", events)
+        self.assertNotIn(draft.strip(), events, "日志不能出现作文正文")
+
+    def test_valid_second_draft_replaces_first_and_uses_two_quota_units(self):
+        first, second = "first " * 225, "revised " * 170
+        self.fake.replies = [
+            rag_reply(decision="general_answer", answer=first, citations=[]),
+            rag_reply(decision="general_answer", answer=second, citations=[]),
+        ]
+        c = tutor.app.test_client()
+        self.assertEqual(self.ask(c, self.TASK).status_code, 302)
+        saved = self.all_rows()
+        self.assertEqual(len(saved), 2)
+        self.assertIn(second.strip(), saved[1][2])
+        self.assertNotIn(first.strip(), saved[1][2])
+        self.assertNotIn("字数提醒", saved[1][2])
+        self.assertEqual(len(self.fake.calls), 2)
+        revision_message = self.fake.calls[1]["messages"][1]["content"]
+        self.assertIn("Draft to edit", revision_message)
+        self.assertIn("225 English words", revision_message)
+        self.assertIn("Cut at least 35 words", revision_message)
+        self.assertIn("Aim for 150 words", revision_message)
+        self.assertIn(first.strip(), revision_message)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            self.assertEqual(conn.execute("SELECT used FROM api_usage").fetchone()[0], 2)
+        finally:
+            conn.close()
+
+    def test_no_second_quota_rejects_overlength_draft(self):
+        tutor.DAILY_API_LIMIT = 1
+        self.fake.reply = rag_reply(
+            decision="general_answer", answer="word " * 225, citations=[])
+        c = tutor.app.test_client()
+        self.ask(c, self.TASK)
+        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(self.all_rows(), [])
+        conn = sqlite3.connect(self.db_path)
+        try:
+            self.assertEqual(conn.execute("SELECT used FROM api_usage").fetchone()[0], 1)
+        finally:
+            conn.close()
+
+    def test_invalid_second_result_never_replaces_valid_first(self):
+        first = "original " * 225
+        self.fake.replies = [
+            rag_reply(decision="general_answer", answer=first, citations=[]),
+            rag_reply(decision="general_answer", answer="revised " * 170,
+                      citations=[{"source": "forged.md", "heading": "not supplied"}]),
+        ]
+        self.ask(tutor.app.test_client(), self.TASK)
+        self.assertEqual(self.all_rows(), [])
+        self.assertEqual(len(self.fake.calls), 2)
+
+    def test_citation_supported_answer_is_not_rewritten(self):
+        self.fake.reply = rag_reply(decision="answer", answer="word " * 225)
+        response = self.ask(tutor.app.test_client(), self.TASK)
+        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(self.all_rows(), [])
+        self.assertNotIn("资料来源：", response.get_data(as_text=True))
+
+    def test_second_model_error_rejects_first_overlength_draft(self):
+        first = "original " * 225
+        self.fake.replies = [
+            rag_reply(decision="general_answer", answer=first, citations=[]),
+            RuntimeError("private model failure"),
+        ]
+        response = self.ask(tutor.app.test_client(), self.TASK)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(self.all_rows(), [])
+        self.assertNotIn(first.strip(), response.get_data(as_text=True))
+        self.assertEqual(len(self.fake.calls), 2)
+
+    def test_no_time_for_rewrite_rejects_overlength_draft(self):
+        tutor.MODEL_REQUEST_TIMEOUT_SECONDS = 5
+        self.fake.reply = rag_reply(
+            decision="general_answer", answer="word " * 225, citations=[])
+        self.ask(tutor.app.test_client(), self.TASK)
+        self.assertEqual(len(self.fake.calls), 1)
+        self.assertEqual(self.all_rows(), [])
+
+    def test_in_range_draft_has_no_warning(self):
+        self.fake.reply = rag_reply(
+            decision="general_answer", answer="word " * 189, citations=[])
+        c = tutor.app.test_client()
+        self.ask(c, self.TASK)
+
+        self.assertEqual(len(self.fake.calls), 1)
+        saved = self.all_rows()[1][2]
+        self.assertNotIn("字数提醒", saved)
+        self.assertNotIn("Word-count warning", saved)
+
+    def test_non_essay_and_refusal_are_not_relabelled_as_bad_essays(self):
+        c = tutor.app.test_client()
+        self.fake.reply = rag_reply(
+            decision="general_answer", answer="word " * 225, citations=[])
+        self.ask(c, "What does 140–190 words mean in an essay task?")
+        self.assertNotIn("字数提醒", self.all_rows()[1][2])
+
+        self.fake.reply = rag_reply(decision="refuse", answer="ignored", citations=[])
+        self.ask(c, self.TASK)
+        self.assertEqual(self.all_rows()[3][2], tutor.rag.REFUSE_TEXT)
+        self.assertEqual(len(self.fake.calls), 2)
+
+    def test_english_profile_receives_english_failure(self):
+        self.make_invite("essay-range-profile")
+        c = tutor.app.test_client()
+        self.enter_invite(c, "essay-range-profile")
+        self.save_profile(c, language_mode="en_only")
+        self.fake.reply = rag_reply(
+            decision="general_answer", answer="word " * 225, citations=[])
+        response = self.ask(c, self.TASK)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(self.all_rows(), [])
+        html = response.get_data(as_text=True)
+        self.assertIn("I could not produce an essay within your requested", html)
+        self.assertNotIn("字数提醒", html)
 
 
 # ===================== 5d. 短期对话上下文（网页层）=====================

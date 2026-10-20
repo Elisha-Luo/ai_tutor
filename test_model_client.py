@@ -15,6 +15,7 @@ class TestBoundedModelClient(unittest.TestCase):
     def setUp(self):
         self.mode = "success"
         self.calls = 0
+        self.request_payloads = []
         self.disconnected = threading.Event()
         self.stop = threading.Event()
         owner = self
@@ -24,7 +25,8 @@ class TestBoundedModelClient(unittest.TestCase):
                 pass
 
             def do_POST(self):
-                self.rfile.read(int(self.headers["Content-Length"]))
+                owner.request_payloads.append(json.loads(
+                    self.rfile.read(int(self.headers["Content-Length"]))))
                 owner.calls += 1
                 if owner.mode == "error":
                     body = b'{"error":{"message":"private-error-marker","type":"server_error"}}'
@@ -79,6 +81,17 @@ class TestBoundedModelClient(unittest.TestCase):
         response = self.call(self.client())
         self.assertEqual(response.choices[0].message.content, "fake-answer")
         self.assertEqual(self.calls, 1)
+        self.assertEqual(self.request_payloads[0]["response_format"],
+                         {"type": "json_object"})
+
+    def test_shorter_deadline_uses_a_new_adapter_without_mutating_original(self):
+        original = self.client(timeout=10)
+        shorter = original.with_timeout(4.5)
+        self.assertIsNot(shorter, original)
+        self.assertEqual(original._timeout, 10)
+        self.assertEqual(shorter._timeout, 4.5)
+        self.assertEqual(shorter._api_key, original._api_key)
+        self.assertEqual(shorter._base_url, original._base_url)
 
     def test_provider_503_is_not_retried_and_error_contents_are_hidden(self):
         self.mode = "error"

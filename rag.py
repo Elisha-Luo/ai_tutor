@@ -42,6 +42,7 @@
 # =====================================================================
 
 import json      # 解析模型返回的 JSON
+import writing_limits  # 只读取本轮明示的英文作文字数范围，不从参考范文猜要求
 
 
 # ===================== 四种结论 =====================
@@ -338,6 +339,30 @@ SYSTEM_PROMPT = """你是一名 AI 英语学习助手。用户的问题属于下
 - 【「精简」是什么意思】档案里选了「精简」时，只给直接答案和最关键的一句解释，
   **不要加延伸**；短不等于没答，但「精简」的用户要的是短。
 
+【英文作文专用：只在用户要求写作文、文章或范文时】
+
+- 【先交成稿】先完成用户要的英文正文，覆盖题目指定的内容、文体、读者和字数；
+  不要用写作模板或写作建议代替正文。没指定的条件沿用上面的默认规则和学习者档案。
+- 【指定字数优先】用户给出英文作文的词数范围或上限时，把它当作交稿条件：
+  先按范围中部规划正文，写完按英文单词数自查，并在同一次回答里删改到范围内。
+  档案选「详细」、用户给了较长的参考范文，都不能成为超出上限的理由；
+  参考范文只供学习写法，不替代这次题目的字数要求。没指定字数时才使用短篇范文的默认长度。
+- 【有中心，也有取舍】开头尽早让读者知道文章要说明什么；各段承担不同任务，
+  顺着题目组织，而不是堆同义的赞美句或把所有作文套进同一套三段论。
+  说明文、叙事文与议论文的写法可以不同，不必强迫每篇都提出可争辩的论点。
+- 【观点落到细节】重要观点尽量用一个具体、可信的事例或细节支撑，并说清
+  它如何说明该观点；不要只写「影响很大」「非常重要」这类空泛结论。
+  不为显得丰富而编造事件、数字、出处或引文；史实、传说与个人评价要分清，
+  不能核实的广泛影响不要写成确定事实。
+- 【只交用户要的成稿】用户只要求写作文时，answer 字段只放作文正文；
+  不加开场白、未要求的标题、写法解析、可复用句式清单或固定搭配清单。
+  这一条优先于上面的「适合时补 1–2 条延伸」和档案的「详细」要求；
+  用户同时要求讲解时，才在正文后简短说明写法。不要因此删掉作文必需的例子和细节。
+- 【交稿前自查，不展示清单】检查题目各部分是否答到、段落是否重复、例子是否真正支持观点、
+  英语是否符合档案水平。只输出完成的作文；不要为凑延伸而在作文后硬塞无关的固定搭配。
+  以上是写作方法，不是课程事实或可引用的资料；
+  四分类、课程业务事实和引用规则仍照常适用。
+
 输出要求：
 
 - 只输出一个 JSON 对象，不要输出 Markdown 代码块（不要用 ``` 包裹），不要任何解释文字、前后缀
@@ -550,6 +575,17 @@ def _build_user_prompt(question, chunks, recent_context=None, preferences=None):
     """
     preference_section = _format_preferences(preferences)
     context_section = _format_recent_context(recent_context)
+    requested_words = writing_limits.requested_essay_word_range(question)
+    if requested_words is not None:
+        minimum, maximum = requested_words
+        target = minimum + max(1, (maximum - minimum) // 5)
+        essay_length_note = (
+            "\n本轮英文作文字数执行提醒：题目要求 " + str(minimum) + "–"
+            + str(maximum) + " 个英文词；请把正文写到约 " + str(target)
+            + " 词，留出余量。不要把 JSON 字段、页面标签或额外讲解算进正文。"
+        )
+    else:
+        essay_length_note = ""
 
     if chunks:
         blocks = []                                # 每段资料拼成一小块文字
@@ -583,7 +619,7 @@ def _build_user_prompt(question, chunks, recent_context=None, preferences=None):
         preference_section
         + context_section
         + material_section
-        + "用户的问题：\n" + str(question) + "\n\n"
+        + "用户的问题：\n" + str(question) + essay_length_note + "\n\n"
         "请严格按照 system 里的规则判断 decision，并只输出那一个 JSON 对象。"
     )
 
@@ -693,7 +729,8 @@ def _degrade(diagnostic_code):
 #
 # 【四个入口最后都走同一个内部实现 _generate()】
 # 提示词只有一份、五道校验只有一份、模型调用只有一处 —— 不会漂移成四个不同的产品。
-# 而且不管从哪个入口进，一次提问【只调用模型一次】。
+# 每调用一次入口，只向模型发一次请求；网页可在明确作文字数不合格时
+# 再调用同一入口一次做限次改写，不复制校验逻辑。
 
 def generate_answer(question, chunks, client, model):
     """把「问题 + 已检索到的片段」交给模型，返回一个**可检查**的结果。
@@ -744,7 +781,7 @@ def generate_answer_with_context_and_diagnostics(question, chunks, recent_messag
 
     【它和评测器那个诊断入口的唯一区别：带不带上下文】
     两者最后都走同一个 `_generate()`，提示词、五道校验、模型调用点都只有一份，
-    不存在「复制一套逻辑」的可能。一次提问仍然只有一次模型调用。
+    不存在「复制一套逻辑」的可能。每调用一次本入口，只发一次模型请求。
 
     【安全】返回的第二个元素依然是不含任何内容的固定短枚举（见文件顶部的 DIAG_*）。
     调用方【只能把它写进安全日志】——绝不能放进给用户看的响应、也不能存进数据库。
@@ -766,9 +803,9 @@ def generate_answer_with_context_and_profile(question, chunks, recent_messages,
         preferences —— 该学习者的档案（profile_store.get_preferences 的返回值，
                        或者 None = 没档案，那就按默认方式回答）
 
-    【一次提问 = 一次模型调用】
-    档案、上下文、资料全部拼进【同一次】请求。这一点和设计文档第 12 节一致：
-    不为档案单独调一次模型，也不为它多花一分钱。
+    【本入口每次调用 = 一次模型请求】
+    档案、上下文、资料全部拼进同一次请求；不为档案单独调用模型。
+    网页仅在明确作文字数不合格时可能再次调用本入口，额度另计。
 
     【档案为什么不会污染引用】
     白名单仍然只从本次 chunks 建（见 _generate）。档案里哪怕写着
@@ -847,8 +884,8 @@ def _generate(question, chunks, recent_context, client, model, preferences=None)
     # 不管有没有检索到片段，都要问一次模型 —— 只有它知道这是个正常的英语问题，
     # 还是一个超出范围的问题。
     #
-    # 【一次提问 = 一次调用】上下文是【拼进这一次请求】的，不是先调一次去理解指代、
-    # 再调一次去回答。所以下面这个 create() 是全流程唯一的模型调用点。
+    # 【本入口一次调用 = 一次请求】上下文拼进请求，不另调一次理解指代。
+    # 网页可能为了作文词数再调用本入口一次；两次都经过同一安全校验点。
     try:
         response = client.chat.completions.create(
             model=model,

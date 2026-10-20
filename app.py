@@ -19,6 +19,7 @@ from env_utils import (load_dotenv, is_example_api_key, EXAMPLE_KEY_MESSAGE,   #
                        ADMIN_MIN_TOKEN_CHARS)
 import retriever                                     # 本地检索层：把问题变成「最相关的几段资料」
 import rag                                           # 生成与引用层：让模型照着资料回答，并校验它引用的来源
+import writing_limits                                # 检查明确的英文作文词数；必要时至多改写一次
 import profile_store                                 # 学习档案存储层：邀请码、学习者、会话绑定、偏好
 
 
@@ -303,6 +304,8 @@ _SAFE_LOG_FIELDS = frozenset({
     "port", "workers", "db_file", "debug",            # 启动信息
     "question_length", "decision", "citation_count", "elapsed_ms",   # 每个问题的统计
     "diagnostic_code",                                # 固定诊断枚举：区分「模型主动判的」和「校验没过降级的」
+    "word_min", "word_max", "word_actual", "word_within_range",  # 作文字数统计，不记正文
+    "rewrite_word_actual", "rewrite_identical",      # 改写效果只记数字和布尔值
     "context_messages", "context_chars",              # 上下文【只记条数和字符数】，绝不记正文
     "deleted_sessions", "deleted_messages",           # 清空全部数据时【只记删了多少条】
     "limit", "used",                                  # 额度
@@ -1289,7 +1292,7 @@ def index():                                          # 用户每次打开页面
                 # 它还能处理「资料没支持、但属于正常英语问题」的情况（general_answer）。
                 #
                 # 【为什么用带上下文的那个入口】历史只在这里拼进那一次请求，
-                # 而且是【唯一一次】模型调用 —— 不会为了「先理解指代再回答」调两次。
+                # 上下文拼进首次请求；只有明确的作文字数不合格，才可能额外改写一次。
                 #
                 # 【额度什么时候算掉】只要走进了这一步，就已经占过一次了。
                 # 哪怕模型调用失败、哪怕 rag 内部降级，这一次【照样计入】——
@@ -1315,12 +1318,101 @@ def index():                                          # 用户每次打开页面
                     return _render(sid, question=question,
                                    error=MODEL_UNAVAILABLE_MESSAGE, status=503)
 
+                # ---------- 作文字数补救：最多一次，受剩余额度和总等待预算限制 ----------
+                word_check = writing_limits.check_essay_word_range(
+                    question, result.get("answer"), result.get("decision"))
+                if word_check is not None and not word_check.within_range:
+                    # 只补救已通过校验的通用知识作文；带来源的 answer 不改写，
+                    # 否则可能让原引用不再支持重写后的句子。
+                    if diagnostic_code == rag.DIAG_OK and result["decision"] == "general_answer":
+                        revision_question = writing_limits.revision_request(
+                            question, result["answer"], word_check)
+                        remaining = MODEL_REQUEST_TIMEOUT_SECONDS - (
+                            time.perf_counter() - started) - 1.0
+                        if revision_question is None:
+                            log_event("essay_rewrite_skipped", stage="draft_too_large")
+                        elif remaining < 5.0:
+                            log_event("essay_rewrite_skipped", stage="time_budget")
+                        elif not hasattr(client, "with_timeout"):
+                            log_event("essay_rewrite_skipped", stage="client_unsupported")
+                        else:
+                            rewrite_allowed, _ = reserve_api_call(DAILY_API_LIMIT)
+                            if not rewrite_allowed:
+                                log_event("essay_rewrite_skipped", stage="quota")
+                            else:
+                                log_event("essay_rewrite_started")
+                                rewrite_client = client.with_timeout(remaining)
+                                revised, revision_diagnostic = (
+                                    rag.generate_answer_with_context_and_profile(
+                                        revision_question, chunks, recent_messages,
+                                        preferences, rewrite_client, MODEL))
+                                revised_check = writing_limits.check_essay_word_range(
+                                    question, revised.get("answer"), revised.get("decision"))
+                                if (revision_diagnostic == rag.DIAG_OK
+                                        and revised.get("decision") == "general_answer"
+                                        and revised.get("citations") == []
+                                        and revised_check is not None
+                                        and not revised_check.within_range):
+                                    edited = writing_limits.trim_optional_essay_sentence(
+                                        revised["answer"], revised_check)
+                                    if edited is not None:
+                                        revised = dict(revised, answer=edited)
+                                        revised_check = writing_limits.check_essay_word_range(
+                                            question, edited, "general_answer")
+                                        log_event("essay_rewrite_sentence_trimmed",
+                                                  word_actual=revised_check.actual)
+                                if (revision_diagnostic == rag.DIAG_OK
+                                        and revised.get("decision") == "general_answer"
+                                        and revised.get("citations") == []
+                                        and revised_check is not None
+                                        and revised_check.within_range):
+                                    result, diagnostic_code, word_check = (
+                                        revised, revision_diagnostic, revised_check)
+                                    log_event("essay_rewrite_accepted")
+                                else:
+                                    # 改写失败或仍超限：保留已校验的首稿，不把降级文案
+                                    # 覆盖为“新答案”，更不会循环重试。
+                                    # 不记录两稿正文或摘要；词数与“是否逐字相同”
+                                    # 足以分清模型未改、改了仍超限、或校验失败。
+                                    log_event(
+                                        "essay_rewrite_rejected",
+                                        diagnostic_code=revision_diagnostic,
+                                        stage=("invalid_result" if revision_diagnostic != rag.DIAG_OK
+                                               or revised.get("decision") != "general_answer"
+                                               or revised.get("citations") != []
+                                               else "word_range"),
+                                        rewrite_word_actual=(revised_check.actual
+                                                             if revised_check else None),
+                                        rewrite_identical=(revised.get("answer") == result.get("answer")
+                                                           if revision_diagnostic == rag.DIAG_OK
+                                                           else None))
+                                    if revision_diagnostic == rag.DIAG_API_OR_RESPONSE_ERROR:
+                                        _model_retry_after = (time.monotonic()
+                                                              + MODEL_RETRY_COOLDOWN_SECONDS)
+
+                # 交付硬门槛：明确要求字数的作文，不能把超限草稿作为成品
+                # 写入历史。已消耗的模型调用照常计入额度；不自动重试。
+                if word_check is not None and not word_check.within_range:
+                    log_event("essay_delivery_rejected",
+                              word_min=word_check.minimum, word_max=word_check.maximum,
+                              word_actual=word_check.actual, word_within_range=False)
+                    return _render(
+                        sid, question=question,
+                        error=writing_limits.format_word_range_failure(
+                            word_check, (preferences or {}).get("language_mode")),
+                        status=503)
+
                 # ---------- 第五步：格式化 + 存库 ----------
                 # 只有真的回答了，才会在后面附上「资料来源」；
                 # 拒答和证据不足不会凭空多出一个来源列表。
                 # 【标记跟着档案的语言偏好走】选了全英文的人，标签也用英文
                 # （默认和中文模式下还是原来那句中文，行为零变化）
                 answer = format_answer_with_sources(result, general_answer_marker(preferences))
+                if word_check is not None:
+                    log_event("essay_word_range_checked",
+                              word_min=word_check.minimum, word_max=word_check.maximum,
+                              word_actual=word_check.actual,
+                              word_within_range=word_check.within_range)
                 question_id = save_exchange(sid, question, answer)
 
                 # 【答完并入库了，才把这次尝试记下来】顺序不能反：
