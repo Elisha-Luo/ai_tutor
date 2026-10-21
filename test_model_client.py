@@ -58,7 +58,10 @@ class TestBoundedModelClient(unittest.TestCase):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
-        self.env_patch = patch.dict(os.environ, {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"})
+        self.env_patch = patch.dict(os.environ, {
+            "NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1",
+            "OLLAMA_API_KEY": "offline-ollama-key-never-sent-to-model-worker",
+        })
         self.env_patch.start()
 
     def tearDown(self):
@@ -121,6 +124,7 @@ class TestBoundedModelClient(unittest.TestCase):
             self.assertNotIn("offline-test-question", str(args))
             self.assertNotIn("CHAT_DB_PATH", kwargs["env"])
             self.assertNotIn("ADMIN_MINT_TOKEN", kwargs["env"])
+            self.assertNotIn("OLLAMA_API_KEY", kwargs["env"])
             process = original(*args, **kwargs)
             processes.append(process)
             return process

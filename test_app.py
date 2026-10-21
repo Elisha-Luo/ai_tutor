@@ -40,7 +40,7 @@ import html as html_module                 # 同上：DOM 转出来的文本要�
 # =====================================================================
 # 【顺序极其重要】下面这几行必须在 import app 之前执行，原因有两个：
 #
-#   1. app.py 一被导入就会读 DEEPSEEK_API_KEY 和 FLASK_SECRET_KEY，
+#   1. app.py 一被导入就会读 OLLAMA_API_KEY 和 FLASK_SECRET_KEY，
 #      读不到会直接报错退出，测试根本跑不起来。
 #
 #   2. app.py 一被导入还会【建数据库表】。如果不先把路径指走，
@@ -53,7 +53,7 @@ _IMPORT_TMPDIR = tempfile.mkdtemp(prefix="ai_tutor_test_")               # 建�
 atexit.register(shutil.rmtree, _IMPORT_TMPDIR, ignore_errors=True)      # 程序退出时自动删掉它
 
 os.environ["CHAT_DB_PATH"] = os.path.join(_IMPORT_TMPDIR, "import_time.db")   # 导入时的建表动作也走临时文件
-os.environ["DEEPSEEK_API_KEY"] = "test-key-not-a-real-key"                    # 假的密钥，绝不可能调通真实服务
+os.environ["OLLAMA_API_KEY"] = "test-key-not-a-real-key"                     # 假的密钥，绝不可能调通真实服务
 os.environ["FLASK_SECRET_KEY"] = "test-secret-not-a-real-key"                 # 假的 cookie 签名密钥
 os.environ["INVITE_CODE_PEPPER"] = "test-pepper-not-a-real-pepper"            # 假的 invitation pepper，只用于测试
 
@@ -4135,7 +4135,7 @@ class TestDeploymentArtifacts(unittest.TestCase):
 
     def test_deployment_doc_lists_the_env_vars(self):
         doc = self.read("DEPLOYMENT.md")
-        for name in ("DEEPSEEK_API_KEY", "FLASK_SECRET_KEY", "INVITE_CODE_PEPPER",
+        for name in ("OLLAMA_API_KEY", "FLASK_SECRET_KEY", "INVITE_CODE_PEPPER",
                      "CHAT_DB_PATH", "MAX_QUESTION_LENGTH", "DAILY_API_LIMIT"):
             self.assertIn(name, doc, "部署文档漏了环境变量 " + name)
 

@@ -1,6 +1,6 @@
 # AI 学习助手（ai_tutor）
 
-一个网页版的英语学习助手：用 Flask 做界面，先从项目资料里检索相关片段，再让 DeepSeek **照着资料**回答，并把资料来源列出来。
+一个网页版的英语学习助手：用 Flask 做界面，先从项目资料里检索相关片段，再让 Ollama 云端模型**照着资料**回答，并把资料来源列出来。
 
 **它同时也是一个「怎么写好一个聊天界面」的练习。** 界面上的每处细节——尤其是「点发送之后会发生什么」——都踩过坑，下面都写清楚了。
 
@@ -39,7 +39,7 @@ pip install -r requirements.txt
 
 | 名字 | 干嘛的 |
 | --- | --- |
-| `DEEPSEEK_API_KEY` | 调用 DeepSeek 用，在 https://platform.deepseek.com 申请 |
+| `OLLAMA_API_KEY` | 服务端调用 Ollama 云端模型用，在 https://ollama.com/settings/keys 管理 |
 | `FLASK_SECRET_KEY` | Flask 用它给浏览器 cookie 签名，防止别人伪造 cookie 冒充成别的会话 |
 | `INVITE_CODE_PEPPER` | 把邀请码算成摘要用的服务端密钥。数据库里只存摘要，没有它就反推不出邀请码 |
 | `ADMIN_MINT_TOKEN`（**可选**） | 给「线上发码 / 撤销」的管理入口用。**不配 = 入口关闭**，应用照常运行；配成模板里的示例值同样等于关闭 |
@@ -69,26 +69,24 @@ python -c "import secrets; print(secrets.token_hex(32))"
 
 把打印出来的那串粘到 `.env` 里即可。
 
-> ### ⚠️ 复制完 `.env.example` 之后，**必须把示例值换掉**
+> ### ⚠️ 复制完 `.env.example` 之后，**必须填入 Ollama 密钥**
 >
-> `.env.example` 是提交进 Git 的**模板**，里面的值（`sk-在这里填你自己的密钥`）
-> 公开可见，所以它**不可能是一个能用的密钥**。
-> 复制完忘了改，程序照样启动、照样发请求，只是每一次都失败 ——
-> 很容易白排查一轮。所以现在两个入口（`app.py` 和评测器）
-> 都会在**发出任何网络请求之前**停住，直接提示：
+> `.env.example` 是提交进 Git 的模板，`OLLAMA_API_KEY=` 故意留空。
+> 网页只读 `OLLAMA_API_KEY`，不会回退到旧的 `DEEPSEEK_API_KEY` 或 `OPENAI_API_KEY`。
+> 没填时会在发出网络请求前停住，直接提示：
 >
 > ```
-> DEEPSEEK_API_KEY 仍是示例值，请配置真实密钥。
+> 没有找到 Ollama 密钥。请先设置环境变量 OLLAMA_API_KEY。
 > ```
 >
-> 看到这句话，去把 `.env` 里那一行换成你自己的就行。
+> 看到这句话，去把 `.env` 里的 `OLLAMA_API_KEY` 填成你自己的值。旧评测器仍是独立工具，不代表网页当前供应商。
 
 **另一种做法：直接设环境变量**
 
 不想用 `.env` 的话，也可以在 Windows 上设一次（永久生效）：
 
 ```powershell
-[Environment]::SetEnvironmentVariable("DEEPSEEK_API_KEY", "你的密钥", "User")
+[Environment]::SetEnvironmentVariable("OLLAMA_API_KEY", "你的密钥", "User")
 [Environment]::SetEnvironmentVariable("FLASK_SECRET_KEY", "你的随机串", "User")
 ```
 
@@ -103,10 +101,10 @@ python -c "import secrets; print(secrets.token_hex(32))"
 > - **重启应用**（关掉再开），或
 > - **开一个全新的终端窗口**，在里面重新跑
 >
-> 想确认当前这个终端读到了什么，可以跑（**只会打印有没有配、几个字符，不会打印密钥本身**）：
+> 想确认当前这个终端读到了什么，可以跑（**只会打印有没有配置，不会打印密钥本身**）：
 >
 > ```powershell
-> python -c "import os; k=os.environ.get('DEEPSEEK_API_KEY',''); print('已配置' if k else '未配置', len(k))"
+> python -c "import os; print('已配置' if os.environ.get('OLLAMA_API_KEY') else '未配置')"
 > ```
 
 > 两种方式同时存在时，**真实环境变量优先**，`.env` 只作兜底。

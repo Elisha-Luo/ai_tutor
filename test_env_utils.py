@@ -484,6 +484,7 @@ class IsolatedAppProcessTestCase(unittest.TestCase):
         """子进程要用的环境变量。overrides 里传 None 表示【把这个变量删掉】。"""
         env = dict(os.environ)
         env["DEEPSEEK_API_KEY"] = self.FAKE_API_KEY
+        env["OLLAMA_API_KEY"] = self.FAKE_API_KEY
         env["FLASK_SECRET_KEY"] = self.FAKE_FLASK_KEY
         env["INVITE_CODE_PEPPER"] = self.FAKE_PEPPER
         env["CHAT_DB_PATH"] = self.db_path
@@ -511,8 +512,8 @@ class IsolatedAppProcessTestCase(unittest.TestCase):
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
 
 
-class AppRefusesExampleKeyTest(IsolatedAppProcessTestCase):
-    """【端到端】网页厨房（app.py）也必须拦住示例值。
+class AppRequiresOllamaKeyTest(IsolatedAppProcessTestCase):
+    """【端到端】网页应用必须有明确的 Ollama 密钥，不能回退到别的密钥。
 
     用子进程跑 `import app`，这样是真的执行 app.py 的模块级检查，
     而不是在源码里 grep 一个字符串 —— grep 过了不等于程序真的会停。
@@ -527,18 +528,20 @@ class AppRefusesExampleKeyTest(IsolatedAppProcessTestCase):
 
         key_value 传 None 表示【不设】这个环境变量。
         """
-        return self.run_app(DEEPSEEK_API_KEY=key_value)
+        return self.run_app(OLLAMA_API_KEY=key_value)
 
-    def test_app_refuses_the_example_value(self):
-        """【核心】用示例值启动 app.py → 直接失败，并给出固定提示。"""
-        code, output = self._import_app(env_utils.EXAMPLE_API_KEY)
-        self.assertNotEqual(code, 0, "app.py 居然带着示例密钥正常启动了")
-        self.assertIn(env_utils.EXAMPLE_KEY_MESSAGE, output)
+    def test_app_refuses_blank_ollama_key(self):
+        code, output = self._import_app("   ")
+        self.assertNotEqual(code, 0)
+        self.assertIn("OLLAMA_API_KEY", output)
 
-    def test_app_refusal_does_not_echo_the_value(self):
-        """【安全】失败输出里不能出现密钥本身。"""
-        _, output = self._import_app(env_utils.EXAMPLE_API_KEY)
-        self.assertNotIn(env_utils.EXAMPLE_API_KEY, output)
+    def test_other_provider_key_cannot_replace_missing_ollama_key(self):
+        code, output = self.run_app(OLLAMA_API_KEY=None,
+                                    DEEPSEEK_API_KEY=self.FAKE_API_KEY,
+                                    OPENAI_API_KEY=self.FAKE_API_KEY)
+        self.assertNotEqual(code, 0)
+        self.assertIn("OLLAMA_API_KEY", output)
+        self.assertNotIn(self.FAKE_API_KEY, output)
 
     def test_app_refuses_missing_key(self):
         """没配密钥同样要停 —— 这是原本就有的行为，别被这次修改弄丢。
@@ -549,7 +552,7 @@ class AppRefusesExampleKeyTest(IsolatedAppProcessTestCase):
         """
         code, output = self._import_app(None)
         self.assertNotEqual(code, 0)
-        self.assertIn("DEEPSEEK_API_KEY", output)
+        self.assertIn("OLLAMA_API_KEY", output)
 
     def test_a_normal_test_key_still_starts_the_app(self):
         """【地基】测试专用的假密钥必须能正常启动。

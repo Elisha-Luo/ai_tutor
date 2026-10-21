@@ -53,7 +53,7 @@ class BoundedModelClient:
             "timeout": self._timeout, "model": model, "messages": messages,
         }, ensure_ascii=False).encode("utf-8")
         worker_env = os.environ.copy()
-        for name in ("DEEPSEEK_API_KEY", "OPENAI_API_KEY", "OPENAI_LOG",
+        for name in ("OLLAMA_API_KEY", "DEEPSEEK_API_KEY", "OPENAI_API_KEY", "OPENAI_LOG",
                      "FLASK_SECRET_KEY", "INVITE_CODE_PEPPER",
                      "ADMIN_MINT_TOKEN", "CHAT_DB_PATH"):
             worker_env.pop(name, None)

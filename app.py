@@ -13,7 +13,8 @@ import threading                                    # 用它的「锁」防止�
 from datetime import datetime, timedelta, timezone  # datetime 记录消息时间；timedelta 设置 cookie 有效期；timezone 算 UTC 日期
 from flask import Flask, render_template, request, redirect, url_for, session, jsonify   # session 给每个浏览器发身份标记；jsonify 拼 JSON 响应
 from model_client import BoundedModelClient         # 模型调用有总时限，超时会结束子进程
-from env_utils import (load_dotenv, is_example_api_key, EXAMPLE_KEY_MESSAGE,   # 共用 .env 读取；示例值检测也在那边
+from provider_config import OLLAMA_BASE_URL, OLLAMA_MODEL
+from env_utils import (load_dotenv,   # 共用 .env 读取
                        is_example_secret, example_secret_message,
                        EXAMPLE_FLASK_KEY, EXAMPLE_PEPPER, EXAMPLE_ADMIN_TOKEN,
                        ADMIN_MIN_TOKEN_CHARS)
@@ -42,19 +43,12 @@ load_dotenv(os.path.join(BASE_DIR, ".env"))         # 启动时先读 .env，下
 
 # ===================== 配置区 =====================
 
-API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")    # 从环境变量 DEEPSEEK_API_KEY 读取密钥；没设置的话得到空字符串
+API_KEY = os.environ.get("OLLAMA_API_KEY", "").strip()  # 只用 Ollama 密钥，绝不回退到其他服务商的密钥
 if not API_KEY:                                     # 如果没读到密钥
     raise RuntimeError(                             # 直接中止程序并报错——没密钥根本用不了，不如启动时就明确报出来
-        "没有找到 DeepSeek 密钥。请先设置环境变量 DEEPSEEK_API_KEY，"
+        "没有找到 Ollama 密钥。请先设置环境变量 OLLAMA_API_KEY，"
         "方法见 README.md 的「配置密钥」一节。"
     )
-
-# 【示例值要拦住】.env.example 是公开的模板文件，里面的示例值不可能管用。
-# 常见事故：复制成 .env 之后忘了改 —— 应用照常启动、照常发请求，只是每次都失败。
-# 与其跑完一整轮才发现，不如启动就明确报错。
-# 【只提示固定文字，绝不打印密钥的任何部分】
-if is_example_api_key(API_KEY):
-    raise RuntimeError(EXAMPLE_KEY_MESSAGE)
 
 # Flask 用这个密钥给浏览器 cookie 做签名，防止别人伪造 cookie 冒充成别的会话。
 # 它必须是一串够长、够随机的字符，而且每个人都不一样——所以绝不能在代码里写死一个默认值。
@@ -136,8 +130,8 @@ ADMIN_TOKEN_HEADER = "X-Admin-Token"
 ADMIN_MAX_BODY_BYTES = 1024
 ADMIN_MAX_CODE_CHARS = 128
 
-BASE_URL = "https://api.deepseek.com"                 # DeepSeek 的接口地址
-MODEL = "deepseek-chat"                               # 要调用的模型名字
+BASE_URL = OLLAMA_BASE_URL                            # Ollama 云端的 OpenAI 兼容接口
+MODEL = OLLAMA_MODEL                                  # 本应用使用的云端开放模型
 
 RETRIEVE_TOP_K = 3                                    # 每个问题检索几段资料。和评测器用同一个默认值
 
