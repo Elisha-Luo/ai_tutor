@@ -37,9 +37,18 @@ class BoundedModelClient:
         self._api_key = api_key
         self._base_url = base_url
         self._timeout = timeout
-        self.last_error_code = None
+        self._request_state = threading.local()
         self.chat = self
         self.completions = self
+
+    @property
+    def last_error_code(self):
+        """Keep diagnostics for one request from being overwritten by another thread."""
+        return getattr(self._request_state, "last_error_code", None)
+
+    @last_error_code.setter
+    def last_error_code(self, code):
+        self._request_state.last_error_code = code
 
     def with_timeout(self, timeout):
         """Use a shorter deadline for a follow-up call; do not mutate the first client."""

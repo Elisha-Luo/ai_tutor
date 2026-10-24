@@ -338,11 +338,40 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_CONTENT_LENGTH # 请求体超过 64KB 直
 client = BoundedModelClient(api_key=API_KEY, base_url=BASE_URL,
                             timeout=MODEL_REQUEST_TIMEOUT_SECONDS)
 
-# 【防止重复提问的第一道防线（服务端）】
-# 「锁」可以理解成一支只有一把的钥匙：谁先拿到，谁才能干活；其他人拿不到就得等着。
-# 我们故意设成「拿不到就不等，直接放弃」——因为拿不到就说明已经有一个问题在处理了。
+# 同一进程最多同时处理两道题；同一会话仍只能有一道在途。
+# _lock 只保护短暂的状态变更，模型调用期间不持有它。删除会先封闭入口，
+# 再等所有在途提问写库结束，避免已删除的消息被迟到的回答写回来。
+MAX_CONCURRENT_QUESTIONS = 2
 _lock = threading.Lock()
-_model_retry_after = 0.0                            # 只在持锁期间读写；故障后暂停新模型请求
+_state_changed = threading.Condition(_lock)
+_question_slots = threading.BoundedSemaphore(MAX_CONCURRENT_QUESTIONS)
+_active_sids = set()
+_deleting = False
+_model_retry_after = 0.0                            # 只在 _lock 下读写
+
+
+def _begin_question(sid):
+    """非阻塞入场；满额、同会话在途或正在删除时都不占模型额度。"""
+    if not _question_slots.acquire(blocking=False):
+        return False
+    if not _lock.acquire(blocking=False):
+        _question_slots.release()
+        return False
+    try:
+        if _deleting or sid in _active_sids:
+            _question_slots.release()
+            return False
+        _active_sids.add(sid)
+        return True
+    finally:
+        _lock.release()
+
+
+def _finish_question(sid):
+    with _state_changed:
+        _active_sids.remove(sid)
+        _state_changed.notify_all()
+    _question_slots.release()
 
 # 【防止重复提问的第二道防线：尝试令牌】—— 补上那把锁够不着的那一块。
 #
@@ -1202,23 +1231,27 @@ def index():                                          # 用户每次打开页面
             started = time.perf_counter()
             log_event("question_received", question_length=len(question))
 
-            # 试着去拿那把锁。拿不到 = 已经有一个请求正在问 AI（多半是用户又按了一次回车）。
-            if not _lock.acquire(blocking=False):
+            # 最多两位不同会话同时提问；同会话重复提交仍立即挡下。
+            if not _begin_question(sid):
                 log_event("request_busy")
                 return _render(sid, question=question, error=LOCKED_MESSAGE)
 
-            # try ... finally：不管中间成功还是失败，最后都必须把锁还回去。
-            # 失败时忘了还锁的话，这把锁就永远拿不回来了，之后所有提问都会被拒绝。
+            # 无论成功、失败还是提前返回，都必须归还并发名额。
             try:
+                # 入场前可能恰好完成了删除；档案以入场后的状态为准。
+                learner_id = _learner_id_for(sid)
                 # 【这次尝试是不是已经答完了】（第二道防线，见 _completed_attempts）
                 # 放在冷却判断【之前】：已经答完的问题随时可以拿出来看，
                 # 不能被「服务刚刚出过错、先歇半分钟」这条规矩连坐。
                 # 这里不占额度、不调模型、不写库 —— 只是把已经存在的那个页面还给他。
-                if _attempt_already_answered(sid, attempt, question):
+                with _state_changed:
+                    already_answered = _attempt_already_answered(sid, attempt, question)
+                    cooling_down = time.monotonic() < _model_retry_after
+                if already_answered:
                     log_event("duplicate_attempt_suppressed")
                     return redirect(url_for("index"))
 
-                if time.monotonic() < _model_retry_after:
+                if cooling_down:
                     log_event("model_cooldown")
                     return _render(sid, question=question,
                                    error=MODEL_UNAVAILABLE_MESSAGE, status=503)
@@ -1304,7 +1337,8 @@ def index():                                          # 用户每次打开页面
                     question, chunks, recent_messages, preferences, client, MODEL)
 
                 if diagnostic_code == rag.DIAG_API_OR_RESPONSE_ERROR:
-                    _model_retry_after = time.monotonic() + MODEL_RETRY_COOLDOWN_SECONDS
+                    with _state_changed:
+                        _model_retry_after = time.monotonic() + MODEL_RETRY_COOLDOWN_SECONDS
                     log_event("model_request_failed", diagnostic_code=diagnostic_code,
                               stage=getattr(client, "last_error_code", None) or "response_error",
                               elapsed_ms=int(round((time.perf_counter() - started) * 1000)))
@@ -1381,8 +1415,9 @@ def index():                                          # 用户每次打开页面
                                                            if revision_diagnostic == rag.DIAG_OK
                                                            else None))
                                     if revision_diagnostic == rag.DIAG_API_OR_RESPONSE_ERROR:
-                                        _model_retry_after = (time.monotonic()
-                                                              + MODEL_RETRY_COOLDOWN_SECONDS)
+                                        with _state_changed:
+                                            _model_retry_after = (time.monotonic()
+                                                                  + MODEL_RETRY_COOLDOWN_SECONDS)
 
                 # 交付硬门槛：明确要求字数的作文，不能把超限草稿作为成品
                 # 写入历史。已消耗的模型调用照常计入额度；不自动重试。
@@ -1412,7 +1447,8 @@ def index():                                          # 用户每次打开页面
                 # 【答完并入库了，才把这次尝试记下来】顺序不能反：
                 # 先记后写的话，万一写库失败，用户再发一次就会被告知「已经答过了」，
                 # 而历史里其实什么都没有 —— 那等于把他的问题吃掉了。
-                _remember_answered_attempt(sid, attempt, question_id, question)
+                with _state_changed:
+                    _remember_answered_attempt(sid, attempt, question_id, question)
 
                 # 【日志只记统计量】决策、引用数、耗时、上下文的条数和字符数。
                 # 上下文【只记这两个数字】，历史正文一个字都不许进日志 ——
@@ -1451,7 +1487,7 @@ def index():                                          # 用户每次打开页面
                 error = SAFE_ERROR_MESSAGE
 
             finally:
-                _lock.release()                                              # 无论成功还是出错，都把锁还回去
+                _finish_question(sid)
 
     # 渲染页面。历史每次都从数据库读，所以重启程序也不会丢。
     return _render(sid, question=question, error=error, just_deleted=just_deleted)
@@ -1795,19 +1831,25 @@ def profile_delete():
         log_event("profile_delete_rejected", stage="no-confirm")
         return _render_profile(sid, learner_id, error=DELETE_CONFIRM_MESSAGE)
 
-    # 【必须和提问共用同一把锁 —— 这是防「删完又冒出来」的关键】
-    # 一个提问的处理过程是：检索 → 调模型 → 格式化 → 写库。
-    # 如果不加这道锁，就可能出现：这边正在调模型，那边把数据全删了，
-    # 然后模型返回、那个请求把消息【又写回数据库】—— 用户以为删干净了，其实没有。
-    # 提问路径从头到尾都持有这把锁（写在 finally 里释放），所以：
-    #   · 删除会等正在进行的提问彻底结束（连同它的写库）才开始
-    #   · 删除期间的新提问拿不到锁，会被挡成「上一个问题还在处理中」
-    # 等到删除提交时，不可能再有旧请求往回写。
+    # 封闭新提问入口，再等所有在途提问完成写库。等待会暂时释放状态锁，
+    # 让在途提问能正常退出；删除事务期间仍持锁，不会有新问题入场。
+    global _deleting
+    deadline = time.monotonic() + DELETE_LOCK_TIMEOUT
     if not _lock.acquire(timeout=DELETE_LOCK_TIMEOUT):
         log_event("profile_delete_blocked", stage="busy")
         return _render_profile(sid, learner_id, error=DELETE_BUSY_MESSAGE)
 
     try:
+        if _deleting:
+            log_event("profile_delete_blocked", stage="busy")
+            return _render_profile(sid, learner_id, error=DELETE_BUSY_MESSAGE)
+        _deleting = True
+        while _active_sids:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                log_event("profile_delete_blocked", stage="busy")
+                return _render_profile(sid, learner_id, error=DELETE_BUSY_MESSAGE)
+            _state_changed.wait(remaining)
         conn = _connect()
         try:
             stats = profile_store.clear_all_data(conn, learner_id)
@@ -1819,6 +1861,7 @@ def profile_delete():
         log_event("profile_delete_failed", error_type=type(exc).__name__)
         return _render_profile(sid, learner_id, error=SAFE_ERROR_MESSAGE)
     finally:
+        _deleting = False
         _lock.release()
 
     # 【只记数量，不记内容】删掉了多少条记录属于统计量；聊了什么都不记。

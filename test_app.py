@@ -201,6 +201,15 @@ class ChatTestCase(unittest.TestCase):
         """模拟一次完整的提问，返回响应对象。"""
         return client.post("/", data={"question": question})
 
+    def another_tab(self, client):
+        """复制会话 cookie 的内容，模拟同一浏览器的另一个标签页。"""
+        other = tutor.app.test_client()
+        with client.session_transaction() as original:
+            state = dict(original)
+        with other.session_transaction() as copied:
+            copied.update(state)
+        return other
+
     def use_fake_upstream(self, mode, timeout=10):
         """把 app 的客户端换成【真的】BoundedModelClient，指向本机假上游。
 
@@ -4333,6 +4342,106 @@ class TestInterfaceGuidance(ChatTestCase):
             css.close()
 
 
+class TestTwoQuestionConcurrency(ChatTestCase):
+    """两位不同学习者可并行；第三位不扣额度，同一会话仍互斥。"""
+
+    def test_two_sessions_run_together_and_a_third_is_busy(self):
+        entered = threading.Event()
+        release = threading.Event()
+        calls_lock = threading.Lock()
+        calls = []
+
+        def blocked(model, messages, **kwargs):
+            with calls_lock:
+                calls.append(1)
+                if len(calls) == 2:
+                    entered.set()
+            release.wait(5)
+            return FakeResponse(rag_reply(decision="general_answer",
+                                          answer="独立回答", citations=[]))
+
+        self.fake.chat.completions.create = blocked
+        clients = [tutor.app.test_client() for _ in range(3)]
+        for c in clients:
+            c.get("/")
+        self.assertEqual(len({self.session_id_of(c) for c in clients}), 3)
+        responses = [None, None]
+        threads = [threading.Thread(
+            target=lambda i=i: responses.__setitem__(i, self.ask(clients[i], "问题" + str(i))))
+            for i in range(2)]
+        for thread in threads:
+            thread.start()
+        try:
+            self.assertTrue(entered.wait(5), "两位用户必须同时进入模型调用")
+            third = self.ask(clients[2], "第三位的问题")
+            self.assertIn(tutor.LOCKED_MESSAGE, third.get_data(as_text=True))
+            self.assertEqual(len(calls), 2)
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(5)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual([r.status_code for r in responses], [302, 302])
+        self.assertEqual(len(self.all_rows()), 4)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            used = conn.execute("SELECT used FROM api_usage WHERE day = ?",
+                                (tutor._utc_day(),)).fetchone()[0]
+        finally:
+            conn.close()
+        self.assertEqual(used, 2, "第三位被挡下后不能占模型额度")
+        self.assertEqual(tutor._active_sids, set())
+
+    def test_delete_waits_for_both_in_flight_questions(self):
+        self.make_invite("parallel-delete")
+        bound = tutor.app.test_client()
+        self.enter_invite(bound, "parallel-delete")
+        self.save_profile(bound)
+        learner = self.learner_id_of(bound)
+        other = tutor.app.test_client()
+        csrf = self.csrf_token(bound, "/profile")
+        entered = threading.Event()
+        release = threading.Event()
+        calls_lock = threading.Lock()
+        call_count = []
+
+        def blocked(model, messages, **kwargs):
+            with calls_lock:
+                call_count.append(1)
+                if len(call_count) == 2:
+                    entered.set()
+            release.wait(5)
+            return FakeResponse(rag_reply())
+
+        self.fake.chat.completions.create = blocked
+        questions = [threading.Thread(target=lambda c=c: self.ask(c, "问题"))
+                     for c in (bound, other)]
+        for thread in questions:
+            thread.start()
+        deletion = None
+        try:
+            self.assertTrue(entered.wait(5))
+            deletion = threading.Thread(target=lambda: bound.post(
+                "/profile/delete", data={"csrf_token": csrf, "confirm": "yes"}))
+            deletion.start()
+            deadline = time.monotonic() + 2
+            while not tutor._deleting and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(tutor._deleting, "删除必须先封闭新提问入口")
+            self.assertIsNotNone(self.profile_row(learner), "在途提问结束前不能先删")
+        finally:
+            release.set()
+            for thread in questions:
+                thread.join(5)
+            if deletion is not None:
+                deletion.join(5)
+        self.assertTrue(all(not thread.is_alive() for thread in questions))
+        self.assertIsNotNone(deletion)
+        self.assertFalse(deletion.is_alive())
+        self.assertIsNone(self.profile_row(learner))
+        self.assertEqual(len(self.all_rows()), 2, "匿名会话保留，已删除会话不能复活")
+
+
 class TestModelOutageRecovery(ChatTestCase):
     """跨浏览器故障只占一次额度，失败不写回答，冷却结束后可恢复。"""
 
@@ -4349,12 +4458,15 @@ class TestModelOutageRecovery(ChatTestCase):
             raise TimeoutError("private-timeout-detail")
 
         self.fake.chat.completions.create = blocked
+        first = tutor.app.test_client()
+        first.get("/")
+        same_session = self.another_tab(first)
         request_thread = threading.Thread(target=lambda: responses.append(
-            self.ask(tutor.app.test_client(), "第一个问题")))
+            self.ask(first, "第一个问题")))
         request_thread.start()
         try:
             self.assertTrue(entered.wait(2))
-            second = self.ask(tutor.app.test_client(), "另一台设备的问题")
+            second = self.ask(same_session, "同一会话重复提问")
             self.assertIn(tutor.LOCKED_MESSAGE, second.get_data(as_text=True))
             self.assertEqual(len(self.fake.calls), 1)
         finally:
@@ -4941,7 +5053,7 @@ console.log(bad === 0 ? 'TABLE_OK' : 'TABLE_BAD');
             conn.close()
 
     def test_a_double_submit_is_blocked_and_keeps_the_text(self):
-        """第一台还卡在半路时，第二台再点发送：被锁挡下，而且【没有多花一次模型调用】。
+        """同一会话的第一题还在途时，再点发送：被挡下且不多扣额度。
 
         【为什么这里用 gate 而不是 hang】这一条本来靠「假上游装死 + 客户端超时」来
         制造并发，但那要拿秒数当节拍器：子进程冷启动约 2 秒，超时也是 2 秒，
@@ -4952,15 +5064,17 @@ console.log(bad === 0 ? 'TABLE_OK' : 'TABLE_BAD');
         upstream = self.use_fake_upstream("gate", timeout=30)
         results = []
         first = tutor.app.test_client()
+        first.get("/")
+        same_session = self.another_tab(first)
         thread = threading.Thread(target=lambda: results.append(
-            self.ask(first, "第一台设备的问题")))
+            self.ask(first, "同一会话的问题")))
         thread.start()
         try:
             self.assertTrue(upstream.arrived.wait(15), "第一个请求没有到达上游")
-            second = self.ask(tutor.app.test_client(), "第二台设备的问题")
+            second = self.ask(same_session, "同一会话的第二题")
             html = second.get_data(as_text=True)
             self.assertIn(tutor.LOCKED_MESSAGE, html)
-            self.assertIn('value="第二台设备的问题"', html)       # 第二台也没丢字
+            self.assertIn('value="同一会话的第二题"', html)
         finally:
             upstream.release.set()                                # 放第一个请求走完
             thread.join(30)
@@ -4972,6 +5086,34 @@ console.log(bad === 0 ? 'TABLE_OK' : 'TABLE_BAD');
         self.assertEqual(self.used_today(), 1, "重复点击不该多花一次模型调用")
         self.assertEqual(upstream.requests, 1)
         self.assertEqual(len(self.all_rows()), 2)                 # 历史里只有一问一答
+
+    def test_two_real_model_workers_can_overlap_at_the_local_upstream(self):
+        """走真实子进程和本机 HTTP；不调用云模型。"""
+        upstream = self.use_fake_upstream("gate", timeout=30)
+        clients = [tutor.app.test_client() for _ in range(3)]
+        for client in clients:
+            client.get("/")
+        responses = [None, None]
+        threads = [threading.Thread(
+            target=lambda i=i: responses.__setitem__(i, self.ask(clients[i], "并行问题" + str(i))))
+            for i in range(2)]
+        for thread in threads:
+            thread.start()
+        try:
+            deadline = time.monotonic() + 15
+            while upstream.requests < 2 and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertEqual(upstream.requests, 2, "两个子进程必须同时到达本机假上游")
+            third = self.ask(clients[2], "第三位的问题")
+            self.assertIn(tutor.LOCKED_MESSAGE, third.get_data(as_text=True))
+        finally:
+            upstream.release.set()
+            for thread in threads:
+                thread.join(30)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual([r.status_code for r in responses], [302, 302])
+        self.assertEqual(self.used_today(), 2)
+        self.assertEqual(len(self.all_rows()), 4)
 
     # ---------- E. 「结果未知」：响应丢了、用户又发一次，不能变成两次调用 ----------
     #

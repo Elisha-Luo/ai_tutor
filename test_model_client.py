@@ -96,6 +96,23 @@ class TestBoundedModelClient(unittest.TestCase):
         self.assertEqual(shorter._api_key, original._api_key)
         self.assertEqual(shorter._base_url, original._base_url)
 
+    def test_error_code_is_private_to_each_request_thread(self):
+        client = self.client()
+        client.last_error_code = "timeout"
+        other_thread_codes = []
+
+        def other_request():
+            other_thread_codes.append(client.last_error_code)
+            client.last_error_code = "connection_error"
+            other_thread_codes.append(client.last_error_code)
+
+        thread = threading.Thread(target=other_request)
+        thread.start()
+        thread.join(2)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(other_thread_codes, [None, "connection_error"])
+        self.assertEqual(client.last_error_code, "timeout")
+
     def test_provider_503_is_not_retried_and_error_contents_are_hidden(self):
         self.mode = "error"
         client = self.client()

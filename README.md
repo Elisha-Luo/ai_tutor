@@ -221,11 +221,13 @@ if (sending) { event.preventDefault(); return; }   // 已经在发了，这次�
 
 这一条和下面第 3 条合起来，才是完整的「防止重复提问」。
 
-### 3. 为什么「锁」必须放在 `finally` 里还
+### 3. 为什么并发名额必须放在 `finally` 里还
 
-服务器端也有一道防线：同一时间只允许处理一个提问。
+服务器端也有一道防线：单进程最多同时处理两位不同会话的提问，同一会话只能有一道在途。超过上限立即提示繁忙，不占模型额度。
 
 ```python
+if not _begin_question(sid):
+    return _render(sid, question=question, error=LOCKED_MESSAGE)
 try:
     chunks = retriever.retrieve(question, top_k=3)                  # ① 只按【当前问题】找资料
     recent = load_recent_messages(sid)                              # ② 取【本会话】最近几条历史，当上下文
@@ -237,8 +239,10 @@ try:
 except Exception:
     error = SAFE_ERROR_MESSAGE     # ← 只给一句固定的抱歉，不写 str(e)
 finally:
-    _lock.release()                # ← 无论成功失败都要还
+    _finish_question(sid)          # ← 无论成功失败都要归还名额
 ```
+
+状态锁只用于短暂检查与记录，模型调用期间不持有。删除会先封闭入口，再等所有在途提问完成（含写库）；不能仅靠增加 worker 绕过这套单进程保护。
 
 > **两个返回值，去向不同：**
 > `result`（三键：decision / answer / citations）是**唯一**进页面和数据库的东西；
@@ -557,9 +561,8 @@ python profile_store.py stats             # 看统计，只报数量、不显示
   那些需要另外的彻底销毁流程。
 - **管不了第三方。** 生成回答时，你的问题会发给模型服务商；对方那边可能保留的记录，
   我们无权也无法删除。
-- **同时进行的提问会被等完再删。** 删除要和「处理提问」共用一把锁：
-  正在回答的那个问题会先跑完（连同它写库），然后才执行删除 ——
-  所以不会出现「删完又被旧请求写回来」。删除时如果等不到锁，会明确告诉用户稍后再试。
+- **同时进行的提问会被等完再删。** 删除先封闭新提问入口，再等所有在途问题跑完（连同写库），然后才执行删除 ——
+  所以不会出现「删完又被旧请求写回来」。超时等不到时会明确告诉用户稍后再试。
 
 > 实现见 `profile_store.clear_all_data()`：整个过程在**同一个 SQLite 事务**里，
 > 顺序是「先找出全部会话（含已失效的）→ 删这些会话的聊天记录 → 轮换其数据代号 → 删偏好 →
